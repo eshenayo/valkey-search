@@ -17,6 +17,7 @@ endif()
 # Options
 option(BUILD_TESTS "Build valkey-search tests" ON)
 option(WITH_SUBMODULES_SYSTEM "Use system submodules" OFF)
+option(ENABLE_SVS "Enable Intel(R) Scalable Vector Search (SVS) support" OFF)
 
 set(SAN_BUILD
     ""
