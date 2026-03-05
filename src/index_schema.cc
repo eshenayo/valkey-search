@@ -1061,10 +1061,8 @@ int IndexSchema::GetNumericAttributeCount() const {
 int IndexSchema::GetVectorAttributeCount() const {
   return std::count_if(attributes_.begin(), attributes_.end(),
                        [](const auto &attr) {
-                         auto type = attr.second.GetIndex()->GetIndexerType();
-                         return type == indexes::IndexerType::kVector ||
-                                type == indexes::IndexerType::kHNSW ||
-                                type == indexes::IndexerType::kFlat;
+                         return indexes::IsVectorIndexType(
+                             attr.second.GetIndex()->GetIndexerType());
                        });
 }
 
@@ -2007,7 +2005,8 @@ absl::StatusOr<vmsdk::ValkeyVersion> IndexSchema::GetMinVersion(
 void IndexSchema::SetTextSizeEstimationConditions() {
   if (text_index_schema_) {
     for (const auto &[_, attr] : attributes_) {
-      if (attr.GetIndex()->GetIndexerType() == indexes::IndexerType::kHNSW) {
+      if (attr.GetIndex()->GetIndexerType() == indexes::IndexerType::kHNSW ||
+          attr.GetIndex()->GetIndexerType() == indexes::IndexerType::kSVS) {
         text_index_schema_->EnableSubtreeItemCountTracking();
       }
     }

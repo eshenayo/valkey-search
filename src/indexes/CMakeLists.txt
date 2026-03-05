@@ -77,6 +77,8 @@ target_link_libraries(tag PUBLIC vmsdklib)
 target_link_libraries(tag PUBLIC ${INDEX_SCHEMA_PROTO_LIB})
 
 if(ENABLE_SVS)
+  target_compile_definitions(vector_base PUBLIC ENABLE_SVS)
+
   set(SRCS_VECTOR_SVS ${CMAKE_CURRENT_LIST_DIR}/vector_svs.cc
                       ${CMAKE_CURRENT_LIST_DIR}/vector_svs.h)
 
