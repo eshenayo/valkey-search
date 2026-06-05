@@ -106,5 +106,8 @@ const config::Boolean& GetRdbReadV2();
 /// Return the threshold for async fanout operations
 config::Number& GetAsyncFanoutThreshold();
 
+/// Return the configuration entry for SVS OpenMP thread count
+config::Number& GetSVSOmpThreads();
+
 }  // namespace options
 }  // namespace valkey_search
