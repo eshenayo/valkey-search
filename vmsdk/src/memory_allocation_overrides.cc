@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <new>
+#include <sys/mman.h>
 
 #include "absl/base/no_destructor.h"
 #include "absl/base/thread_annotations.h"
@@ -321,6 +322,15 @@ int __wrap_posix_memalign(void** r, size_t __alignment, size_t __size) PMES {
 
 void* __wrap_valloc(size_t size) noexcept {
   return __wrap_aligned_alloc(sysconf(_SC_PAGESIZE), size);
+}
+
+void* __wrap_mmap(void* addr, size_t length, int prot, int flags, int fd,
+                  off_t offset) noexcept {
+  return __real_mmap(addr, length, prot, flags, fd, offset);
+}
+
+int __wrap_munmap(void* addr, size_t length) noexcept {
+  return __real_munmap(addr, length);
 }
 
 }  // extern "C"
