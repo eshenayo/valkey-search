@@ -8,7 +8,6 @@
 #include "src/indexes/vector_svs.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -38,6 +37,7 @@
 #include "third_party/hnswlib/hnswlib.h"
 #include "vmsdk/src/latency_sampler.h"
 #include "vmsdk/src/log.h"
+#include "vmsdk/src/memory_allocation.h"
 #include "vmsdk/src/utils.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
@@ -104,6 +104,28 @@ const char* CompressionTypeName(data_model::SVSCompressionType type) {
 }  // namespace
 
 template <typename T>
+void VectorSVS<T>::UpdateRuntimeMemoryAccounting(uint64_t rss_before) {
+  uint64_t rss_after = vmsdk::GetProcessRSSBytes();
+  if (rss_after <= rss_before) return;
+  uint64_t delta = rss_after - rss_before;
+  reported_svs_bytes_.fetch_add(delta, std::memory_order_relaxed);
+  vmsdk::ReportAllocMemorySize(delta);
+  vmsdk::ReportSVSRuntimeAlloc(delta);
+}
+
+template <typename T>
+void VectorSVS<T>::UpdateRuntimeMemoryAccountingFree(uint64_t rss_before) {
+  uint64_t rss_after = vmsdk::GetProcessRSSBytes();
+  if (rss_after >= rss_before) return;
+  uint64_t delta = rss_before - rss_after;
+  uint64_t prev = reported_svs_bytes_.load(std::memory_order_relaxed);
+  if (delta > prev) delta = prev;
+  reported_svs_bytes_.fetch_sub(delta, std::memory_order_relaxed);
+  vmsdk::ReportFreeMemorySize(delta);
+  vmsdk::ReportSVSRuntimeFree(delta);
+}
+
+template <typename T>
 VectorSVS<T>::VectorSVS(
     int dimensions, data_model::DistanceMetric distance_metric,
     const SVSBuildConfig& build_config,
@@ -129,6 +151,11 @@ VectorSVS<T>::~VectorSVS() {
   }
 
   if (svs_index_) {
+    uint64_t reported = reported_svs_bytes_.exchange(0);
+    if (reported > 0) {
+      vmsdk::ReportFreeMemorySize(reported);
+      vmsdk::ReportSVSRuntimeFree(reported);
+    }
     auto status = svs::runtime::v0::DynamicVamanaIndex::destroy(svs_index_);
     if (!status.ok()) {
       VMSDK_LOG(WARNING, nullptr)
@@ -251,6 +278,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
 
   auto storage_kind = ToSVSStorageKind(config.compression);
 
+  uint64_t rss_before = vmsdk::GetProcessRSSBytes();
   auto status = svs::runtime::v0::DynamicVamanaIndex::build(
       &index->svs_index_,
       vector_index_proto.dimension_count(),
@@ -265,6 +293,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
   }
 
   index->index_state_ = SVSIndexState::kReady;
+  index->UpdateRuntimeMemoryAccounting(rss_before);
 
   VMSDK_LOG(NOTICE, nullptr)
       << "Created SVS Vamana index with dim="
@@ -350,14 +379,17 @@ absl::Status VectorSVS<T>::FlushBuffer() {
     }
 
     // Batch insert to SVS (this takes ~seconds for 10K vectors)
-    auto status = svs_index_->add(
+    uint64_t rss_before = vmsdk::GetProcessRSSBytes();
+    auto svs_status = svs_index_->add(
         batch_size, labels.data(), data_flat.data());
 
-    if (!status.ok()) {
+    if (!svs_status.ok()) {
       buffer_flushing_ = false;
       return absl::InternalError(
-          absl::StrCat("SVS batch add failed: ", status.message()));
+          absl::StrCat("SVS batch add failed: ", svs_status.message()));
     }
+
+    UpdateRuntimeMemoryAccounting(rss_before);
 
     // Clear buffer
     pending_buffer_.clear();
@@ -421,6 +453,7 @@ absl::Status VectorSVS<T>::TrainAndBuildLeanVecIndex() {
     }
 
     // 2. Train LeanVec compression matrices.
+    uint64_t rss_before = vmsdk::GetProcessRSSBytes();
     auto train_status = svs::runtime::v0::LeanVecTrainingData::build(
         &leanvec_training_data_,
         static_cast<size_t>(dimensions_),
@@ -484,6 +517,8 @@ absl::Status VectorSVS<T>::TrainAndBuildLeanVecIndex() {
         leanvec_training_data_);
     leanvec_training_data_ = nullptr;
 
+    UpdateRuntimeMemoryAccounting(rss_before);
+
     auto duration = total_timer.Duration();
     Metrics::GetStats().svs_flush_latency.SubmitSample(duration);
     Metrics::GetStats().svs_flush_cnt.fetch_add(1,
@@ -524,11 +559,11 @@ absl::Status VectorSVS<T>::RemoveRecordImpl(uint64_t internal_id) {
     }
 
     size_t label = static_cast<size_t>(internal_id);
-    auto status = svs_index_->remove(1, &label);
+    auto svs_status = svs_index_->remove(1, &label);
 
-    if (!status.ok()) {
+    if (!svs_status.ok()) {
       return absl::InternalError(
-          absl::StrCat("SVS remove failed: ", status.message()));
+          absl::StrCat("SVS remove failed: ", svs_status.message()));
     }
 
     if (num_elements_ > 0) {

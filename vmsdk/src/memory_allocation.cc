@@ -7,9 +7,12 @@
 
 #include "vmsdk/src/memory_allocation.h"
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include "vmsdk/src/sharded_atomic.h"
 
@@ -23,11 +26,14 @@ namespace vmsdk {
 // https://redis.com/blog/using-the-redis-allocator-in-rust for more details.
 
 thread_local static int64_t memory_delta = 0;
+thread_local static bool in_svs_context = false;
 
 ShardedAtomic<uint64_t> used_memory_bytes;
+ShardedAtomic<uint64_t> svs_runtime_memory_bytes;
 
 void ResetValkeyAllocStats() {
   used_memory_bytes.Reset();
+  svs_runtime_memory_bytes.Reset();
   memory_delta = 0;
 }
 
@@ -47,5 +53,39 @@ void ReportFreeMemorySize(uint64_t size) {
 int64_t GetMemoryDelta() { return memory_delta; }
 
 void SetMemoryDelta(int64_t delta) { memory_delta = delta; }
+
+void EnterSVSContext() { in_svs_context = true; }
+
+void LeaveSVSContext() { in_svs_context = false; }
+
+bool InSVSContext() { return in_svs_context; }
+
+uint64_t GetSVSRuntimeMemoryCnt() {
+  return svs_runtime_memory_bytes.GetTotal();
+}
+
+void ReportSVSRuntimeAlloc(uint64_t size) {
+  svs_runtime_memory_bytes.Add(size);
+}
+
+void ReportSVSRuntimeFree(uint64_t size) {
+  svs_runtime_memory_bytes.Subtract(size);
+}
+
+uint64_t GetProcessRSSBytes() {
+  int fd = open("/proc/self/status", O_RDONLY);
+  if (fd < 0) return 0;
+  char buf[4096];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  const char* pos = strstr(buf, "VmRSS:");
+  if (!pos) return 0;
+  pos += 6;
+  while (*pos == ' ' || *pos == '\t') ++pos;
+  uint64_t kb = strtoull(pos, nullptr, 10);
+  return kb * 1024;
+}
 
 }  // namespace vmsdk

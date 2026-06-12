@@ -117,6 +117,21 @@ static vmsdk::info_field::Integer used_text_memory_human(
           return SchemaManager::Instance().GetTotalTextMemoryUsage();
         }));
 
+static vmsdk::info_field::Integer svs_runtime_memory(
+    "memory", "svs_runtime_memory_bytes",
+    vmsdk::info_field::IntegerBuilder()
+        .App()
+        .Computed(vmsdk::GetSVSRuntimeMemoryCnt)
+        .CrashSafe());
+
+static vmsdk::info_field::Integer svs_runtime_memory_human(
+    "memory", "svs_runtime_memory_human",
+    vmsdk::info_field::IntegerBuilder()
+        .SIBytes()
+        .App()
+        .Computed(vmsdk::GetSVSRuntimeMemoryCnt)
+        .CrashSafe());
+
 static vmsdk::info_field::Integer reclaimable_memory(
     "memory", "index_reclaimable_memory",
     vmsdk::info_field::IntegerBuilder()
