@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <sys/mman.h>
 #include <type_traits>
 
 #include "vmsdk/src/memory_allocation.h"
@@ -38,6 +39,11 @@ WEAK_SYMBOL int (*__real_posix_memalign)(void**, size_t,
                                          size_t) = posix_memalign;
 // NOLINTNEXTLINE
 WEAK_SYMBOL void* (*__real_valloc)(size_t) = valloc;
+// NOLINTNEXTLINE
+WEAK_SYMBOL void* (*__real_mmap)(void*, size_t, int, int, int,
+                                  off_t) = mmap;
+// NOLINTNEXTLINE
+WEAK_SYMBOL int (*__real_munmap)(void*, size_t) = munmap;
 // NOLINTNEXTLINE
 __attribute__((weak)) size_t empty_usable_size(void* ptr) noexcept;
 }  // extern "C"
@@ -67,6 +73,11 @@ int __wrap_malloc_usable_size(void* ptr) noexcept;
 int __wrap_posix_memalign(void** r, size_t __alignment, size_t __size) PMES;
 // NOLINTNEXTLINE
 void* __wrap_valloc(size_t size) noexcept;
+// NOLINTNEXTLINE
+void* __wrap_mmap(void* addr, size_t length, int prot, int flags, int fd,
+                  off_t offset) noexcept;
+// NOLINTNEXTLINE
+int __wrap_munmap(void* addr, size_t length) noexcept;
 }  // extern "C"
 
 #ifndef SAN_BUILD
@@ -84,6 +95,10 @@ void* __wrap_valloc(size_t size) noexcept;
 #define posix_memalign(...) __wrap_posix_memalign(__VA_ARGS__)
 // NOLINTNEXTLINE
 #define valloc(...) __wrap_valloc(__VA_ARGS__)
+// NOLINTNEXTLINE
+#define mmap(...) __wrap_mmap(__VA_ARGS__)
+// NOLINTNEXTLINE
+#define munmap(...) __wrap_munmap(__VA_ARGS__)
 
 void* operator new(size_t size) noexcept(false);
 void operator delete(void* p) noexcept;

@@ -8,6 +8,7 @@
 #ifndef VALKEYSEARCH_SRC_INDEXES_VECTOR_SVS_H_
 #define VALKEYSEARCH_SRC_INDEXES_VECTOR_SVS_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -136,11 +137,18 @@ class VectorSVS : public VectorBase {
   absl::Status TrainAndBuildLeanVecIndex()
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
 
+  // Update SVS runtime memory accounting using VmRSS delta measurement.
+  void UpdateRuntimeMemoryAccounting(uint64_t rss_before)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
+  void UpdateRuntimeMemoryAccountingFree(uint64_t rss_before)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
+
   // SVS index (owned, destroyed via DynamicVamanaIndex::destroy)
   svs::runtime::v0::DynamicVamanaIndex* svs_index_
       ABSL_GUARDED_BY(index_mutex_){nullptr};
   SVSBuildConfig build_config_;
   size_t num_elements_ ABSL_GUARDED_BY(index_mutex_){0};
+  std::atomic<uint64_t> reported_svs_bytes_{0};
 
   // kStaging until LeanVec training completes; kReady from the start for
   // non-LeanVec compression types.
