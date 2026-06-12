@@ -378,7 +378,8 @@ absl::Status VectorSVS<T>::FlushBuffer() {
       std::copy(src, src + dimensions_, data_flat.begin() + i * dimensions_);
     }
 
-    // Batch insert to SVS (this takes ~seconds for 10K vectors)
+    // Batch insert to SVS (this takes ~seconds for 10K vectors).
+    // Capture RSS before/after to measure persistent SVS storage growth.
     uint64_t rss_before = vmsdk::GetProcessRSSBytes();
     auto svs_status = svs_index_->add(
         batch_size, labels.data(), data_flat.data());
