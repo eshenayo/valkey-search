@@ -740,11 +740,197 @@ Currently: `src/indexes/vector_svs.h` defines `absl::flat_hash_map<uint64_t, std
 
 Once §3.5 and §3.6 are delivered, we delete `raw_vectors_`.
 
-### 4.3 OMP thread management
+### 4.3 Custom thread pool in the C++ runtime API
 
-Currently: we pin `omp_set_num_threads(1)` twice (once in `Create()`, once per-search) as a workaround for oversubscription.
+#### The problem
 
-See `SVS_OMP_PERF_ANALYSIS.md` for the profiling data that motivated this. The request is §3.10: make thread count an API parameter, not a libgomp ICV.
+Currently we pin `omp_set_num_threads(1)` twice (once in `Create()`, once per-search) as a workaround for oversubscription. See `SVS_OMP_PERF_ANALYSIS.md` for the profiling data that motivated this.
+
+The core issue: the C++ runtime API (`svs/runtime/v0/DynamicVamanaIndex`) has **no thread pool parameter at any call site**. All internal parallelism is hardcoded through `GOMP_parallel`, controlled only by the thread-local `omp_set_num_threads()` ICV — which doesn't propagate across thread pools and must be re-applied on every call.
+
+Meanwhile, the SVS **C API** on the `dev` branch already supports custom thread pools via `svs_threadpool_interface`, and the underlying C++ concept (`svs::threads::ThreadPool`) requires only two methods:
+
+```cpp
+template <typename Pool>
+concept ThreadPool = requires(Pool& pool, const Pool& const_pool,
+                              std::function<void(size_t)> f, size_t n) {
+    { const_pool.size() } -> std::convertible_to<size_t>;
+    pool.parallel_for(std::move(f), n);
+};
+```
+
+The C-to-C++ bridge wraps this into a `ThreadPoolHandle` (type-erased unique_ptr) that's passed into the Vamana orchestrator for all parallel operations. The C++ runtime bindings need the same path exposed — that's the ask.
+
+#### Why valkey-search needs to own the thread pool
+
+valkey-search's reader pool is the concurrency axis for search. Each reader-pool thread handles one `FT.SEARCH` at a time; multiple threads are in-flight concurrently (typically 8-64 threads, matching core count). The threading model:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    Valkey Main Thread                                    │
+│                 (FT.SEARCH arrives, dispatches)                          │
+└─────────────────────────────────┬──────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Reader Thread Pool  (N = CPU cores, configurable via --reader-threads)  │
+│                                                                          │
+│  Thread 0: Search(idx_A, query_0)  ───►  svs_index_->search(...)        │
+│  Thread 1: Search(idx_B, query_1)  ───►  svs_index_->search(...)        │
+│  Thread 2: Search(idx_A, query_2)  ───►  svs_index_->search(...)        │
+│  …                                                                       │
+│  Thread N-1: Search(idx_C, query_M)  ──►  svs_index_->search(...)       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Each `svs_index_->search()` call should run **entirely on the calling thread** (or, if intra-query parallelism is desired for large-K queries, on threads that valkey-search explicitly allocated for this purpose — not OMP's implicit fork/join).
+
+If SVS internally spawns OMP threads, the effective thread count becomes `omp_threads × reader_threads`. On 8 cores with 8 readers and OMP=4, that's 32 threads competing for 8 cores. Profiling shows kernel-space CPU rising from 2.7% to 17.6%, dominated by `native_queued_spin_lock_slowpath`.
+
+The valkey-search writer pool has the inverse requirement: during batch ingest only one writer is active per index, so intra-operation parallelism (OMP > 1) is beneficial for `add()` and `build()`. But the pool should still be valkey-search-owned — OMP threads escaping into the scheduler cause the same oversubscription during mixed read/write workloads.
+
+#### The ask: expose `ThreadPoolHandle` in the C++ runtime API
+
+**Tier 1 (Critical): Accept a custom thread pool at construction and load**
+
+```cpp
+// Proposed additions to DynamicVamanaIndex
+static Status build(
+    DynamicVamanaIndex** index,
+    size_t dim,
+    MetricType metric,
+    StorageKind storage_kind,
+    const BuildParams& params,
+    const SearchParams& default_search_params,
+    const DynamicIndexParams& dynamic_index_params,
+    ThreadPoolHandle pool                              // <-- NEW
+) noexcept;
+
+static Status load(
+    DynamicVamanaIndex** index,
+    std::istream& in,
+    MetricType metric,
+    StorageKind storage_kind,
+    ThreadPoolHandle pool                              // <-- NEW
+) noexcept;
+```
+
+The pool passed at construction is stored inside the index and used for all subsequent `search()`, `add()`, `remove()` calls. This is the same pattern as the C API's `svs_index_builder_set_threadpool_custom()`.
+
+**Tier 2 (Important): Per-call thread count or pool override on `search()`**
+
+```cpp
+// Option A: thread count in SearchParams (minimal change)
+struct VamanaSearchParameters {
+    size_t search_window_size = Unspecify<size_t>();
+    size_t search_buffer_capacity = Unspecify<size_t>();
+    size_t prefetch_lookahead = Unspecify<size_t>();
+    size_t prefetch_step = Unspecify<size_t>();
+    float filter_stop = Unspecify<float>();
+    OptionalBool filter_estimate_batch = Unspecify<bool>();
+    size_t num_threads = Unspecify<size_t>();           // <-- NEW
+};
+
+// Option B: separate overload (more explicit)
+Status search(
+    size_t n, const float* x, size_t k,
+    float* distances, size_t* labels,
+    const SearchParams* params,
+    IDFilter* filter,
+    ThreadPoolHandle pool                              // <-- NEW
+) const noexcept;
+```
+
+Why: valkey-search needs `num_threads = 1` on the search path (reader-pool threads ARE the parallelism), but may want `num_threads = N` during bulk-load or background consolidation operations where only one operation is active. A per-call knob avoids reconstructing the index to switch modes.
+
+When `num_threads = 1` (or `pool.size() == 1`), the code path must execute inline on the calling thread with **zero fork/join overhead** — no `GOMP_parallel` dispatch, no thread-local ICV lookup, no spin-wait. This is the hot path for valkey-search.
+
+**Tier 3 (Nice-to-have): `set_threadpool()` post-construction**
+
+```cpp
+Status set_threadpool(ThreadPoolHandle pool) noexcept;
+```
+
+Lets valkey-search switch pool widths without index rebuild — e.g., use a wider pool during batch ingest, then narrow for steady-state search.
+
+#### How valkey-search would implement the bridge
+
+valkey-search's vmsdk `ThreadPool` (`vmsdk/src/thread_pool.h`) provides:
+- Per-thread task queues with priority scheduling
+- CPU monitoring per thread
+- Resize (grow/shrink thread count at runtime)
+- Graceful and abrupt shutdown
+
+The bridge adapter satisfying `svs::threads::ThreadPool`:
+
+```cpp
+class ValkeySearchThreadPoolAdapter {
+  vmsdk::ThreadPool* pool_;
+ public:
+  explicit ValkeySearchThreadPoolAdapter(vmsdk::ThreadPool* pool)
+      : pool_(pool) {}
+
+  size_t size() const { return pool_->GetThreadCount(); }
+
+  void parallel_for(std::function<void(size_t)> f, size_t n) {
+    if (n == 0) return;
+    if (n == 1) { f(0); return; }
+    // Submit n tasks to valkey-search's thread pool, barrier on completion.
+    absl::BlockingCounter done(n);
+    for (size_t i = 0; i < n; ++i) {
+      pool_->Enqueue([&f, i, &done] {
+        f(i);
+        done.DecrementCount();
+      });
+    }
+    done.Wait();
+  }
+};
+```
+
+For the search path (where we want single-threaded execution), valkey-search would pass a trivial inline pool:
+
+```cpp
+class InlineThreadPool {
+ public:
+  size_t size() const { return 1; }
+  void parallel_for(std::function<void(size_t)> f, size_t n) {
+    for (size_t i = 0; i < n; ++i) { f(i); }
+  }
+};
+```
+
+This eliminates OMP entirely from the search path. No `omp_set_num_threads` calls, no libgomp dependency on the critical path, no oversubscription risk.
+
+#### Lifetime and ownership contract
+
+The C API's `svs_threadpool_interface` is **borrowed** (not owned) — the caller must keep the struct alive for the lifetime of the index. valkey-search needs the same guarantee spelled out for the C++ API:
+
+- If `ThreadPoolHandle` is a type-erased `unique_ptr`: SVS owns the pool and valkey-search transfers ownership at construction. valkey-search keeps its raw `vmsdk::ThreadPool*` for its own use; the adapter is a thin bridge that doesn't own the underlying pool.
+- If `ThreadPoolHandle` is a borrowed reference: SVS stores a pointer; valkey-search guarantees the pool outlives the index (easy — both live for the module lifetime).
+
+Either works. The key constraint is that valkey-search must be able to share the same underlying thread pool across multiple SVS indexes (we have one reader pool for all indexes, not one per index).
+
+#### What this unblocks
+
+With a custom thread pool on the C++ runtime API:
+
+1. **Eliminates OMP oversubscription** — test_02 concurrent search scaling matches HNSW (5× on 8 cores) regardless of pool size.
+2. **Eliminates per-call `omp_set_num_threads`** — no thread-local ICV workarounds.
+3. **Enables libgomp-free builds** — if SVS internalizes all parallelism through the pool concept, the runtime library no longer needs to link libgomp. This removes the ~40-70 µs `GOMP_parallel` overhead on every single-threaded search call.
+4. **Enables asymmetric thread allocation** — search at width 1, batch-add at width N, consolidation at width M, all controlled by valkey-search's scheduler.
+5. **Enables cooperative scheduling** — valkey-search can implement work-stealing, priority inversion avoidance, or CPU-pinning in the adapter without touching SVS internals.
+
+#### Relationship to existing asks
+
+This subsumes ask #8 ("Per-index thread count via SVS API") from §5 below. It also directly enables ask #1 ("Concurrent-safe `search()` with no OMP oversubscription") — once we control the pool, oversubscription is architecturally impossible.
+
+#### Validation
+
+Existing test pair **02** (concurrent search) is the validation target:
+- With the custom pool at `size() = 1`, test_02 should show linear QPS scaling with reader threads (no OMP contention).
+- With the custom pool at `size() = 4` but only 1 concurrent search, intra-query parallelism should deliver speedup on high-dim (768d+) single queries.
+- `perf record` during test_02 should show zero `GOMP_*` symbols in the call stack.
 
 ---
 
@@ -759,7 +945,8 @@ See `SVS_OMP_PERF_ANALYSIS.md` for the profiling data that motivated this. The r
 | 5 | `reconstruct(label, float* out)` API | §3.5 | 07 |
 | 6 | `compute_distance(label, query, float* out)` API | §3.6 | 08 |
 | 7 | Version-stable save/load format | §3.9 | 06 |
-| 8 | Per-index thread count via SVS API (not libgomp ICV) | §3.10 | 02 |
+| 8 | **Custom `ThreadPoolHandle` on C++ runtime API** (`build`, `load`, `search`) | §3.10, §4.3 | 02 |
+| 9 | Per-call `num_threads` in `SearchParams` (or per-call pool override) | §4.3 | 02 |
 
 Validation pattern: each scenario has an **`hnsw/test_0N_X.cc`** baseline (vendored upstream hnswlib) and an **`svs/test_0N_X.cc`** twin (against `libsvs_runtime.so`). Read them side by side. The SVS twin is expected to fail (perf, correctness, crash, or link error) on the current 0.2.0 runtime and pass on the new runtime — `svs_integration_tests/README.md` has the observed failure modes on 0.2.0.
 
