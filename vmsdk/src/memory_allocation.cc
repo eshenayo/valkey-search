@@ -28,8 +28,10 @@ namespace vmsdk {
 thread_local static int64_t memory_delta = 0;
 thread_local static bool in_svs_context = false;
 
-ShardedAtomic<uint64_t> used_memory_bytes;
-ShardedAtomic<uint64_t> svs_runtime_memory_bytes;
+struct UsedMemoryTag {};
+struct SVSRuntimeMemoryTag {};
+ShardedAtomic<uint64_t, UsedMemoryTag> used_memory_bytes;
+ShardedAtomic<uint64_t, SVSRuntimeMemoryTag> svs_runtime_memory_bytes;
 
 void ResetValkeyAllocStats() {
   used_memory_bytes.Reset();
