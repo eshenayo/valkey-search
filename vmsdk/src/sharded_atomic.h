@@ -20,9 +20,10 @@ namespace vmsdk {
 
 // A high-performance sharded atomic counter that supports template types.
 // It uses Thread-Local Storage (TLS) to allow zero-contention writes.
-// Note: This implements a Global Counter behavior per type T.
-// All instances of ShardedAtomic<T> will share the same underlying sum.
-template <typename T>
+// Each unique (T, Tag) pair gets its own independent counter. Use distinct
+// tag types to create separate counters of the same value type.
+struct DefaultShardedAtomicTag {};
+template <typename T, typename Tag = DefaultShardedAtomicTag>
 class ShardedAtomic {
  public:
   // ------------------------------------------------------------------------
