@@ -98,7 +98,7 @@ if(ENABLE_SVS)
   find_package(OpenMP REQUIRED)
   include(FetchContent)
   set(SVS_URL
-      "https://github.com/intel/ScalableVectorSearch/releases/download/v0.4.0/svs-cpp-runtime-bindings-0.4.0.tar.gz"
+      "https://github.com/intel/ScalableVectorSearch/releases/download/v0.4.0/svs-cpp-runtime-bindings.tar.gz"
       CACHE STRING "URL to fetch SVS runtime library")
   FetchContent_Declare(svs URL "${SVS_URL}")
   FetchContent_MakeAvailable(svs)
