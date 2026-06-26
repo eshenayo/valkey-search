@@ -35,11 +35,9 @@
 
 namespace valkey_search::indexes {
 
-// Lifecycle of a VectorSVS index. Most compression kinds are kReady from
-// construction. LeanVec defers SVS-graph construction until the buffered
-// vectors reach the training threshold; until then the index is kStaging
-// and search is rejected.
-enum class SVSIndexState { kStaging, kReady };
+// SVS compression state reported via FT.INFO. With deferred compression
+// the index is always searchable; this only reflects storage backing.
+enum class SVSCompressionStatus { kDeferred, kActive };
 
 // Per-dimension epsilon factor for distance-based vector matching.
 // Empirically derived: worst-case compression (LVQ4x0 and LeanVec4x4) produces
@@ -137,31 +135,13 @@ class VectorSVS : public VectorBase {
             absl::string_view attribute_identifier,
             data_model::AttributeDataType attribute_data_type);
 
-  // Flush buffered vectors to SVS graph
-  absl::Status FlushBuffer() ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
-
-  // Train LeanVec matrices on the buffered vectors, build a
-  // DynamicVamanaIndexLeanVec, and ingest the buffer as the first batch.
-  // Transitions index_state_ from kStaging to kReady. Called from
-  // AddRecordImpl when the buffer reaches leanvec_training_threshold.
-  absl::Status TrainAndBuildLeanVecIndex()
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
-
-  // SVS index (owned, destroyed via DynamicVamanaIndex::destroy)
+  // SVS index (owned, destroyed via DynamicVamanaIndex::destroy).
+  // Always non-null after Create() — deferred compression means the index
+  // is always searchable.
   svs::runtime::v0::DynamicVamanaIndex* svs_index_
       ABSL_GUARDED_BY(index_mutex_){nullptr};
   SVSBuildConfig build_config_;
   size_t num_elements_ ABSL_GUARDED_BY(index_mutex_){0};
-
-  // kStaging until LeanVec training completes; kReady from the start for
-  // non-LeanVec compression types.
-  SVSIndexState index_state_ ABSL_GUARDED_BY(index_mutex_){
-      SVSIndexState::kReady};
-  // LeanVec compression matrices (raw owning pointer; destroyed via
-  // svs::runtime::v0::LeanVecTrainingData::destroy after the index is
-  // built or in the destructor).
-  svs::runtime::v0::LeanVecTrainingData* leanvec_training_data_
-      ABSL_GUARDED_BY(index_mutex_){nullptr};
 
   mutable absl::Mutex index_mutex_;
   mutable absl::Mutex tracked_vectors_mutex_;
@@ -171,14 +151,6 @@ class VectorSVS : public VectorBase {
   // Space interface for distance computation in pre-filter path
   std::unique_ptr<hnswlib::SpaceInterface<T>> space_;
 
-  // Buffering for benchmarking (simple 10K batch approach)
-  static constexpr size_t kBufferSize = 10000;
-  struct PendingInsert {
-    uint64_t internal_id;
-    std::vector<char> data;
-  };
-  std::vector<PendingInsert> pending_buffer_ ABSL_GUARDED_BY(index_mutex_);
-  bool buffer_flushing_ ABSL_GUARDED_BY(index_mutex_){false};
   size_t last_reported_svs_memory_ ABSL_GUARDED_BY(index_mutex_){0};
 
   void UpdateReportedMemory() ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
