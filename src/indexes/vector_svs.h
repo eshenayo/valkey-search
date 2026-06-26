@@ -75,6 +75,13 @@ class VectorSVS : public VectorBase {
       data_model::AttributeDataType attribute_data_type)
       ABSL_NO_THREAD_SAFETY_ANALYSIS;
 
+  static absl::StatusOr<std::shared_ptr<VectorSVS<T>>> LoadFromRDB(
+      ValkeyModuleCtx* ctx,
+      const AttributeDataType* attribute_data_type,
+      const data_model::VectorIndex& vector_index_proto,
+      absl::string_view attribute_identifier,
+      SupplementalContentChunkIter&& iter) ABSL_NO_THREAD_SAFETY_ANALYSIS;
+
   ~VectorSVS() override;
 
   size_t GetDataTypeSize() const override { return sizeof(T); }

@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
+#include <streambuf>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -708,11 +710,200 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   return 4;  // 4 top-level reply pairs: data_type + algorithm
 }
 
+// std::streambuf adapter: bridges std::ostream writes to RDBChunkOutputStream.
+class RDBOstreamBuf : public std::streambuf {
+ public:
+  explicit RDBOstreamBuf(RDBChunkOutputStream* out)
+      : out_(out) {
+    buf_.resize(kStreamBufSize);
+    setp(buf_.data(), buf_.data() + buf_.size());
+  }
+
+  ~RDBOstreamBuf() override { sync(); }
+
+  absl::Status status() const { return status_; }
+
+ protected:
+  int overflow(int ch) override {
+    if (!status_.ok()) return traits_type::eof();
+    if (flush_buffer() != 0) return traits_type::eof();
+    if (ch != traits_type::eof()) {
+      *pptr() = static_cast<char>(ch);
+      pbump(1);
+    }
+    return ch;
+  }
+
+  int sync() override {
+    return flush_buffer();
+  }
+
+ private:
+  static constexpr size_t kStreamBufSize = 4 * 1024 * 1024;
+
+  int flush_buffer() {
+    auto n = pptr() - pbase();
+    if (n > 0) {
+      status_ = out_->SaveChunk(pbase(), n);
+      if (!status_.ok()) return -1;
+      setp(buf_.data(), buf_.data() + buf_.size());
+    }
+    return 0;
+  }
+
+  RDBChunkOutputStream* out_;
+  std::vector<char> buf_;
+  absl::Status status_ = absl::OkStatus();
+};
+
+// std::streambuf adapter: bridges std::istream reads from RDBChunkInputStream.
+class RDBIstreamBuf : public std::streambuf {
+ public:
+  explicit RDBIstreamBuf(RDBChunkInputStream* in)
+      : in_(in) {}
+
+  absl::Status status() const { return status_; }
+
+ protected:
+  int underflow() override {
+    if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+    if (in_->AtEnd()) return traits_type::eof();
+    auto chunk_or = in_->LoadChunk();
+    if (!chunk_or.ok()) {
+      status_ = chunk_or.status();
+      return traits_type::eof();
+    }
+    current_chunk_ = std::move(*chunk_or);
+    if (!current_chunk_ || current_chunk_->empty()) {
+      return traits_type::eof();
+    }
+    char* data = current_chunk_->data();
+    setg(data, data, data + current_chunk_->size());
+    return traits_type::to_int_type(*gptr());
+  }
+
+ private:
+  RDBChunkInputStream* in_;
+  std::unique_ptr<std::string> current_chunk_;
+  absl::Status status_ = absl::OkStatus();
+};
+
+static constexpr uint32_t kSVSRDBVersion = 2;
+
 template <typename T>
 absl::Status VectorSVS<T>::SaveIndexImpl(
     RDBChunkOutputStream chunked_out) const {
-  return absl::UnimplementedError(
-      "SVS index RDB persistence is not yet implemented");
+  absl::ReaderMutexLock lock(&index_mutex_);
+
+  VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(kSVSRDBVersion));
+
+  VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(build_config_.graph_max_degree));
+  VMSDK_RETURN_IF_ERROR(
+      chunked_out.SaveObject(build_config_.construction_window_size));
+  VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(build_config_.alpha));
+  VMSDK_RETURN_IF_ERROR(
+      chunked_out.SaveObject(build_config_.search_window_size));
+  uint32_t compression = static_cast<uint32_t>(build_config_.compression);
+  VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(compression));
+  VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(build_config_.leanvec_dims));
+  VMSDK_RETURN_IF_ERROR(
+      chunked_out.SaveObject(build_config_.leanvec_training_threshold));
+  uint8_t drop_intern = build_config_.drop_intern_store ? 1 : 0;
+  VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(drop_intern));
+
+  VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(num_elements_));
+
+  // NOTE: SVS runtime save() currently crashes with heap corruption when
+  // called in a forked BGSAVE child. This is tracked as an SVS runtime bug.
+  RDBOstreamBuf ostreambuf(&chunked_out);
+  std::ostream os(&ostreambuf);
+  auto svs_status = svs_index_->save(os);
+  os.flush();
+  if (!svs_status.ok()) {
+    return absl::InternalError(
+        absl::StrCat("SVS save failed: ", svs_status.message()));
+  }
+  VMSDK_RETURN_IF_ERROR(ostreambuf.status());
+
+  return absl::OkStatus();
+}
+
+template <typename T>
+absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
+    ValkeyModuleCtx* ctx,
+    const AttributeDataType* attribute_data_type,
+    const data_model::VectorIndex& vector_index_proto,
+    absl::string_view attribute_identifier,
+    SupplementalContentChunkIter&& iter) {
+  RDBChunkInputStream input(std::move(iter));
+
+  VMSDK_ASSIGN_OR_RETURN(auto version, input.LoadObject<uint32_t>());
+  if (version != kSVSRDBVersion) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unsupported SVS RDB version: ", version));
+  }
+
+  SVSBuildConfig config;
+  VMSDK_ASSIGN_OR_RETURN(config.graph_max_degree,
+                         input.LoadObject<size_t>());
+  VMSDK_ASSIGN_OR_RETURN(config.construction_window_size,
+                         input.LoadObject<size_t>());
+  VMSDK_ASSIGN_OR_RETURN(config.alpha, input.LoadObject<float>());
+  VMSDK_ASSIGN_OR_RETURN(config.search_window_size,
+                         input.LoadObject<size_t>());
+  VMSDK_ASSIGN_OR_RETURN(auto compression_val,
+                         input.LoadObject<uint32_t>());
+  config.compression =
+      static_cast<data_model::SVSCompressionType>(compression_val);
+  VMSDK_ASSIGN_OR_RETURN(config.leanvec_dims, input.LoadObject<size_t>());
+  VMSDK_ASSIGN_OR_RETURN(config.leanvec_training_threshold,
+                         input.LoadObject<size_t>());
+  VMSDK_ASSIGN_OR_RETURN(auto drop_intern_val,
+                         input.LoadObject<uint8_t>());
+  config.drop_intern_store = (drop_intern_val != 0);
+
+  VMSDK_ASSIGN_OR_RETURN(auto num_elements, input.LoadObject<size_t>());
+
+  auto index = std::shared_ptr<VectorSVS<T>>(new VectorSVS<T>(
+      vector_index_proto.dimension_count(),
+      vector_index_proto.distance_metric(), config,
+      attribute_identifier, attribute_data_type->ToProto()));
+
+  index->Init(vector_index_proto.dimension_count(),
+              vector_index_proto.distance_metric(), index->space_);
+
+#ifdef _OPENMP
+  long long omp_threads = options::GetSVSOmpThreads().GetValue();
+  if (omp_threads > 0) {
+    omp_set_num_threads(static_cast<int>(omp_threads));
+  }
+#endif
+
+  auto svs_metric = ToSVSMetric(vector_index_proto.distance_metric());
+  auto storage_kind = ToSVSStorageKind(config.compression);
+
+  RDBIstreamBuf istreambuf(&input);
+  std::istream is(&istreambuf);
+
+  uint64_t rss_before = vmsdk::GetProcessRSSBytes();
+  auto svs_status = svs::runtime::v0::DynamicVamanaIndex::load(
+      &index->svs_index_, is, svs_metric, storage_kind);
+  if (!svs_status.ok()) {
+    return absl::InternalError(
+        absl::StrCat("SVS load failed: ", svs_status.message()));
+  }
+  VMSDK_RETURN_IF_ERROR(istreambuf.status());
+
+  index->num_elements_ = num_elements;
+  index->UpdateRuntimeMemoryAccounting(rss_before);
+
+  VMSDK_LOG(NOTICE, nullptr)
+      << "Loaded SVS Vamana index from RDB: dim="
+      << vector_index_proto.dimension_count()
+      << " compression=" << CompressionTypeName(config.compression)
+      << " num_elements=" << num_elements;
+
+  return index;
 }
 
 // Explicit template instantiation
