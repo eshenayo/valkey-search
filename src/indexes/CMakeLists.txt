@@ -94,11 +94,10 @@ if(ENABLE_SVS)
   target_link_libraries(vector_svs PUBLIC valkey_module)
 
   # SVS runtime: auto-fetch pre-built bindings from GitHub releases
-  # (same pattern as FAISS -DFAISS_ENABLE_SVS=ON)
   find_package(OpenMP REQUIRED)
   include(FetchContent)
   set(SVS_URL
-      "https://github.com/intel/ScalableVectorSearch/releases/download/v0.4.0/svs-cpp-runtime-bindings.tar.gz"
+      "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-cpp-runtime-bindings-nightly-2026-06-23-1416.tar.gz"
       CACHE STRING "URL to fetch SVS runtime library")
   FetchContent_Declare(svs URL "${SVS_URL}")
   FetchContent_MakeAvailable(svs)
