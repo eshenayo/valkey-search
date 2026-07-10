@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -111,6 +112,12 @@ class VectorSVS : public VectorBase {
       std::optional<unsigned> search_window_size = std::nullopt)
       ABSL_LOCKS_EXCLUDED(index_mutex_);
 
+  // Pre-fork RDB serialization: serialize SVS graph to an in-memory buffer
+  // so the forked BGSAVE child only writes raw bytes (SVS runtime is not
+  // fork-safe).
+  void PreSerializeForRDB() ABSL_LOCKS_EXCLUDED(index_mutex_);
+  void ClearPreSerializedData() ABSL_LOCKS_EXCLUDED(index_mutex_);
+
  protected:
   absl::Status AddRecordImpl(uint64_t internal_id,
                              absl::string_view record) override
@@ -189,6 +196,12 @@ class VectorSVS : public VectorBase {
   size_t last_reported_svs_memory_ ABSL_GUARDED_BY(index_mutex_){0};
 
   void UpdateReportedMemory() ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
+
+  // Pre-serialized SVS graph data for fork-safe RDB persistence.
+  // Populated in AtForkPrepare, consumed in SaveIndexImpl (forked child),
+  // cleared in AfterForkParent.
+  mutable std::optional<std::string> pre_serialized_snapshot_
+      ABSL_GUARDED_BY(index_mutex_);
 };
 
 }  // namespace valkey_search::indexes

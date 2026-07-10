@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <streambuf>
 #include <type_traits>
 #include <utility>
@@ -1106,6 +1107,30 @@ class RDBIstreamBuf : public std::streambuf {
 static constexpr uint32_t kSVSRDBVersion = 2;
 
 template <typename T>
+void VectorSVS<T>::PreSerializeForRDB() {
+  absl::WriterMutexLock lock(&index_mutex_);
+  if (!svs_index_ || num_elements_ == 0) {
+    pre_serialized_snapshot_ = std::string();
+    return;
+  }
+  std::ostringstream oss(std::ios::binary);
+  auto status = svs_index_->save(oss);
+  if (!status.ok()) {
+    VMSDK_LOG(WARNING, nullptr)
+        << "SVS pre-serialization failed: " << status.message();
+    pre_serialized_snapshot_ = std::nullopt;
+    return;
+  }
+  pre_serialized_snapshot_ = oss.str();
+}
+
+template <typename T>
+void VectorSVS<T>::ClearPreSerializedData() {
+  absl::WriterMutexLock lock(&index_mutex_);
+  pre_serialized_snapshot_ = std::nullopt;
+}
+
+template <typename T>
 absl::Status VectorSVS<T>::SaveIndexImpl(
     RDBChunkOutputStream chunked_out) const {
   absl::ReaderMutexLock lock(&index_mutex_);
@@ -1128,17 +1153,29 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
 
   VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(num_elements_));
 
-  // NOTE: SVS runtime save() currently crashes with heap corruption when
-  // called in a forked BGSAVE child. This is tracked as an SVS runtime bug.
-  RDBOstreamBuf ostreambuf(&chunked_out);
-  std::ostream os(&ostreambuf);
-  auto svs_status = svs_index_->save(os);
-  os.flush();
-  if (!svs_status.ok()) {
-    return absl::InternalError(
-        absl::StrCat("SVS save failed: ", svs_status.message()));
+  if (pre_serialized_snapshot_.has_value()) {
+    // Fork-safe path: write pre-serialized bytes (no SVS library calls).
+    const std::string& data = *pre_serialized_snapshot_;
+    if (!data.empty()) {
+      VMSDK_RETURN_IF_ERROR(
+          chunked_out.SaveChunk(data.data(), data.size()));
+    }
+  } else {
+    // Foreground SAVE (no fork) — serialize to buffer first, then write.
+    // SVS save() crashes when writing through the RDBOstreamBuf callback
+    // chain (protobuf allocations interfere with SVS internals).
+    std::ostringstream oss(std::ios::binary);
+    auto svs_status = svs_index_->save(oss);
+    if (!svs_status.ok()) {
+      return absl::InternalError(
+          absl::StrCat("SVS save failed: ", svs_status.message()));
+    }
+    std::string data = oss.str();
+    if (!data.empty()) {
+      VMSDK_RETURN_IF_ERROR(
+          chunked_out.SaveChunk(data.data(), data.size()));
+    }
   }
-  VMSDK_RETURN_IF_ERROR(ostreambuf.status());
 
   return absl::OkStatus();
 }
