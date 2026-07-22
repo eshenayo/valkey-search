@@ -63,6 +63,12 @@ struct SVSBuildConfig {
   // LeanVec-only: number of vectors to accumulate before training matrices
   // and constructing the index. Default 10000.
   size_t leanvec_training_threshold = 10000;
+  // LeanVec-only: enable OOD (Out-of-Distribution) training. Trains the
+  // projection matrix using representative queries sampled from the dataset.
+  bool leanvec_ood = false;
+  // LeanVec-only: number of OOD training queries sampled from the buffered
+  // vectors (non-overlapping with the baseline training set).
+  size_t leanvec_ood_query_count = 5000;
   // When true, skip the intern store and use SVS native APIs for vector
   // retrieval and distance computation.
   bool drop_intern_store = false;

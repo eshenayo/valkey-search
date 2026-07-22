@@ -51,6 +51,9 @@ constexpr absl::string_view kCompressionParam{"COMPRESSION"};
 constexpr absl::string_view kLeanVecDimsParam{"LEANVEC_DIMS"};
 constexpr absl::string_view kLeanVecTrainingThresholdParam{
     "LEANVEC_TRAINING_THRESHOLD"};
+constexpr absl::string_view kLeanVecOODParam{"LEANVEC_OOD"};
+constexpr absl::string_view kLeanVecOODQueryCountParam{
+    "LEANVEC_OOD_QUERY_COUNT"};
 constexpr absl::string_view kRawVectorStorageParam{"RAW_VECTOR_STORAGE"};
 constexpr absl::string_view kDistanceMatchEpsilonParam{
     "DISTANCE_MATCH_EPSILON"};
@@ -398,6 +401,11 @@ vmsdk::KeyValueParser<SVSParameters> CreateSVSParser() {
   parser.AddParamParser(
       kLeanVecTrainingThresholdParam,
       GENERATE_VALUE_PARSER(SVSParameters, leanvec_training_threshold));
+  parser.AddParamParser(kLeanVecOODParam,
+                        GENERATE_FLAG_PARSER(SVSParameters, leanvec_ood));
+  parser.AddParamParser(
+      kLeanVecOODQueryCountParam,
+      GENERATE_VALUE_PARSER(SVSParameters, leanvec_ood_query_count));
   parser.AddParamParser(
       kRawVectorStorageParam,
       GENERATE_ENUM_PARSER(SVSParameters, raw_vector_storage,
@@ -919,9 +927,24 @@ absl::Status SVSParameters::Verify() const {
       return absl::InvalidArgumentError(
           "LEANVEC_TRAINING_THRESHOLD must be at least 1.");
     }
+    if (leanvec_ood && leanvec_ood_query_count < 1) {
+      return absl::InvalidArgumentError(
+          "LEANVEC_OOD_QUERY_COUNT must be at least 1 when LEANVEC_OOD is set.");
+    }
+    if (leanvec_ood && static_cast<uint32_t>(leanvec_ood_query_count) >=
+                           static_cast<uint32_t>(leanvec_training_threshold)) {
+      return absl::InvalidArgumentError(
+          "LEANVEC_OOD_QUERY_COUNT must be less than "
+          "LEANVEC_TRAINING_THRESHOLD (queries are sampled from the "
+          "non-baseline portion of the training buffer).");
+    }
   } else if (leanvec_dims > 0) {
     return absl::InvalidArgumentError(
         "LEANVEC_DIMS is only valid with LEANVEC* COMPRESSION.");
+  }
+  if (!is_leanvec && leanvec_ood) {
+    return absl::InvalidArgumentError(
+        "LEANVEC_OOD is only valid with LEANVEC* COMPRESSION.");
   }
   return absl::OkStatus();
 }
@@ -937,6 +960,8 @@ std::unique_ptr<data_model::VectorIndex> SVSParameters::ToProto() const {
   svs_algorithm_proto->set_leanvec_dims(leanvec_dims);
   svs_algorithm_proto->set_leanvec_training_threshold(
       leanvec_training_threshold);
+  svs_algorithm_proto->set_leanvec_ood(leanvec_ood);
+  svs_algorithm_proto->set_leanvec_ood_query_count(leanvec_ood_query_count);
   svs_algorithm_proto->set_raw_vector_storage(raw_vector_storage);
   svs_algorithm_proto->set_distance_match_epsilon_per_dim(
       distance_match_epsilon_per_dim);

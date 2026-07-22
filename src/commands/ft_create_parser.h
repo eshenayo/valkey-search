@@ -130,6 +130,7 @@ constexpr int kDefaultSVSConstructionWindowSize{128};
 constexpr int kDefaultSVSSearchWindowSize{10};
 constexpr float kDefaultSVSAlpha{1.2f};
 constexpr int kDefaultSVSLeanVecTrainingThreshold{10000};
+constexpr int kDefaultSVSLeanVecOODQueryCount{5000};
 
 struct SVSParameters : public FTCreateVectorParameters {
   int graph_max_degree{kDefaultSVSGraphMaxDegree};
@@ -140,6 +141,9 @@ struct SVSParameters : public FTCreateVectorParameters {
   // Required (>0) when compression is one of LEANVEC*. Must be < dimensions.
   int leanvec_dims{0};
   int leanvec_training_threshold{kDefaultSVSLeanVecTrainingThreshold};
+  // OOD training for LeanVec projection matrix.
+  bool leanvec_ood{false};
+  int leanvec_ood_query_count{kDefaultSVSLeanVecOODQueryCount};
   data_model::RawVectorStorage raw_vector_storage{
       data_model::RAW_VECTOR_STORAGE_KEEP};
   float distance_match_epsilon_per_dim{0.0f};  // 0 = use compiled default

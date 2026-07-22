@@ -151,5 +151,14 @@ message SVSVamanaAlgorithm {
   // Effective threshold = this value * dimension_count.
   // 0 means use the compiled default (kDefaultDistanceMatchEpsilonPerDim).
   float distance_match_epsilon_per_dim = 9;
+  // Enable Out-of-Distribution (OOD) training for LeanVec. When true, the
+  // projection matrix is trained using representative queries sampled from
+  // the dataset, preserving dimensions relevant to query patterns rather
+  // than just maximum data variance. Only used for LEANVEC* compression.
+  bool leanvec_ood = 10;
+  // Number of OOD training queries to sample from the buffered vectors
+  // (non-overlapping with the baseline training set). Only used when
+  // leanvec_ood is true. Default 5000.
+  uint32 leanvec_ood_query_count = 11;
 }
 

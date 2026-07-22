@@ -211,6 +211,10 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
       config.leanvec_training_threshold =
           svs_params.leanvec_training_threshold();
     }
+    config.leanvec_ood = svs_params.leanvec_ood();
+    if (svs_params.leanvec_ood_query_count() > 0) {
+      config.leanvec_ood_query_count = svs_params.leanvec_ood_query_count();
+    }
     if (svs_params.raw_vector_storage() ==
         data_model::RAW_VECTOR_STORAGE_DROP) {
       config.drop_intern_store = true;
@@ -267,7 +271,9 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
         << vector_index_proto.dimension_count()
         << " compression=" << CompressionTypeName(config.compression)
         << " leanvec_dims=" << config.leanvec_dims
-        << " leanvec_training_threshold=" << config.leanvec_training_threshold;
+        << " leanvec_training_threshold=" << config.leanvec_training_threshold
+        << " leanvec_ood=" << (config.leanvec_ood ? "true" : "false")
+        << " leanvec_ood_query_count=" << config.leanvec_ood_query_count;
     return index;
   }
 
@@ -460,13 +466,40 @@ absl::Status VectorSVS<T>::TrainAndBuildLeanVecIndex() {
     }
 
     // 2. Train LeanVec compression matrices.
+    //    When OOD is enabled, split the buffer into a baseline (first portion)
+    //    and OOD queries (random sample from the remainder). The OOD overload
+    //    trains the projection to preserve dimensions relevant to query
+    //    patterns, significantly improving recall.
     uint64_t rss_before = vmsdk::GetProcessRSSBytes();
-    auto train_status = svs::runtime::v0::LeanVecTrainingData::build(
-        &leanvec_training_data_,
-        static_cast<size_t>(dimensions_),
-        n,
-        flat.data(),
-        build_config_.leanvec_dims);
+    svs::runtime::v0::Status train_status;
+    if (build_config_.leanvec_ood) {
+      // Baseline: first half of the buffer (or all minus OOD query count).
+      size_t n_ood = std::min(build_config_.leanvec_ood_query_count, n / 2);
+      size_t n_baseline = n - n_ood;
+      // OOD queries are taken from the tail of the shuffled buffer. The
+      // vectors arriving in insertion order from different keys provide
+      // sufficient randomness without an explicit shuffle.
+      const float* baseline_data = flat.data();
+      const float* ood_queries = flat.data() + n_baseline * dimensions_;
+      VMSDK_LOG(NOTICE, nullptr)
+          << "Training LeanVec OOD: baseline=" << n_baseline
+          << " ood_queries=" << n_ood;
+      train_status = svs::runtime::v0::LeanVecTrainingData::build(
+          &leanvec_training_data_,
+          static_cast<size_t>(dimensions_),
+          n_baseline,
+          baseline_data,
+          n_ood,
+          ood_queries,
+          build_config_.leanvec_dims);
+    } else {
+      train_status = svs::runtime::v0::LeanVecTrainingData::build(
+          &leanvec_training_data_,
+          static_cast<size_t>(dimensions_),
+          n,
+          flat.data(),
+          build_config_.leanvec_dims);
+    }
     if (!train_status.ok()) {
       buffer_flushing_ = false;
       return absl::InternalError(absl::StrCat(
@@ -968,6 +1001,9 @@ void VectorSVS<T>::ToProtoImpl(
   svs_algo_proto->set_leanvec_dims(build_config_.leanvec_dims);
   svs_algo_proto->set_leanvec_training_threshold(
       build_config_.leanvec_training_threshold);
+  svs_algo_proto->set_leanvec_ood(build_config_.leanvec_ood);
+  svs_algo_proto->set_leanvec_ood_query_count(
+      build_config_.leanvec_ood_query_count);
   svs_algo_proto->set_raw_vector_storage(
       build_config_.drop_intern_store ? data_model::RAW_VECTOR_STORAGE_DROP
                                       : data_model::RAW_VECTOR_STORAGE_KEEP);
@@ -1003,8 +1039,8 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   // Base pairs: name, graph_max_degree, cws, sws, alpha, compression, state,
   // raw_vector_storage.
   // For LeanVec also: leanvec_dims, leanvec_training_threshold,
-  // training_progress.
-  int n_pairs = is_leanvec ? 11 : 8;
+  // leanvec_ood, leanvec_ood_query_count, training_progress.
+  int n_pairs = is_leanvec ? 13 : 8;
   ValkeyModule_ReplyWithArray(ctx, n_pairs * 2);
 
   ValkeyModule_ReplyWithSimpleString(ctx, "name");
@@ -1038,6 +1074,10 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
     ValkeyModule_ReplyWithSimpleString(ctx, "leanvec_training_threshold");
     ValkeyModule_ReplyWithLongLong(
         ctx, build_config_.leanvec_training_threshold);
+    ValkeyModule_ReplyWithSimpleString(ctx, "leanvec_ood");
+    ValkeyModule_ReplyWithLongLong(ctx, build_config_.leanvec_ood ? 1 : 0);
+    ValkeyModule_ReplyWithSimpleString(ctx, "leanvec_ood_query_count");
+    ValkeyModule_ReplyWithLongLong(ctx, build_config_.leanvec_ood_query_count);
     ValkeyModule_ReplyWithSimpleString(ctx, "training_progress");
     // "buffered/threshold" string so it's grep-friendly in tests.
     auto progress = absl::StrCat(buffered_snapshot, "/",
