@@ -84,8 +84,7 @@ int main() {
     float d_direct = 0.0f;
     auto s = idx->get_distance(/*id*/ i, q.data(), &d_direct);
     if (!s.ok()) {
-      fail("get_distance",
-           "i=" + std::to_string(i) + ": " + s.message());
+      fail("get_distance", "i=" + std::to_string(i) + ": " + s.message());
       DVamana::destroy(idx);
       return 1;
     }

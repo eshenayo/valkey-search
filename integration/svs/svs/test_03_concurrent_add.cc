@@ -23,14 +23,15 @@
 //   ./build_test.sh svs/test_03_concurrent_add
 //   ./svs/test_03_concurrent_add
 //
-// Expected output on current SVS runtime 0.2.0:
-//   **SEGFAULT.** DynamicVamanaIndex::add() is not safe to call from
-//   multiple threads concurrently, even with disjoint labels. This is
-//   why valkey-search serializes all writes with an *exclusive*
+// Status on SVS runtime v0.4.0:
+//   **SEGFAULT.** DynamicVamanaIndex::add() is still not safe to call
+//   from multiple threads concurrently, even with disjoint labels. This
+//   is why valkey-search serializes all writes with an *exclusive*
 //   index_mutex_ around add() in VectorSVS::AddRecordImpl
-//   (src/indexes/vector_svs.cc:230-274).
+//   (src/indexes/vector_svs.cc). Thread safety for concurrent add is a
+//   future SVS runtime ask.
 //
-// Expected output on the new SVS runtime:
+// Expected output once concurrent add() is supported:
 //   No crashes; aggregate add rate scales roughly with thread count,
 //   at least up to core count.
 

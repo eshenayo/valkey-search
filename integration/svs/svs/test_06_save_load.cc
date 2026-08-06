@@ -21,14 +21,15 @@
 //   ./build_test.sh svs/test_06_save_load
 //   ./svs/test_06_save_load
 //
-// Expected output on current SVS runtime 0.2.0:
+// Status on SVS runtime v0.4.0:
 //   **FAIL: top-10 match is typically 1-3 / 10**, even though save and
 //   load both return OK. This indicates the reload produces a
 //   semantically different graph (different search params, different
 //   entry point, or missing state). Surfacing this is the point of the
-//   test — spec §3.9 asks for a stable round-trip.
+//   test — spec §3.9 asks for a stable round-trip. The issue persists
+//   in v0.4.0; stable save/load remains a future SVS runtime ask.
 //
-// Expected output on the new SVS runtime:
+// Expected output once save/load is stable:
 //   100% top-10 match; version-stable across patch releases.
 
 #include <unistd.h>

@@ -66,8 +66,7 @@ int main() {
     size_t label = i;
     auto s = idx->reconstruct_at(1, &label, out.data());
     if (!s.ok()) {
-      fail("reconstruct_at",
-           "i=" + std::to_string(i) + ": " + s.message());
+      fail("reconstruct_at", "i=" + std::to_string(i) + ": " + s.message());
       DVamana::destroy(idx);
       return 1;
     }
