@@ -2,34 +2,27 @@
 //
 // Purpose:
 //   Twin of hnsw/test_08_compute_distance.cc. For a given query,
-//   compute distance to every stored vector via a hypothetical
-//   compute_distance() API on DynamicVamanaIndex, and cross-check
-//   against the distance returned by a full-N search().
+//   compute distance to every stored vector via
+//   DynamicVamanaIndex::get_distance() and cross-check against the
+//   distance returned by a full-N search().
 //
-// Status on current SVS runtime 0.2.0:
-//   **This test is expected to fail at link time.** DynamicVamanaIndex
-//   has no compute_distance() method. The link error IS the ask
-//   (spec §3.6).
+// Status on SVS runtime v0.4.0:
+//   get_distance(id, query, distance) is available on VamanaIndex as of
+//   v0.3.0. This test uses the member API directly.
 //
 // valkey-search code path this mimics:
 //   VectorSVS::ComputeDistanceFromRecordImpl
-//       src/indexes/vector_svs.cc:640-658 — currently uses raw_vectors_
-//       + an hnswlib SpaceInterface to avoid calling SVS. We want to
-//       replace that with a native SVS call.
-//
-// Spec section: §3.6 — expose compute_distance(label, query, float*).
+//       src/indexes/vector_svs.cc — currently uses raw_vectors_ +
+//       an hnswlib SpaceInterface. A future change can replace that
+//       with get_distance() to remove the shadow store dependency.
+//       The epsilon fix (IsVectorMatch) already uses get_distance().
 //
 // Reproduction:
 //   ./build_test.sh svs/test_08_compute_distance
-//   # On current SVS 0.2.0:
-//   #   undefined reference to
-//   svs::runtime::v0::DynamicVamanaIndex::compute_distance # On the new SVS
-//   runtime:
 //   ./svs/test_08_compute_distance
 //
-// Expected output (new runtime): |direct - search| below 1e-4 for FP32;
-// for compressed storage, the exact error bound depends on the
-// quantizer (typically < 1% of distance magnitude).
+// Expected output: |direct - search| below 1e-4 for FP32; for
+// compressed storage the bound depends on the quantizer.
 
 #include <algorithm>
 #include <climits>
@@ -40,18 +33,6 @@
 
 #include "svs_common.h"
 #include "test_common.h"
-
-// Forward declaration of the desired API. Absent from 0.2.0; will link
-// once the SVS team adds it.
-namespace svs {
-namespace runtime {
-namespace v0 {
-Status dynamic_vamana_compute_distance(const DynamicVamanaIndex* idx,
-                                       size_t label, const float* query,
-                                       float* out) noexcept;
-}
-}  // namespace runtime
-}  // namespace svs
 
 using namespace svstest;
 using svstest::svs_::DVamana;
@@ -96,15 +77,15 @@ int main() {
   for (size_t i = 0; i < kN; ++i)
     if (slabels[i] != SIZE_MAX) dist_from_search[slabels[i]] = sdists[i];
 
-  section("compute_distance");
+  section("get_distance");
   size_t mismatches = 0;
   double max_abs_err = 0.0;
   for (size_t i = 0; i < kN; ++i) {
     float d_direct = 0.0f;
-    auto s = ::svs::runtime::v0::dynamic_vamana_compute_distance(
-        idx, /*label*/ i, q.data(), &d_direct);
+    auto s = idx->get_distance(/*id*/ i, q.data(), &d_direct);
     if (!s.ok()) {
-      fail("compute_distance", "i=" + std::to_string(i) + ": " + s.message());
+      fail("get_distance",
+           "i=" + std::to_string(i) + ": " + s.message());
       DVamana::destroy(idx);
       return 1;
     }
