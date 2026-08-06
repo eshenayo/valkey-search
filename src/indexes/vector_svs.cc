@@ -10,11 +10,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <sstream>
 #include <streambuf>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -49,6 +51,69 @@
 namespace valkey_search::indexes {
 
 namespace {
+
+// A streambuf that uses glibc's allocator directly (__libc_malloc/realloc/free)
+// for its internal buffer. This prevents allocator mismatch when SVS (which uses
+// glibc) writes to a stream whose buffer would otherwise be managed by jemalloc
+// (via the module's operator new override).
+extern "C" {
+extern void* __libc_malloc(size_t);
+extern void __libc_free(void*);
+extern void* __libc_realloc(void*, size_t);
+}
+
+class GlibcStreamBuf : public std::streambuf {
+ public:
+  GlibcStreamBuf() = default;
+  ~GlibcStreamBuf() override { __libc_free(buf_); }
+
+  GlibcStreamBuf(const GlibcStreamBuf&) = delete;
+  GlibcStreamBuf& operator=(const GlibcStreamBuf&) = delete;
+
+  std::string_view view() const {
+    return {buf_, static_cast<size_t>(pptr() - pbase())};
+  }
+
+ protected:
+  int_type overflow(int_type ch) override {
+    if (ch == traits_type::eof()) return traits_type::not_eof(ch);
+    size_t used = pptr() - pbase();
+    size_t new_cap = cap_ == 0 ? 4096 : cap_ * 2;
+    char* new_buf =
+        static_cast<char*>(__libc_realloc(buf_, new_cap));
+    if (!new_buf) return traits_type::eof();
+    buf_ = new_buf;
+    cap_ = new_cap;
+    setp(buf_, buf_ + cap_);
+    pbump(static_cast<int>(used));
+    *pptr() = static_cast<char>(ch);
+    pbump(1);
+    return traits_type::to_int_type(static_cast<unsigned char>(ch));
+  }
+
+  std::streamsize xsputn(const char* s, std::streamsize n) override {
+    size_t used = pptr() - pbase();
+    size_t needed = used + static_cast<size_t>(n);
+    if (needed > cap_) {
+      size_t new_cap = cap_ == 0 ? 4096 : cap_;
+      while (new_cap < needed) new_cap *= 2;
+      char* new_buf =
+          static_cast<char*>(__libc_realloc(buf_, new_cap));
+      if (!new_buf) return 0;
+      buf_ = new_buf;
+      cap_ = new_cap;
+      setp(buf_, buf_ + cap_);
+      pbump(static_cast<int>(used));
+    }
+    std::memcpy(pptr(), s, static_cast<size_t>(n));
+    pbump(static_cast<int>(n));
+    return n;
+  }
+
+ private:
+  char* buf_ = nullptr;
+  size_t cap_ = 0;
+};
 
 // Convert valkey-search distance metric to SVS MetricType.
 svs::runtime::v0::MetricType ToSVSMetric(data_model::DistanceMetric metric) {
@@ -303,10 +368,60 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
 // --- Mutation methods ---
 
 template <typename T>
+absl::Status VectorSVS<T>::EnsureSVSIndex() {
+  if (svs_index_ != nullptr) return absl::OkStatus();
+
+  // svs_index_ is null when LoadFromRDB loaded an RDB that had no graph data
+  // (has_graph_data=0). Rebuild an empty index using the stored config so that
+  // subsequent Add operations can populate it normally.
+  auto svs_metric = ToSVSMetric(distance_metric_);
+  auto storage_kind = ToSVSStorageKind(build_config_.compression);
+
+  svs::runtime::v0::VamanaIndex::BuildParams build_params;
+  build_params.graph_max_degree = build_config_.graph_max_degree;
+  build_params.construction_window_size =
+      build_config_.construction_window_size;
+  build_params.alpha = build_config_.alpha;
+
+  svs::runtime::v0::VamanaIndex::SearchParams search_params;
+  search_params.search_window_size = build_config_.search_window_size;
+
+  svs::runtime::v0::Status status;
+  if (IsLeanVecCompression(build_config_.compression)) {
+    status = svs::runtime::v0::DynamicVamanaIndexLeanVec::build(
+        &svs_index_, dimensions_, svs_metric, storage_kind,
+        build_config_.leanvec_dims, build_params, search_params);
+  } else {
+    status = svs::runtime::v0::DynamicVamanaIndex::build(
+        &svs_index_, dimensions_, svs_metric, storage_kind,
+        build_params, search_params);
+  }
+
+  if (!status.ok()) {
+    return absl::InternalError(
+        absl::StrCat("SVS lazy-init build failed: ", status.message()));
+  }
+  if (svs_index_ == nullptr) {
+    return absl::InternalError("SVS lazy-init: build() returned null index");
+  }
+  VMSDK_LOG(NOTICE, nullptr)
+      << "SVS index lazily re-initialized after empty restore (dim="
+      << dimensions_ << ")";
+  return absl::OkStatus();
+}
+
+template <typename T>
 absl::Status VectorSVS<T>::AddRecordImpl(uint64_t internal_id,
                                          absl::string_view record) {
   try {
     absl::MutexLock lock(&index_mutex_);
+
+    // For the empty-restore path (LoadFromRDB with has_graph_data=0), the
+    // SVS index is null but index_state_ is kReady. Initialize it lazily
+    // before the first add so FlushBuffer() can insert into a valid index.
+    if (index_state_ == SVSIndexState::kReady && svs_index_ == nullptr) {
+      if (auto s = EnsureSVSIndex(); !s.ok()) return s;
+    }
 
     // Buffer the vector instead of immediate SVS insert (for benchmarking)
     pending_buffer_.push_back(
@@ -594,13 +709,16 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
 
     size_t label = static_cast<size_t>(internal_id);
     auto remove_status = svs_index_->remove(1, &label);
+    svs::runtime::v0::Status add_status;
+    if (remove_status.ok()) {
+      add_status = svs_index_->add(
+          1, &label, reinterpret_cast<const float*>(record.data()));
+    }
     if (!remove_status.ok()) {
       return absl::InternalError(absl::StrCat("SVS remove (modify) failed: ",
                                               remove_status.message()));
     }
 
-    auto add_status = svs_index_->add(
-        1, &label, reinterpret_cast<const float*>(record.data()));
     if (!add_status.ok()) {
       if (num_elements_ > 0) {
         --num_elements_;
@@ -1104,7 +1222,7 @@ class RDBIstreamBuf : public std::streambuf {
   absl::Status status_ = absl::OkStatus();
 };
 
-static constexpr uint32_t kSVSRDBVersion = 2;
+static constexpr uint32_t kSVSRDBVersion = 3;
 
 template <typename T>
 void VectorSVS<T>::PreSerializeForRDB() {
@@ -1113,15 +1231,26 @@ void VectorSVS<T>::PreSerializeForRDB() {
     pre_serialized_snapshot_ = std::string();
     return;
   }
-  std::ostringstream oss(std::ios::binary);
-  auto status = svs_index_->save(oss);
-  if (!status.ok()) {
+  try {
+    GlibcStreamBuf sbuf;
+    std::ostream oss(&sbuf);
+    auto status = svs_index_->save(oss);
+    if (!status.ok()) {
+      VMSDK_LOG(WARNING, nullptr)
+          << "SVS pre-serialization failed: " << status.message();
+      pre_serialized_snapshot_ = std::nullopt;
+      return;
+    }
+    auto sv = sbuf.view();
+    pre_serialized_snapshot_ = std::string(sv.data(), sv.size());
+  } catch (const std::exception& e) {
     VMSDK_LOG(WARNING, nullptr)
-        << "SVS pre-serialization failed: " << status.message();
+        << "SVS pre-serialization exception: " << e.what();
     pre_serialized_snapshot_ = std::nullopt;
-    return;
+  } catch (...) {
+    VMSDK_LOG(WARNING, nullptr) << "SVS pre-serialization unknown exception";
+    pre_serialized_snapshot_ = std::nullopt;
   }
-  pre_serialized_snapshot_ = oss.str();
 }
 
 template <typename T>
@@ -1156,25 +1285,53 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
   if (pre_serialized_snapshot_.has_value()) {
     // Fork-safe path: write pre-serialized bytes (no SVS library calls).
     const std::string& data = *pre_serialized_snapshot_;
+    uint8_t has_graph_data = data.empty() ? 0 : 1;
+    VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
     if (!data.empty()) {
       VMSDK_RETURN_IF_ERROR(
           chunked_out.SaveChunk(data.data(), data.size()));
+    }
+  } else if (svs_index_ != nullptr) {
+    // Foreground SAVE (no fork, no pre-serialization failure) — serialize
+    // directly. Use GlibcStreamBuf to keep the buffer in glibc's heap.
+    try {
+      GlibcStreamBuf sbuf;
+      std::ostream oss(&sbuf);
+      auto svs_status = svs_index_->save(oss);
+      if (!svs_status.ok()) {
+        VMSDK_LOG(WARNING, nullptr)
+            << "SVS foreground save failed: " << svs_status.message()
+            << " — RDB will contain empty graph for this index.";
+        uint8_t has_graph_data = 0;
+        VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
+      } else {
+        auto sv = sbuf.view();
+        uint8_t has_graph_data = sv.empty() ? 0 : 1;
+        VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
+        if (!sv.empty()) {
+          VMSDK_RETURN_IF_ERROR(
+              chunked_out.SaveChunk(sv.data(), sv.size()));
+        }
+      }
+    } catch (const std::exception& e) {
+      VMSDK_LOG(WARNING, nullptr)
+          << "SVS foreground save exception: " << e.what()
+          << " — RDB will contain empty graph for this index.";
+      uint8_t has_graph_data = 0;
+      VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
+    } catch (...) {
+      VMSDK_LOG(WARNING, nullptr)
+          << "SVS foreground save unknown exception"
+          << " — RDB will contain empty graph for this index.";
+      uint8_t has_graph_data = 0;
+      VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
     }
   } else {
-    // Foreground SAVE (no fork) — serialize to buffer first, then write.
-    // SVS save() crashes when writing through the RDBOstreamBuf callback
-    // chain (protobuf allocations interfere with SVS internals).
-    std::ostringstream oss(std::ios::binary);
-    auto svs_status = svs_index_->save(oss);
-    if (!svs_status.ok()) {
-      return absl::InternalError(
-          absl::StrCat("SVS save failed: ", svs_status.message()));
-    }
-    std::string data = oss.str();
-    if (!data.empty()) {
-      VMSDK_RETURN_IF_ERROR(
-          chunked_out.SaveChunk(data.data(), data.size()));
-    }
+    // svs_index_ is null (empty-restored index or pre-serialization failed
+    // with no index available). Write has_graph_data=0; load path will
+    // create an empty index.
+    uint8_t has_graph_data = 0;
+    VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
   }
 
   return absl::OkStatus();
@@ -1190,7 +1347,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
   RDBChunkInputStream input(std::move(iter));
 
   VMSDK_ASSIGN_OR_RETURN(auto version, input.LoadObject<uint32_t>());
-  if (version != kSVSRDBVersion) {
+  if (version != 2 && version != kSVSRDBVersion) {
     return absl::InvalidArgumentError(
         absl::StrCat("Unsupported SVS RDB version: ", version));
   }
@@ -1216,6 +1373,13 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
 
   VMSDK_ASSIGN_OR_RETURN(auto num_elements, input.LoadObject<size_t>());
 
+  // v3+: has_graph_data flag indicates whether graph bytes follow.
+  // v2:  graph data is always present for non-empty indexes (no flag byte).
+  uint8_t has_graph_data = 1;
+  if (version >= 3) {
+    VMSDK_ASSIGN_OR_RETURN(has_graph_data, input.LoadObject<uint8_t>());
+  }
+
   auto index = std::shared_ptr<VectorSVS<T>>(new VectorSVS<T>(
       vector_index_proto.dimension_count(),
       vector_index_proto.distance_metric(), config,
@@ -1223,6 +1387,21 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
 
   index->Init(vector_index_proto.dimension_count(),
               vector_index_proto.distance_metric(), index->space_);
+
+  if (has_graph_data == 0) {
+    // Pre-serialization failed or save() threw — no graph data in RDB.
+    // Return an empty (but valid) index; mutations will re-build via the
+    // lazy-init path in AddRecordImpl when keys are re-written.
+    if (num_elements > 0) {
+      VMSDK_LOG(WARNING, nullptr)
+          << "SVS RDB: graph data unavailable for " << num_elements
+          << " vectors (dim=" << vector_index_proto.dimension_count()
+          << " compression=" << CompressionTypeName(config.compression)
+          << "). Index will be empty until vectors are re-indexed.";
+    }
+    index->num_elements_ = 0;
+    return index;
+  }
 
 #ifdef _OPENMP
   long long omp_threads = options::GetSVSOmpThreads().GetValue();

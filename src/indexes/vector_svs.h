@@ -161,7 +161,14 @@ class VectorSVS : public VectorBase {
   absl::Status TrainAndBuildLeanVecIndex()
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
 
-  // SVS index (owned, destroyed via DynamicVamanaIndex::destroy)
+  // Ensure svs_index_ is initialized. Called from AddRecordImpl to handle
+  // the empty-restore path (LoadFromRDB with has_graph_data=0), where
+  // svs_index_ is null until the first mutation.
+  absl::Status EnsureSVSIndex()
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
+
+  // SVS index (owned, destroyed via DynamicVamanaIndex::destroy).
+  // Non-null after Create() or after the first Add on an empty-restored index.
   svs::runtime::v0::DynamicVamanaIndex* svs_index_
       ABSL_GUARDED_BY(index_mutex_){nullptr};
   SVSBuildConfig build_config_;
