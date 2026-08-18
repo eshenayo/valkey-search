@@ -1232,6 +1232,12 @@ void VectorSVS<T>::PreSerializeForRDB() {
     return;
   }
   try {
+#ifdef _OPENMP
+    // Force single-threaded serialization. save() opens OMP parallel regions
+    // and the main thread (AtForkPrepare) may never have had omp_set_num_threads
+    // called on it, causing OMP to default to all CPUs and abort() under load.
+    omp_set_num_threads(1);
+#endif
     GlibcStreamBuf sbuf;
     std::ostream oss(&sbuf);
     auto status = svs_index_->save(oss);
@@ -1295,6 +1301,9 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
     // Foreground SAVE (no fork, no pre-serialization failure) — serialize
     // directly. Use GlibcStreamBuf to keep the buffer in glibc's heap.
     try {
+#ifdef _OPENMP
+      omp_set_num_threads(1);
+#endif
       GlibcStreamBuf sbuf;
       std::ostream oss(&sbuf);
       auto svs_status = svs_index_->save(oss);
