@@ -1144,51 +1144,6 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   return 4;  // 4 top-level reply pairs: data_type + algorithm
 }
 
-// std::streambuf adapter: bridges std::ostream writes to RDBChunkOutputStream.
-class RDBOstreamBuf : public std::streambuf {
- public:
-  explicit RDBOstreamBuf(RDBChunkOutputStream* out)
-      : out_(out) {
-    buf_.resize(kStreamBufSize);
-    setp(buf_.data(), buf_.data() + buf_.size());
-  }
-
-  ~RDBOstreamBuf() override { sync(); }
-
-  absl::Status status() const { return status_; }
-
- protected:
-  int overflow(int ch) override {
-    if (!status_.ok()) return traits_type::eof();
-    if (flush_buffer() != 0) return traits_type::eof();
-    if (ch != traits_type::eof()) {
-      *pptr() = static_cast<char>(ch);
-      pbump(1);
-    }
-    return ch;
-  }
-
-  int sync() override {
-    return flush_buffer();
-  }
-
- private:
-  static constexpr size_t kStreamBufSize = 4 * 1024 * 1024;
-
-  int flush_buffer() {
-    auto n = pptr() - pbase();
-    if (n > 0) {
-      status_ = out_->SaveChunk(pbase(), n);
-      if (!status_.ok()) return -1;
-      setp(buf_.data(), buf_.data() + buf_.size());
-    }
-    return 0;
-  }
-
-  RDBChunkOutputStream* out_;
-  std::vector<char> buf_;
-  absl::Status status_ = absl::OkStatus();
-};
 
 // std::streambuf adapter: bridges std::istream reads from RDBChunkInputStream.
 class RDBIstreamBuf : public std::streambuf {
@@ -1356,7 +1311,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
   RDBChunkInputStream input(std::move(iter));
 
   VMSDK_ASSIGN_OR_RETURN(auto version, input.LoadObject<uint32_t>());
-  if (version != 2 && version != kSVSRDBVersion) {
+  if (version != kSVSRDBVersion) {
     return absl::InvalidArgumentError(
         absl::StrCat("Unsupported SVS RDB version: ", version));
   }
@@ -1381,13 +1336,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
   config.drop_intern_store = (drop_intern_val != 0);
 
   VMSDK_ASSIGN_OR_RETURN(auto num_elements, input.LoadObject<size_t>());
-
-  // v3+: has_graph_data flag indicates whether graph bytes follow.
-  // v2:  graph data is always present for non-empty indexes (no flag byte).
-  uint8_t has_graph_data = 1;
-  if (version >= 3) {
-    VMSDK_ASSIGN_OR_RETURN(has_graph_data, input.LoadObject<uint8_t>());
-  }
+  VMSDK_ASSIGN_OR_RETURN(auto has_graph_data, input.LoadObject<uint8_t>());
 
   auto index = std::shared_ptr<VectorSVS<T>>(new VectorSVS<T>(
       vector_index_proto.dimension_count(),
