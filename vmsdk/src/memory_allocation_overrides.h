@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <sys/mman.h>
 #include <type_traits>
 
 #include "vmsdk/src/memory_allocation.h"
@@ -46,6 +47,11 @@ WEAK_SYMBOL int (*__real_posix_memalign)(void**, size_t,
                                          size_t) = posix_memalign;
 // NOLINTNEXTLINE
 WEAK_SYMBOL void* (*__real_valloc)(size_t) = valloc;
+// NOLINTNEXTLINE
+WEAK_SYMBOL void* (*__real_mmap)(void*, size_t, int, int, int,
+                                  off_t) = mmap;
+// NOLINTNEXTLINE
+WEAK_SYMBOL int (*__real_munmap)(void*, size_t) = munmap;
 // NOLINTNEXTLINE
 __attribute__((weak)) size_t empty_usable_size(void* ptr) noexcept;
 }  // extern "C"
