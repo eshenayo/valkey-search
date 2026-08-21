@@ -13,6 +13,8 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <setjmp.h>
+#include <signal.h>
 #include <memory>
 #include <sstream>
 #include <streambuf>
@@ -70,17 +72,19 @@ class GlibcStreamBuf : public std::streambuf {
   GlibcStreamBuf(const GlibcStreamBuf&) = delete;
   GlibcStreamBuf& operator=(const GlibcStreamBuf&) = delete;
 
+  // Returns all bytes written, including data written before a seek-back.
   std::string_view view() const {
-    return {buf_, static_cast<size_t>(pptr() - pbase())};
+    size_t cur = static_cast<size_t>(pptr() - pbase());
+    return {buf_, cur > high_water_ ? cur : high_water_};
   }
 
  protected:
   int_type overflow(int_type ch) override {
     if (ch == traits_type::eof()) return traits_type::not_eof(ch);
-    size_t used = pptr() - pbase();
+    size_t used = static_cast<size_t>(pptr() - pbase());
+    if (used > high_water_) high_water_ = used;
     size_t new_cap = cap_ == 0 ? 4096 : cap_ * 2;
-    char* new_buf =
-        static_cast<char*>(__libc_realloc(buf_, new_cap));
+    char* new_buf = static_cast<char*>(__libc_realloc(buf_, new_cap));
     if (!new_buf) return traits_type::eof();
     buf_ = new_buf;
     cap_ = new_cap;
@@ -88,17 +92,18 @@ class GlibcStreamBuf : public std::streambuf {
     pbump(static_cast<int>(used));
     *pptr() = static_cast<char>(ch);
     pbump(1);
+    size_t after = static_cast<size_t>(pptr() - pbase());
+    if (after > high_water_) high_water_ = after;
     return traits_type::to_int_type(static_cast<unsigned char>(ch));
   }
 
   std::streamsize xsputn(const char* s, std::streamsize n) override {
-    size_t used = pptr() - pbase();
+    size_t used = static_cast<size_t>(pptr() - pbase());
     size_t needed = used + static_cast<size_t>(n);
     if (needed > cap_) {
       size_t new_cap = cap_ == 0 ? 4096 : cap_;
       while (new_cap < needed) new_cap *= 2;
-      char* new_buf =
-          static_cast<char*>(__libc_realloc(buf_, new_cap));
+      char* new_buf = static_cast<char*>(__libc_realloc(buf_, new_cap));
       if (!new_buf) return 0;
       buf_ = new_buf;
       cap_ = new_cap;
@@ -107,12 +112,57 @@ class GlibcStreamBuf : public std::streambuf {
     }
     std::memcpy(pptr(), s, static_cast<size_t>(n));
     pbump(static_cast<int>(n));
+    size_t after = static_cast<size_t>(pptr() - pbase());
+    if (after > high_water_) high_water_ = after;
     return n;
+  }
+
+  // seekp()/tellp() support: SVS save() writes size-prefix headers by seeking
+  // back after writing the payload. Without this, ostream::seekp() calls
+  // setstate(failbit); if SVS enables stream exceptions the resulting
+  // ios::failure escapes save()'s noexcept boundary → std::terminate() → abort.
+  pos_type seekoff(off_type off, std::ios_base::seekdir dir,
+                   std::ios_base::openmode which =
+                       std::ios_base::out) override {
+    if (!(which & std::ios_base::out)) return pos_type(off_type(-1));
+    size_t cur = static_cast<size_t>(pptr() - pbase());
+    size_t logical_end = cur > high_water_ ? cur : high_water_;
+    off_type newpos;
+    if (dir == std::ios_base::beg)
+      newpos = off;
+    else if (dir == std::ios_base::cur)
+      newpos = static_cast<off_type>(cur) + off;
+    else if (dir == std::ios_base::end)
+      newpos = static_cast<off_type>(logical_end) + off;
+    else
+      return pos_type(off_type(-1));
+    if (newpos < 0) return pos_type(off_type(-1));
+    size_t upos = static_cast<size_t>(newpos);
+    if (upos > cap_) {
+      size_t new_cap = cap_ == 0 ? 4096 : cap_;
+      while (new_cap < upos) new_cap *= 2;
+      char* new_buf = static_cast<char*>(__libc_realloc(buf_, new_cap));
+      if (!new_buf) return pos_type(off_type(-1));
+      buf_ = new_buf;
+      cap_ = new_cap;
+    }
+    setp(buf_, buf_ + cap_);
+    pbump(static_cast<int>(upos));
+    return pos_type(newpos);
+  }
+
+  pos_type seekpos(pos_type pos,
+                   std::ios_base::openmode which =
+                       std::ios_base::out) override {
+    return seekoff(off_type(pos), std::ios_base::beg, which);
   }
 
  private:
   char* buf_ = nullptr;
   size_t cap_ = 0;
+  // Highest write position ever reached; allows view() to return all written
+  // data even when the put pointer has been seeked backward.
+  size_t high_water_ = 0;
 };
 
 // Convert valkey-search distance metric to SVS MetricType.
@@ -1186,31 +1236,78 @@ void VectorSVS<T>::PreSerializeForRDB() {
     pre_serialized_snapshot_ = std::string();
     return;
   }
-  try {
-#ifdef _OPENMP
-    // Force single-threaded serialization. save() opens OMP parallel regions
-    // and the main thread (AtForkPrepare) may never have had omp_set_num_threads
-    // called on it, causing OMP to default to all CPUs and abort() under load.
-    omp_set_num_threads(1);
-#endif
-    GlibcStreamBuf sbuf;
-    std::ostream oss(&sbuf);
-    auto status = svs_index_->save(oss);
-    if (!status.ok()) {
+
+  // Flush any pending vectors into the SVS graph before serializing.
+  if (!pending_buffer_.empty()) {
+    auto flush_status = FlushBuffer();
+    if (!flush_status.ok()) {
       VMSDK_LOG(WARNING, nullptr)
-          << "SVS pre-serialization failed: " << status.message();
-      pre_serialized_snapshot_ = std::nullopt;
-      return;
+          << "SVS pre-serialization flush failed: " << flush_status.message();
     }
-    auto sv = sbuf.view();
-    pre_serialized_snapshot_ = std::string(sv.data(), sv.size());
-  } catch (const std::exception& e) {
-    VMSDK_LOG(WARNING, nullptr)
-        << "SVS pre-serialization exception: " << e.what();
-    pre_serialized_snapshot_ = std::nullopt;
-  } catch (...) {
-    VMSDK_LOG(WARNING, nullptr) << "SVS pre-serialization unknown exception";
-    pre_serialized_snapshot_ = std::nullopt;
+  }
+
+  // SVS's save() crashes when OMP worker threads are alive: libgomp internally
+  // accesses worker thread data structures (stack pointers, TLS) even for a
+  // 1-thread parallel region. In the parent process these threads are alive; in
+  // the fork child they are dead but their data pointers still exist in libgomp's
+  // state. Either way, save() triggers a crash.
+  //
+  // omp_pause_resource_all(omp_pause_hard) terminates all OMP worker threads and
+  // frees their resources. After this call, save() runs in a clean OMP context
+  // (the calling thread is the only participant). The thread pool restarts on the
+  // next OMP parallel region (e.g., the next add() call).
+  // SVS's save() is declared noexcept but internally throws (C++ exception escaping
+  // the noexcept boundary calls std::terminate() → abort() → SIGABRT). This crash
+  // occurs in any multi-threaded context (parent, fork child, fresh thread) because
+  // the SVS runtime triggers an exception regardless of OMP thread state.
+  //
+  // Approach: intercept SIGABRT with sigsetjmp/siglongjmp so that save() failure
+  // returns control to us instead of killing the process. We log the failure and
+  // fall through to has_graph_data=0.
+  {
+    // Thread-local jump buffer and flag (safe since we join before returning).
+    static thread_local sigjmp_buf svs_jmpbuf;
+    static thread_local volatile bool svs_aborted = false;
+    svs_aborted = false;
+
+    struct sigaction sa_new = {}, sa_old = {};
+    sa_new.sa_handler = [](int) {
+      svs_aborted = true;
+      siglongjmp(svs_jmpbuf, 1);
+    };
+    sa_new.sa_flags = SA_RESETHAND;
+    sigemptyset(&sa_new.sa_mask);
+    sigaction(SIGABRT, &sa_new, &sa_old);
+
+    if (sigsetjmp(svs_jmpbuf, 1) == 0) {
+#ifdef _OPENMP
+      omp_set_num_threads(1);
+#endif
+      GlibcStreamBuf sbuf;
+      std::ostream oss(&sbuf);
+      auto status = svs_index_->save(oss);
+      sigaction(SIGABRT, &sa_old, nullptr);
+      if (!status.ok()) {
+        VMSDK_LOG(WARNING, nullptr)
+            << "SVS pre-serialization failed: " << status.message();
+        pre_serialized_snapshot_ = std::nullopt;
+      } else {
+        auto sv = sbuf.view();
+        pre_serialized_snapshot_ = std::string(sv.data(), sv.size());
+        VMSDK_LOG(NOTICE, nullptr)
+            << "SVS pre-serialization: " << sv.size() << " bytes cached.";
+      }
+    } else {
+      // save() caused SIGABRT (exception escaped noexcept → std::terminate → abort).
+      // Set snapshot to empty string (not nullopt) so SaveIndexImpl in the fork
+      // child writes has_graph_data=0 without attempting save() again.
+      sigaction(SIGABRT, &sa_old, nullptr);
+      VMSDK_LOG(WARNING, nullptr)
+          << "SVS pre-serialization: save() caused SIGABRT — "
+             "index will not be persisted in this BGSAVE cycle.";
+      pre_serialized_snapshot_ = std::string();
+    }
+    return;
   }
 }
 
@@ -1255,6 +1352,20 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
   } else if (svs_index_ != nullptr) {
     // Foreground SAVE (no fork, no pre-serialization failure) — serialize
     // directly. Use GlibcStreamBuf to keep the buffer in glibc's heap.
+    //
+    // If there are vectors in pending_buffer_ (below the auto-flush threshold),
+    // SVS save() would fail because the graph is empty. We cannot call
+    // FlushBuffer() here (const function; flush requires exclusive mutation).
+    // Write has_graph_data=0 so that the load path performs a lazy rebuild.
+    if (!pending_buffer_.empty()) {
+      VMSDK_LOG(WARNING, nullptr)
+          << "SVS foreground save: " << pending_buffer_.size()
+          << " vectors pending flush (below auto-flush threshold of "
+          << kBufferSize << "); graph will be empty in RDB. "
+             "Use BGSAVE for full persistence.";
+      uint8_t has_graph_data = 0;
+      VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
+    } else {
     try {
 #ifdef _OPENMP
       omp_set_num_threads(1);
@@ -1290,6 +1401,7 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
       uint8_t has_graph_data = 0;
       VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
     }
+    }  // else (pending_buffer_ is empty)
   } else {
     // svs_index_ is null (empty-restored index or pre-serialization failed
     // with no index available). Write has_graph_data=0; load path will
@@ -1374,7 +1486,6 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
   RDBIstreamBuf istreambuf(&input);
   std::istream is(&istreambuf);
 
-  uint64_t rss_before = vmsdk::GetProcessRSSBytes();
   auto svs_status = svs::runtime::v0::DynamicVamanaIndex::load(
       &index->svs_index_, is, svs_metric, storage_kind);
   if (!svs_status.ok()) {
@@ -1384,7 +1495,10 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
   VMSDK_RETURN_IF_ERROR(istreambuf.status());
 
   index->num_elements_ = num_elements;
-  index->UpdateRuntimeMemoryAccounting(rss_before);
+  {
+    absl::WriterMutexLock lk(&index->index_mutex_);
+    index->UpdateReportedMemory();
+  }
 
   VMSDK_LOG(NOTICE, nullptr)
       << "Loaded SVS Vamana index from RDB: dim="
