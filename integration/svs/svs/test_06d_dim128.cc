@@ -1,10 +1,11 @@
 // test_06d_dim128.cc — isolate save() crash with dim=128, incremental adds.
 // Reports exactly which operation (add or save) fails.
 
+#include <unistd.h>
+
 #include <cstdio>
 #include <fstream>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #include "svs_common.h"
@@ -14,14 +15,17 @@ using namespace svstest;
 using svstest::svs_::DVamana;
 
 static void run(const char* label, size_t dim, size_t n, bool incremental) {
-  std::printf("\n[%s] dim=%zu n=%zu incremental=%s\n",
-              label, dim, n, incremental ? "yes" : "no");
+  std::printf("\n[%s] dim=%zu n=%zu incremental=%s\n", label, dim, n,
+              incremental ? "yes" : "no");
   rng(42);
   auto data = random_vecs(n, dim);
 
   DVamana* idx = nullptr;
   auto st = svs_::build_svs(&idx, dim);
-  if (!st.ok()) { std::printf("  build FAIL: %s\n", st.message()); return; }
+  if (!st.ok()) {
+    std::printf("  build FAIL: %s\n", st.message());
+    return;
+  }
 
   if (incremental) {
     for (size_t i = 0; i < n; ++i) {
@@ -57,12 +61,12 @@ static void run(const char* label, size_t dim, size_t n, bool incremental) {
 }
 
 int main() {
-  run("inc_dim4_n10",     4,   10, true);
-  run("inc_dim4_n200",    4,  200, true);
-  run("inc_dim128_n1",  128,    1, true);
-  run("inc_dim128_n10", 128,   10, true);
-  run("inc_dim128_n200",128,  200, true);
-  run("bulk_dim128_n200",128, 200, false);
-  run("inc_dim128_n5000",128, 5000, true);
-  run("bulk_dim128_n5000",128,5000, false);
+  run("inc_dim4_n10", 4, 10, true);
+  run("inc_dim4_n200", 4, 200, true);
+  run("inc_dim128_n1", 128, 1, true);
+  run("inc_dim128_n10", 128, 10, true);
+  run("inc_dim128_n200", 128, 200, true);
+  run("bulk_dim128_n200", 128, 200, false);
+  run("inc_dim128_n5000", 128, 5000, true);
+  run("bulk_dim128_n5000", 128, 5000, false);
 }

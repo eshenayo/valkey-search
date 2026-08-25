@@ -1,11 +1,12 @@
 // test_06c_add_patterns.cc — isolate exactly where single-vector incremental
 // add fails vs bulk add succeeds.
 
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #include "svs_common.h"
@@ -17,7 +18,7 @@ using svstest::svs_::DVamana;
 int main() {
   rng(42);
   constexpr size_t kDim = 4;
-  constexpr size_t kN   = 10;
+  constexpr size_t kN = 10;
   auto data = random_vecs(kN, kDim);
 
   // --- Case 1: single add(1) to empty graph ---
@@ -61,7 +62,8 @@ int main() {
     std::vector<size_t> labels(kN);
     for (size_t i = 0; i < kN; ++i) labels[i] = i;
     st = idx->add(kN, labels.data(), data.data());
-    std::printf("  initial bulk add(%zu): %s\n", kN, st.ok() ? "OK" : st.message());
+    std::printf("  initial bulk add(%zu): %s\n", kN,
+                st.ok() ? "OK" : st.message());
 
     if (st.ok()) {
       // Now add one more vector

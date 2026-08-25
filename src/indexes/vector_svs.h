@@ -90,8 +90,7 @@ class VectorSVS : public VectorBase {
       ABSL_NO_THREAD_SAFETY_ANALYSIS;
 
   static absl::StatusOr<std::shared_ptr<VectorSVS<T>>> LoadFromRDB(
-      ValkeyModuleCtx* ctx,
-      const AttributeDataType* attribute_data_type,
+      ValkeyModuleCtx* ctx, const AttributeDataType* attribute_data_type,
       const data_model::VectorIndex& vector_index_proto,
       absl::string_view attribute_identifier,
       SupplementalContentChunkIter&& iter) ABSL_NO_THREAD_SAFETY_ANALYSIS;
@@ -164,8 +163,7 @@ class VectorSVS : public VectorBase {
   // Ensure svs_index_ is initialized. Called from AddRecordImpl to handle
   // the empty-restore path (LoadFromRDB with has_graph_data=0), where
   // svs_index_ is null until the first mutation.
-  absl::Status EnsureSVSIndex()
-      ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
+  absl::Status EnsureSVSIndex() ABSL_EXCLUSIVE_LOCKS_REQUIRED(index_mutex_);
 
   // SVS index (owned, destroyed via DynamicVamanaIndex::destroy).
   // Non-null after Create() or after the first Add on an empty-restored index.

@@ -14,6 +14,7 @@ import numpy as np
 from valkey import ResponseError
 from valkey.client import Valkey
 from valkey_search_test_case import ValkeySearchTestCaseBase
+from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util import waiters
 from ft_info_parser import FTInfoParser
 import pytest

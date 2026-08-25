@@ -8,11 +8,12 @@
 #ifndef VMSDK_SRC_MEMORY_ALLOCATION_OVERRIDES_H_
 #define VMSDK_SRC_MEMORY_ALLOCATION_OVERRIDES_H_
 
+#include <sys/mman.h>
+
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
-#include <sys/mman.h>
 #include <type_traits>
 
 #include "vmsdk/src/memory_allocation.h"
@@ -48,8 +49,7 @@ WEAK_SYMBOL int (*__real_posix_memalign)(void**, size_t,
 // NOLINTNEXTLINE
 WEAK_SYMBOL void* (*__real_valloc)(size_t) = valloc;
 // NOLINTNEXTLINE
-WEAK_SYMBOL void* (*__real_mmap)(void*, size_t, int, int, int,
-                                  off_t) = mmap;
+WEAK_SYMBOL void* (*__real_mmap)(void*, size_t, int, int, int, off_t) = mmap;
 // NOLINTNEXTLINE
 WEAK_SYMBOL int (*__real_munmap)(void*, size_t) = munmap;
 // NOLINTNEXTLINE
