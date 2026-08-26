@@ -175,6 +175,30 @@ class TestSVSSaveRestore(ValkeySearchTestCaseBase):
             self.client.execute_command("FT.INFO", "svs_idx"))
         assert info.num_docs == NUM_VECTORS
 
+    def test_svs_bgsave_no_crash(self):
+        """BGSAVE with a populated SVS index must complete without crashing.
+
+        Current expected behavior: the SVS graph is not persisted
+        (has_graph_data=0) due to a C++ ABI incompatibility under
+        RTLD_DEEPBIND; the sigsetjmp workaround in PreSerializeForRDB
+        intercepts the resulting SIGABRT and allows BGSAVE to complete
+        safely. The server must respond to PING after BGSAVE finishes.
+        """
+        vectors = random_vectors(NUM_VECTORS, DIM)
+        self.create_svs_index(self.client)
+        self.load_vectors(self.client, vectors)
+        self.wait_for_index_ready(self.client)
+
+        self.client.execute_command("BGSAVE")
+        # Wait for BGSAVE to finish before pinging.
+        waiters.wait_for_false(
+            lambda: self.client.info("persistence")["rdb_bgsave_in_progress"],
+            timeout=30,
+        )
+        # If BGSAVE caused an unhandled SIGABRT the server would be dead
+        # and this PING would raise a connection error.
+        assert self.client.ping()
+
     def _backfill_complete(self, client):
         try:
             info = FTInfoParser(

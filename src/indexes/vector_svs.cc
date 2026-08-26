@@ -1250,6 +1250,14 @@ void VectorSVS<T>::PreSerializeForRDB() {
     return;
   }
 
+  // Once save() has caused SIGABRT, the SVS runtime's internal state (locks,
+  // allocator) is not known-good. Skip all future save() calls for this index
+  // instance to avoid operating on potentially-corrupted state.
+  if (serialize_disabled_.load(std::memory_order_relaxed)) {
+    pre_serialized_snapshot_ = std::string();
+    return;
+  }
+
   // Flush any pending vectors into the SVS graph before serializing.
   if (!pending_buffer_.empty()) {
     auto flush_status = FlushBuffer();
@@ -1279,14 +1287,18 @@ void VectorSVS<T>::PreSerializeForRDB() {
   // failure returns control to us instead of killing the process. We log the
   // failure and fall through to has_graph_data=0.
   {
-    // Thread-local jump buffer and flag (safe since we join before returning).
+    // Thread-local jump buffer and arm flag. The flag guards against a SIGABRT
+    // delivered to a different thread (e.g. an OMP worker): that thread's copy
+    // of svs_jmpbuf_armed is false, so the handler returns without jumping
+    // through an uninitialized buffer.
     static thread_local sigjmp_buf svs_jmpbuf;
-    static thread_local volatile bool svs_aborted = false;
-    svs_aborted = false;
+    static thread_local volatile bool svs_jmpbuf_armed = false;
+    svs_jmpbuf_armed = false;
 
     struct sigaction sa_new = {}, sa_old = {};
     sa_new.sa_handler = [](int) {
-      svs_aborted = true;
+      if (!svs_jmpbuf_armed) return;  // wrong thread — don't jump
+      svs_jmpbuf_armed = false;
       siglongjmp(svs_jmpbuf, 1);
     };
     sa_new.sa_flags = SA_RESETHAND;
@@ -1294,17 +1306,24 @@ void VectorSVS<T>::PreSerializeForRDB() {
     sigaction(SIGABRT, &sa_new, &sa_old);
 
     if (sigsetjmp(svs_jmpbuf, 1) == 0) {
+      // Arm only after sigsetjmp has initialized the buffer. A SIGABRT
+      // arriving between sigaction and here would see armed=false and return
+      // from the handler without jumping through an uninitialized buffer.
+      svs_jmpbuf_armed = true;
 #ifdef _OPENMP
       omp_set_num_threads(1);
 #endif
       GlibcStreamBuf sbuf;
       std::ostream oss(&sbuf);
       auto status = svs_index_->save(oss);
+      svs_jmpbuf_armed = false;
       sigaction(SIGABRT, &sa_old, nullptr);
       if (!status.ok()) {
         VMSDK_LOG(WARNING, nullptr)
             << "SVS pre-serialization failed: " << status.message();
-        pre_serialized_snapshot_ = std::nullopt;
+        // Use empty string (not nullopt) so SaveIndexImpl writes
+        // has_graph_data=0 without attempting save() again in the fork child.
+        pre_serialized_snapshot_ = std::string();
       } else {
         auto sv = sbuf.view();
         pre_serialized_snapshot_ = std::string(sv.data(), sv.size());
@@ -1313,12 +1332,13 @@ void VectorSVS<T>::PreSerializeForRDB() {
       }
     } else {
       // save() caused SIGABRT (exception escaped noexcept → std::terminate →
-      // abort). Set snapshot to empty string (not nullopt) so SaveIndexImpl in
-      // the fork child writes has_graph_data=0 without attempting save() again.
+      // abort). SVS runtime state is not known-good; disable future save()
+      // calls for this index instance to avoid operating on corrupted state.
       sigaction(SIGABRT, &sa_old, nullptr);
+      serialize_disabled_.store(true, std::memory_order_relaxed);
       VMSDK_LOG(WARNING, nullptr)
           << "SVS pre-serialization: save() caused SIGABRT — "
-             "index will not be persisted in this BGSAVE cycle.";
+             "serialization disabled for this index instance.";
       pre_serialized_snapshot_ = std::string();
     }
     return;
@@ -1380,39 +1400,66 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
       uint8_t has_graph_data = 0;
       VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
     } else {
-      try {
+      // pending_buffer_ is empty — call save() directly.
+      // Guard with the same sigsetjmp pattern as PreSerializeForRDB:
+      // try/catch does NOT intercept SIGABRT (raised by abort() outside the
+      // C++ exception mechanism). serialize_disabled_ prevents calling save()
+      // again if a prior BGSAVE or SAVE cycle already proved it aborts.
+      if (serialize_disabled_.load(std::memory_order_relaxed)) {
+        VMSDK_LOG(WARNING, nullptr)
+            << "SVS foreground save skipped: save() previously caused SIGABRT "
+               "on this index instance.";
+        uint8_t has_graph_data = 0;
+        VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
+      } else {
+        static thread_local sigjmp_buf svs_save_jmpbuf;
+        static thread_local volatile bool svs_save_jmpbuf_armed = false;
+        svs_save_jmpbuf_armed = false;
+
+        struct sigaction sa_new = {}, sa_old = {};
+        sa_new.sa_handler = [](int) {
+          if (!svs_save_jmpbuf_armed) return;
+          svs_save_jmpbuf_armed = false;
+          siglongjmp(svs_save_jmpbuf, 1);
+        };
+        sa_new.sa_flags = SA_RESETHAND;
+        sigemptyset(&sa_new.sa_mask);
+        sigaction(SIGABRT, &sa_new, &sa_old);
+
+        if (sigsetjmp(svs_save_jmpbuf, 1) == 0) {
+          svs_save_jmpbuf_armed = true;
 #ifdef _OPENMP
-        omp_set_num_threads(1);
+          omp_set_num_threads(1);
 #endif
-        GlibcStreamBuf sbuf;
-        std::ostream oss(&sbuf);
-        auto svs_status = svs_index_->save(oss);
-        if (!svs_status.ok()) {
+          GlibcStreamBuf sbuf;
+          std::ostream oss(&sbuf);
+          auto svs_status = svs_index_->save(oss);
+          svs_save_jmpbuf_armed = false;
+          sigaction(SIGABRT, &sa_old, nullptr);
+          if (!svs_status.ok()) {
+            VMSDK_LOG(WARNING, nullptr)
+                << "SVS foreground save failed: " << svs_status.message()
+                << " — RDB will contain empty graph for this index.";
+            uint8_t has_graph_data = 0;
+            VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
+          } else {
+            auto sv = sbuf.view();
+            uint8_t has_graph_data = sv.empty() ? 0 : 1;
+            VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
+            if (!sv.empty()) {
+              VMSDK_RETURN_IF_ERROR(
+                  chunked_out.SaveChunk(sv.data(), sv.size()));
+            }
+          }
+        } else {
+          sigaction(SIGABRT, &sa_old, nullptr);
+          serialize_disabled_.store(true, std::memory_order_relaxed);
           VMSDK_LOG(WARNING, nullptr)
-              << "SVS foreground save failed: " << svs_status.message()
-              << " — RDB will contain empty graph for this index.";
+              << "SVS foreground save() caused SIGABRT — "
+                 "serialization disabled for this index instance.";
           uint8_t has_graph_data = 0;
           VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
-        } else {
-          auto sv = sbuf.view();
-          uint8_t has_graph_data = sv.empty() ? 0 : 1;
-          VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
-          if (!sv.empty()) {
-            VMSDK_RETURN_IF_ERROR(chunked_out.SaveChunk(sv.data(), sv.size()));
-          }
         }
-      } catch (const std::exception& e) {
-        VMSDK_LOG(WARNING, nullptr)
-            << "SVS foreground save exception: " << e.what()
-            << " — RDB will contain empty graph for this index.";
-        uint8_t has_graph_data = 0;
-        VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
-      } catch (...) {
-        VMSDK_LOG(WARNING, nullptr)
-            << "SVS foreground save unknown exception"
-            << " — RDB will contain empty graph for this index.";
-        uint8_t has_graph_data = 0;
-        VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(has_graph_data));
       }
     }  // else (pending_buffer_ is empty)
   } else {

@@ -207,6 +207,10 @@ class VectorSVS : public VectorBase {
   // cleared in AfterForkParent.
   mutable std::optional<std::string> pre_serialized_snapshot_
       ABSL_GUARDED_BY(index_mutex_);
+  // Set permanently after save() causes SIGABRT. Prevents subsequent save()
+  // calls on potentially-corrupted SVS runtime state. Mutable so it can be
+  // set from the const SaveIndexImpl (foreground SAVE path).
+  mutable std::atomic<bool> serialize_disabled_{false};
 };
 
 }  // namespace valkey_search::indexes
