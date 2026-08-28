@@ -1240,7 +1240,7 @@ class RDBIstreamBuf : public std::streambuf {
   absl::Status status_ = absl::OkStatus();
 };
 
-static constexpr uint32_t kSVSRDBVersion = 3;
+static constexpr uint32_t kSVSRDBVersion = 1;
 
 template <typename T>
 void VectorSVS<T>::PreSerializeForRDB() {
@@ -1334,6 +1334,11 @@ void VectorSVS<T>::PreSerializeForRDB() {
       // save() caused SIGABRT (exception escaped noexcept → std::terminate →
       // abort). SVS runtime state is not known-good; disable future save()
       // calls for this index instance to avoid operating on corrupted state.
+      //
+      // Known limitation: siglongjmp skips C++ destructors, so GlibcStreamBuf's
+      // heap buffer (buf_) is leaked here. Since serialize_disabled_ prevents
+      // any future abort, this leak occurs at most once per index instance.
+      // Resolved when this path is replaced by the SVS C API migration.
       sigaction(SIGABRT, &sa_old, nullptr);
       serialize_disabled_.store(true, std::memory_order_relaxed);
       VMSDK_LOG(WARNING, nullptr)
@@ -1371,6 +1376,8 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
       chunked_out.SaveObject(build_config_.leanvec_training_threshold));
   uint8_t drop_intern = build_config_.drop_intern_store ? 1 : 0;
   VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(drop_intern));
+  VMSDK_RETURN_IF_ERROR(
+      chunked_out.SaveObject(build_config_.distance_match_epsilon_per_dim));
 
   VMSDK_RETURN_IF_ERROR(chunked_out.SaveObject(num_elements_));
 
@@ -1452,6 +1459,10 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
             }
           }
         } else {
+          // Known limitation: siglongjmp skips GlibcStreamBuf's destructor;
+          // buf_ is leaked. Occurs at most once per instance
+          // (serialize_disabled_ prevents repeats). Resolved by the SVS C API
+          // migration.
           sigaction(SIGABRT, &sa_old, nullptr);
           serialize_disabled_.store(true, std::memory_order_relaxed);
           VMSDK_LOG(WARNING, nullptr)
@@ -1481,10 +1492,12 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
     SupplementalContentChunkIter&& iter) {
   RDBChunkInputStream input(std::move(iter));
 
-  VMSDK_ASSIGN_OR_RETURN(auto version, input.LoadObject<uint32_t>());
-  if (version != kSVSRDBVersion) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("Unsupported SVS RDB version: ", version));
+  {
+    VMSDK_ASSIGN_OR_RETURN(auto version, input.LoadObject<uint32_t>());
+    if (version != kSVSRDBVersion) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Unsupported SVS RDB version: ", version));
+    }
   }
 
   SVSBuildConfig config;
@@ -1501,6 +1514,8 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
                          input.LoadObject<size_t>());
   VMSDK_ASSIGN_OR_RETURN(auto drop_intern_val, input.LoadObject<uint8_t>());
   config.drop_intern_store = (drop_intern_val != 0);
+  VMSDK_ASSIGN_OR_RETURN(config.distance_match_epsilon_per_dim,
+                         input.LoadObject<float>());
 
   VMSDK_ASSIGN_OR_RETURN(auto num_elements, input.LoadObject<size_t>());
   VMSDK_ASSIGN_OR_RETURN(auto has_graph_data, input.LoadObject<uint8_t>());
