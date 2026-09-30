@@ -114,6 +114,10 @@ class VectorSVS : public VectorType<T> {
       float query_magnitude) const override ABSL_NO_THREAD_SAFETY_ANALYSIS;
   std::shared_ptr<const VectorRecord> &GetVectorLockFree(
       uint64_t internal_id) const override ABSL_NO_THREAD_SAFETY_ANALYSIS;
+  // SVS has no tombstones, so every label LoadTrackedKeys re-encounters is
+  // new to this map; try_emplace instead of the base class's CHECK.
+  std::shared_ptr<const VectorRecord> &GetOrCreateVectorLockFree(
+      uint64_t internal_id) override ABSL_NO_THREAD_SAFETY_ANALYSIS;
   std::shared_ptr<const VectorRecord> &GetVector(
       uint64_t internal_id) const override ABSL_NO_THREAD_SAFETY_ANALYSIS;
   std::optional<hnswlib::tableint> GetAlgoIdLockFree(
@@ -129,6 +133,9 @@ class VectorSVS : public VectorType<T> {
   SVSBuildConfig build_config_;
   mutable absl::flat_hash_map<uint64_t, std::shared_ptr<const VectorRecord>>
       label_to_record_ ABSL_GUARDED_BY(resize_mutex_);
+  // Advisory label_count from the RDB header (LoadFromRDB); compared in
+  // GetOrCreateVectorLockFree, the earliest point label_to_record_ refills.
+  std::optional<uint64_t> expected_label_count_;
 };
 
 }  // namespace valkey_search::indexes

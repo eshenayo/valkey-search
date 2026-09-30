@@ -1,6 +1,10 @@
 valkey_search_create_proto_library("src/index_schema.proto"
                                    "index_schema_cc_proto")
 
+valkey_search_create_proto_library("src/indexes/svs_index.proto"
+                                   "svs_index_cc_proto")
+target_link_libraries(svs_index_cc_proto PUBLIC index_schema_cc_proto)
+
 set(SRCS_SCORING
     ${CMAKE_CURRENT_LIST_DIR}/scoring/scorer.h
     ${CMAKE_CURRENT_LIST_DIR}/scoring/scorer.cc
@@ -14,6 +18,7 @@ target_link_libraries(scoring PUBLIC vmsdklib)
 add_library(index_base INTERFACE ${SRCS_INDEX_BASE})
 target_include_directories(index_base INTERFACE ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(index_base INTERFACE index_schema_cc_proto)
+target_link_libraries(index_base INTERFACE svs_index_cc_proto)
 target_link_libraries(index_base INTERFACE rdb_serialization)
 target_link_libraries(index_base INTERFACE string_interning)
 target_link_libraries(index_base INTERFACE vmsdklib)
