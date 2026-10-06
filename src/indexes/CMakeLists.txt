@@ -126,7 +126,22 @@ target_link_libraries(vector_svs PUBLIC valkey_module)
 # link it plus OpenMP. On other platforms vector_svs.cc compiles as a
 # stub whose factories return absl::UnimplementedError; arch is detected
 # in the source via __linux__ && __x86_64__ rather than a project flag.
-if(UNIX AND NOT APPLE
+if(SVS_C_API_PREBUILT_DIR)
+    # The bundled archive carries LVQ/LeanVec and static MKL; --exclude-libs,ALL
+    # on libsearch keeps its symbols out of the module's dynamic table.
+    set(SVS_C_API_ARCHIVE "${SVS_C_API_PREBUILT_DIR}/lib/libsvs_c_api.a")
+    if(NOT EXISTS "${SVS_C_API_ARCHIVE}")
+        message(FATAL_ERROR "SVS_C_API_PREBUILT_DIR: ${SVS_C_API_ARCHIVE} not found")
+    endif()
+    find_package(OpenMP REQUIRED)
+    add_library(svs_c_api_static STATIC IMPORTED)
+    set_target_properties(svs_c_api_static PROPERTIES
+        IMPORTED_LOCATION "${SVS_C_API_ARCHIVE}"
+        INTERFACE_INCLUDE_DIRECTORIES "${SVS_C_API_PREBUILT_DIR}/include")
+    target_link_libraries(svs_c_api_static INTERFACE
+        OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS} m)
+    target_link_libraries(vector_svs PRIVATE svs_c_api_static)
+elseif(UNIX AND NOT APPLE
    AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     set(SVS_C_API_DIR "${CMAKE_SOURCE_DIR}/third_party/svs/bindings/c")
     set(SRCS_SVS_C_API

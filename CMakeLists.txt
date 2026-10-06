@@ -24,6 +24,9 @@ endif()
 # Options
 option(BUILD_UNIT_TESTS "Build valkey-search unit tests" ON)
 option(WITH_SUBMODULES_SYSTEM "Use system submodules" OFF)
+set(SVS_C_API_PREBUILT_DIR
+    ""
+    CACHE PATH "Extracted svs-c-api.tar.gz to link instead of compiling third_party/svs")
 
 set(SAN_BUILD
     ""
