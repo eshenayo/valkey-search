@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
@@ -43,6 +44,21 @@ constexpr absl::string_view kBlockSizeParam{"BLOCK_SIZE"};
 constexpr absl::string_view kMParam{"M"};
 constexpr absl::string_view kEfConstructionParam{"EF_CONSTRUCTION"};
 constexpr absl::string_view kEfRuntimeParam{"EF_RUNTIME"};
+constexpr absl::string_view kGraphMaxDegreeParam{"GRAPH_MAX_DEGREE"};
+constexpr absl::string_view kConstructionWindowSizeParam{
+    "CONSTRUCTION_WINDOW_SIZE"};
+constexpr absl::string_view kSearchWindowSizeParam{"SEARCH_WINDOW_SIZE"};
+constexpr absl::string_view kAlphaParam{"ALPHA"};
+constexpr absl::string_view kCompressionParam{"COMPRESSION"};
+
+const absl::NoDestructor<
+    absl::flat_hash_map<absl::string_view, data_model::SVSCompressionType>>
+    kSVSCompressionByStr({
+        {"NONE", data_model::SVS_COMPRESSION_NONE},
+        {"FP16", data_model::SVS_COMPRESSION_FP16},
+        {"SQ8", data_model::SVS_COMPRESSION_SQ8},
+    });
+
 constexpr absl::string_view kDimensionsParam{"DIM"};
 constexpr absl::string_view kDistanceMetricParam{"DISTANCE_METRIC"};
 constexpr absl::string_view kDataTypeParam{"TYPE"};
@@ -360,6 +376,37 @@ vmsdk::KeyValueParser<HNSWParameters> CreateHNSWParser() {
                         GENERATE_VALUE_PARSER(HNSWParameters, ef_runtime));
   return parser;
 }
+vmsdk::KeyValueParser<SVSVamanaParameters> CreateSVSParser() {
+  vmsdk::KeyValueParser<SVSVamanaParameters> parser;
+  parser.AddParamParser(kDimensionsParam,
+                        GENERATE_VALUE_PARSER(SVSVamanaParameters, dimensions));
+  parser.AddParamParser(
+      kDataTypeParam,
+      GENERATE_ENUM_PARSER(SVSVamanaParameters, vector_data_type,
+                           *indexes::kVectorDataTypeByStr));
+  parser.AddParamParser(
+      kDistanceMetricParam,
+      GENERATE_ENUM_PARSER(SVSVamanaParameters, distance_metric,
+                           *indexes::kDistanceMetricByStr));
+  parser.AddParamParser(
+      kInitialCapParam,
+      GENERATE_VALUE_PARSER(SVSVamanaParameters, initial_cap));
+  parser.AddParamParser(
+      kGraphMaxDegreeParam,
+      GENERATE_VALUE_PARSER(SVSVamanaParameters, graph_max_degree));
+  parser.AddParamParser(
+      kConstructionWindowSizeParam,
+      GENERATE_VALUE_PARSER(SVSVamanaParameters, construction_window_size));
+  parser.AddParamParser(
+      kSearchWindowSizeParam,
+      GENERATE_VALUE_PARSER(SVSVamanaParameters, search_window_size));
+  parser.AddParamParser(kAlphaParam,
+                        GENERATE_VALUE_PARSER(SVSVamanaParameters, alpha));
+  parser.AddParamParser(kCompressionParam,
+                        GENERATE_ENUM_PARSER(SVSVamanaParameters, compression,
+                                             *kSVSCompressionByStr));
+  return parser;
+}
 vmsdk::KeyValueParser<FlatParameters> CreateFlatParamParser() {
   vmsdk::KeyValueParser<FlatParameters> parser;
   parser.AddParamParser(kDimensionsParam,
@@ -396,6 +443,12 @@ absl::Status ParseVector(vmsdk::ArgsIterator &itr,
   if (algo == data_model::VectorIndex::kHnswAlgorithm) {
     static auto parser = CreateHNSWParser();
     HNSWParameters parameters;
+    VMSDK_RETURN_IF_ERROR(parser.Parse(parameters, vector_itr));
+    VMSDK_RETURN_IF_ERROR(parameters.Verify());
+    index_proto.set_allocated_vector_index(parameters.ToProto().release());
+  } else if (algo == data_model::VectorIndex::kSvsVamanaAlgorithm) {
+    static auto parser = CreateSVSParser();
+    SVSVamanaParameters parameters;
     VMSDK_RETURN_IF_ERROR(parser.Parse(parameters, vector_itr));
     VMSDK_RETURN_IF_ERROR(parameters.Verify());
     index_proto.set_allocated_vector_index(parameters.ToProto().release());
@@ -892,6 +945,88 @@ std::unique_ptr<data_model::VectorIndex> FlatParameters::ToProto() const {
   flat_algorithm_proto->set_block_size(block_size);
   vector_index_proto->set_allocated_flat_algorithm(
       flat_algorithm_proto.release());
+  return vector_index_proto;
+}
+
+absl::Status SVSVamanaParameters::Verify() const {
+  VMSDK_RETURN_IF_ERROR(FTCreateVectorParameters::Verify());
+  if (vector_data_type == data_model::VECTOR_DATA_TYPE_BFLOAT16) {
+    return absl::InvalidArgumentError(
+        "BFLOAT16 wire format is not supported for SVS_VAMANA; use "
+        "ALGORITHM HNSW for BFLOAT16 storage, or COMPRESSION FP16 for "
+        "compressed FP16 storage inside SVS.");
+  }
+  // SQ8 calibrates its int8 range from the dataset it is built from. The
+  // first-add bootstrap builds from one vector, so later components outside
+  // that one's range saturate. Fenced until the calibration path lands.
+  if (compression == data_model::SVS_COMPRESSION_SQ8) {
+    return absl::InvalidArgumentError(
+        "COMPRESSION SQ8 is not supported for SVS_VAMANA in v1 pending "
+        "range calibration; use COMPRESSION NONE or FP16.");
+  }
+  // SVS reports inner-product and cosine as *similarities* (larger is
+  // closer). The valkey-search reply layer treats __v_score as a
+  // distance (smaller is closer), which inverts order and score on the
+  // native search path. Fenced until the per-metric transform + tests
+  // land in a follow-up.
+  if (distance_metric == data_model::DISTANCE_METRIC_IP ||
+      distance_metric == data_model::DISTANCE_METRIC_COSINE) {
+    return absl::InvalidArgumentError(
+        "DISTANCE_METRIC IP and COSINE are not supported for SVS_VAMANA "
+        "in v1; use ALGORITHM HNSW for IP or COSINE, or DISTANCE_METRIC "
+        "L2 for SVS_VAMANA.");
+  }
+  // ALPHA sentinel (-1.0) means "use SVS's metric-specific default".
+  // Any user-supplied value must be finite and respect SVS's L2
+  // invariant (alpha >= 1.0). IP/COSINE's 0 < alpha <= 1.0 range is
+  // unreachable while those metrics are fenced above; the check will
+  // widen when the fence lifts. Bit-pattern test avoids -ffast-math
+  // folding isnan/isfinite to constants.
+  if (alpha != kDefaultSVSAlphaSentinel) {
+    uint32_t alpha_bits;
+    std::memcpy(&alpha_bits, &alpha, sizeof(alpha_bits));
+    const bool is_non_finite = (alpha_bits & 0x7F800000u) == 0x7F800000u;
+    if (is_non_finite || alpha < 1.0f) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(kAlphaParam, " must be >= 1.0 for DISTANCE_METRIC L2."));
+    }
+  }
+  const auto max_m_value = options::GetMaxM().GetValue();
+  VMSDK_RETURN_IF_ERROR(vmsdk::VerifyRange(graph_max_degree, 2, max_m_value))
+      << kGraphMaxDegreeParam
+      << " must be a positive integer greater than 2 and cannot exceed "
+      << max_m_value << ".";
+  const auto max_ef_construction_value =
+      options::GetMaxEfConstruction().GetValue();
+  VMSDK_RETURN_IF_ERROR(vmsdk::VerifyRange(construction_window_size, 1,
+                                           max_ef_construction_value))
+      << kConstructionWindowSizeParam
+      << " must be a positive integer greater than 0 and cannot exceed "
+      << max_ef_construction_value << ".";
+  const auto max_ef_runtime_value = options::GetMaxEfRuntime().GetValue();
+  VMSDK_RETURN_IF_ERROR(
+      vmsdk::VerifyRange(search_window_size, 1, max_ef_runtime_value))
+      << kSearchWindowSizeParam
+      << " must be a positive integer greater than 0 and cannot exceed "
+      << max_ef_runtime_value << ".";
+  if (construction_window_size < graph_max_degree) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        kConstructionWindowSizeParam, " (", construction_window_size,
+        ") must be >= ", kGraphMaxDegreeParam, " (", graph_max_degree, ")."));
+  }
+  return absl::OkStatus();
+}
+
+std::unique_ptr<data_model::VectorIndex> SVSVamanaParameters::ToProto() const {
+  auto vector_index_proto = FTCreateVectorParameters::ToProto();
+  auto svs_algorithm_proto = std::make_unique<data_model::SVSVamanaAlgorithm>();
+  svs_algorithm_proto->set_graph_max_degree(graph_max_degree);
+  svs_algorithm_proto->set_construction_window_size(construction_window_size);
+  svs_algorithm_proto->set_search_window_size(search_window_size);
+  svs_algorithm_proto->set_alpha(alpha);
+  svs_algorithm_proto->set_compression(compression);
+  vector_index_proto->set_allocated_svs_vamana_algorithm(
+      svs_algorithm_proto.release());
   return vector_index_proto;
 }
 
