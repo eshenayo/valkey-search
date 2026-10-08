@@ -48,6 +48,9 @@ struct SVSBuildConfig {
   data_model::SVSCompressionType compression{data_model::SVS_COMPRESSION_NONE};
 };
 
+// Routes SVS's default logger to the Valkey log. Call once at module load.
+void InitSvsLogging();
+
 template <typename T>
 class VectorSVS : public VectorType<T> {
  protected:
