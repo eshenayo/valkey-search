@@ -253,6 +253,29 @@ using SearchParamsPtr =
     std::unique_ptr<std::remove_pointer_t<svs_search_params_h>,
                     SearchParamsDeleter>;
 
+// Forwards SVS log messages to the Valkey log. `self` is the NUL-terminated
+// tag of the owning index (its attribute identifier), or a fixed tag for the
+// global default logger. May run on SVS worker threads; the sink is
+// thread_local and a null ctx is valid for ValkeyModule_Log.
+void SvsLogCallback(void* self, svs_log_level_t level, const char* msg) {
+  const LogLevel valkey_level = level <= SVS_LOG_LEVEL_DEBUG  ? DEBUG
+                                : level == SVS_LOG_LEVEL_INFO ? VERBOSE
+                                                              : WARNING;
+  VMSDK_LOG(valkey_level, nullptr)
+      << "SVS[" << static_cast<const char*>(self) << "] " << msg;
+}
+
+svs_logging_ops_t kSvsLogOps = SVS_INIT_LOGGING_OPS(SvsLogCallback);
+
+// Best-effort: returns null on failure. The logger runs at TRACE so that
+// VMSDK_LOG alone filters by the engine log level (including runtime changes).
+svs_logger_h MakeSvsLogger(const char* tag) {
+  svs_logging_t iface{&kSvsLogOps, const_cast<char*>(tag)};
+  svs_logger_h l = svs_logger_create_custom(&iface, nullptr);
+  if (l) svs_logger_set_level(l, SVS_LOG_LEVEL_TRACE, nullptr);
+  return l;
+}
+
 // Bridges the base-class filter predicate through the SVS C ABI.
 // `self` carries the predicate object; is_member forwards each SVS
 // candidate id through operator(); filter_rate hints selectivity to
@@ -324,7 +347,8 @@ absl::Status CheckFiniteVector(const T* src, size_t n_elements) {
 // first-add path passes the vector supplied by the ingest call.
 absl::StatusOr<svs_index_h> BootstrapIndex(
     const SVSBuildConfig& config, data_model::DistanceMetric distance_metric,
-    int dimensions, uint64_t label, const float* fp32_vector) {
+    int dimensions, uint64_t label, const float* fp32_vector,
+    const char* log_tag) {
   auto metric = ToSvsDistanceMetric(distance_metric);
   if (!metric.has_value()) {
     return absl::InvalidArgumentError(
@@ -382,6 +406,11 @@ absl::StatusOr<svs_index_h> BootstrapIndex(
     }
   }
 
+  if (svs_logger_h l = MakeSvsLogger(log_tag)) {
+    svs_index_builder_set_logger(builder.get(), l, nullptr);
+    svs_logger_free(l);  // the builder keeps its own reference
+  }
+
   svs_index_h index = svs_index_build_dynamic(
       builder.get(), fp32_vector, &label, /*num_vectors=*/1,
       /*blocksize_bytes=*/kSvsBlockSizeBytes, err.get());
@@ -394,6 +423,16 @@ absl::StatusOr<svs_index_h> BootstrapIndex(
 }  // namespace
 
 #endif  // __linux__ && __x86_64__
+
+void InitSvsLogging() {
+#if defined(__linux__) && defined(__x86_64__)
+  // Covers SVS work without a per-index logger, such as stream loads.
+  if (svs_logger_h l = MakeSvsLogger("global")) {
+    svs_set_default_logger(l, nullptr);
+    svs_logger_free(l);
+  }
+#endif
+}
 
 template <typename T>
 VectorSVS<T>::VectorSVS(int dimensions, absl::string_view attribute_identifier,
@@ -560,8 +599,9 @@ absl::Status VectorSVS<T>::AddRecordImpl(
   };
 
   if (svs_index_ == nullptr) {
-    auto result = BootstrapIndex(build_config_, this->distance_metric_,
-                                 dimensions_, internal_id, fp32);
+    auto result =
+        BootstrapIndex(build_config_, this->distance_metric_, dimensions_,
+                       internal_id, fp32, this->attribute_identifier_.c_str());
     if (!result.ok()) return result.status();
     svs_index_ = *result;
   } else {
@@ -651,8 +691,9 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(
       return SvsErrorToStatus(err.get(), "modify: index_dynamic_add_points");
     }
   } else {
-    auto result = BootstrapIndex(build_config_, this->distance_metric_,
-                                 dimensions_, internal_id, fp32);
+    auto result =
+        BootstrapIndex(build_config_, this->distance_metric_, dimensions_,
+                       internal_id, fp32, this->attribute_identifier_.c_str());
     if (!result.ok()) return result.status();
     svs_index_ = *result;
   }
