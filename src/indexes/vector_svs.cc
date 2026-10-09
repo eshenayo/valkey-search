@@ -27,6 +27,7 @@
 #include "src/indexes/bfloat16.h"
 #include "src/indexes/fp16.h"
 #include "src/indexes/index_base.h"
+#include "src/indexes/svs_capabilities.h"
 #include "src/indexes/vector_base.h"
 #include "src/rdb_serialization.h"
 #include "src/utils/cancel.h"
@@ -175,26 +176,6 @@ std::optional<svs_distance_metric_t> ToSvsDistanceMetric(
   }
 }
 
-// Selects the SVS internal storage data type from the compression proto
-// value. FLOAT32 storage is the default; FP16 and SQ8 are the two open
-// v1 compression kinds the SVS C API registers.
-std::optional<svs_data_type_t> CompressionToSvsDataType(
-    data_model::SVSCompressionType compression) {
-  switch (compression) {
-    case data_model::SVS_COMPRESSION_NONE:
-      return SVS_DATA_TYPE_FLOAT32;
-    case data_model::SVS_COMPRESSION_FP16:
-      return SVS_DATA_TYPE_FLOAT16;
-    case data_model::SVS_COMPRESSION_SQ8:
-      // SVS SQ storage accepts INT8 or UINT8. We use INT8 for the v1
-      // SQ8 option; symmetric quantization around zero.
-      return SVS_DATA_TYPE_INT8;
-    default:
-      // LVQ / LEANVEC variants are v2 proprietary; rejected here.
-      return std::nullopt;
-  }
-}
-
 // Owns an svs_error_h so it is freed on scope exit. SVS errors are
 // heap-allocated by the C API even on the success path (they hold the
 // last recorded message); leaking them would grow used_memory.
@@ -227,6 +208,45 @@ struct StorageDeleter {
 };
 using StoragePtr =
     std::unique_ptr<std::remove_pointer_t<svs_storage_h>, StorageDeleter>;
+
+// Maps the compression proto value to an SVS storage configuration.
+absl::StatusOr<StoragePtr> MakeSvsStorage(const SVSBuildConfig& config) {
+  ScopedSvsError err;
+  StoragePtr storage;
+  switch (config.compression) {
+    case data_model::SVS_COMPRESSION_NONE:
+      storage.reset(
+          svs_storage_create_simple(SVS_DATA_TYPE_FLOAT32, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_FP16:
+      storage.reset(
+          svs_storage_create_simple(SVS_DATA_TYPE_FLOAT16, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_SQ8:
+      // INT8 gives symmetric quantization around zero.
+      storage.reset(svs_storage_create_sq(SVS_DATA_TYPE_INT8, err.get()));
+      break;
+    // TODO(LVQ): svs_storage_create_lvq(primary, residual); LVQ<P>X<R> maps
+    // P/R bits to SVS_DATA_TYPE_UINT4/UINT8, and LVQ4/LVQ8 use residual VOID.
+    case data_model::SVS_COMPRESSION_LVQ4:
+    case data_model::SVS_COMPRESSION_LVQ8:
+    case data_model::SVS_COMPRESSION_LVQ4X4:
+    case data_model::SVS_COMPRESSION_LVQ4X8:
+      return absl::UnimplementedError(
+          "SVS_VAMANA: LVQ storage is not implemented yet");
+    // TODO(LeanVec): svs_storage_create_leanvec(config.leanvec_dims, primary,
+    // secondary), or svs_storage_create_leanvec_trained once training lands.
+    case data_model::SVS_COMPRESSION_LEANVEC4X4:
+    case data_model::SVS_COMPRESSION_LEANVEC4X8:
+    case data_model::SVS_COMPRESSION_LEANVEC8X8:
+      return absl::UnimplementedError(
+          "SVS_VAMANA: LeanVec storage is not implemented yet");
+    default:
+      return absl::InvalidArgumentError("SVS_VAMANA: unknown COMPRESSION");
+  }
+  if (!storage) return SvsErrorToStatus(err.get(), "storage_create");
+  return storage;
+}
 
 struct AlgorithmDeleter {
   void operator()(svs_algorithm_h h) const {
@@ -330,12 +350,7 @@ absl::StatusOr<svs_index_h> BootstrapIndex(
     return absl::InvalidArgumentError(
         "SVS_VAMANA: unsupported DISTANCE_METRIC");
   }
-  auto storage_type = CompressionToSvsDataType(config.compression);
-  if (!storage_type.has_value()) {
-    return absl::InvalidArgumentError(
-        "SVS_VAMANA: COMPRESSION is proprietary / v2 and not available "
-        "in this build");
-  }
+  VMSDK_ASSIGN_OR_RETURN(auto storage, MakeSvsStorage(config));
 
   ScopedSvsError err;
 
@@ -349,14 +364,6 @@ absl::StatusOr<svs_index_h> BootstrapIndex(
       return SvsErrorToStatus(err.get(), "algorithm_vamana_set_alpha");
     }
   }
-
-  StoragePtr storage;
-  if (config.compression == data_model::SVS_COMPRESSION_SQ8) {
-    storage.reset(svs_storage_create_sq(*storage_type, err.get()));
-  } else {
-    storage.reset(svs_storage_create_simple(*storage_type, err.get()));
-  }
-  if (!storage) return SvsErrorToStatus(err.get(), "storage_create");
 
   BuilderPtr builder(svs_index_builder_create(
       *metric, static_cast<size_t>(dimensions), algo.get(), err.get()));
@@ -382,6 +389,8 @@ absl::StatusOr<svs_index_h> BootstrapIndex(
     }
   }
 
+  // TODO(LeanVec): a one-vector build cannot train LeanVec. Buffer until
+  // leanvec_training_threshold, or rebuild via svs_index_convert_dynamic.
   svs_index_h index = svs_index_build_dynamic(
       builder.get(), fp32_vector, &label, /*num_vectors=*/1,
       /*blocksize_bytes=*/kSvsBlockSizeBytes, err.get());
@@ -423,11 +432,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
         "SVS_VAMANA: unsupported DISTANCE_METRIC");
   }
   const auto& svs_proto = vector_index_proto.svs_vamana_algorithm();
-  if (!CompressionToSvsDataType(svs_proto.compression()).has_value()) {
-    return absl::InvalidArgumentError(
-        "SVS_VAMANA: COMPRESSION is proprietary / v2 and not available in "
-        "this build");
-  }
+  VMSDK_RETURN_IF_ERROR(CheckSvsCompressionAvailable(svs_proto.compression()));
 
   auto instance = std::shared_ptr<VectorSVS<T>>(
       new VectorSVS<T>(vector_index_proto.dimension_count(),
@@ -435,9 +440,13 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
       vmsdk::DestructByMainThread<VectorSVS<T>>{});
   instance->Init(vector_index_proto.distance_metric());
   instance->build_config_ = SVSBuildConfig{
-      svs_proto.graph_max_degree(),   svs_proto.construction_window_size(),
-      svs_proto.search_window_size(), svs_proto.alpha(),
+      svs_proto.graph_max_degree(),
+      svs_proto.construction_window_size(),
+      svs_proto.search_window_size(),
+      svs_proto.alpha(),
       svs_proto.compression(),
+      svs_proto.leanvec_dims(),
+      svs_proto.leanvec_training_threshold(),
   };
   // svs_index_ stays null until the first HSET bootstraps it via
   // svs_index_build_dynamic. The SVS C API requires num_vectors > 0 at

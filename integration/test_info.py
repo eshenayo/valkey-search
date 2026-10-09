@@ -101,7 +101,7 @@ class TestAppMetrics(ValkeySearchTestCaseDebugMode):
             m.decode('utf-8') if isinstance(m, bytes) else m 
             for m in actual_metrics
         )
-        # Expected baseline: 78 APP metrics as of current implementation
+        # Expected baseline: 80 APP metrics as of current implementation
         # This list should be updated intentionally when metrics are added/removed
         expected_metrics = {
             # Counts uses of the legacy (incompatible) invalid-data handling
@@ -135,8 +135,10 @@ class TestAppMetrics(ValkeySearchTestCaseDebugMode):
             "hnsw_remove_exceptions_count",
             "hnsw_search_exceptions_count",
             "svs_add_exceptions_count",
+            "svs_c_api_prebuilt",
             "svs_create_exceptions_count",
             "svs_duplicate_label_on_load_count",
+            "svs_lvq_leanvec_supported",
             "svs_modify_exceptions_count",
             "svs_remove_exceptions_count",
             "svs_search_exceptions_count",

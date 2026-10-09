@@ -364,11 +364,44 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
             assert int(key.split(b":")[1]) % 2 == 0, \
                 f"filter leaked non-red doc: {key!r}"
 
+    @pytest.mark.parametrize("compression", ["LVQ8", "LVQ4X8", "LEANVEC4X8"])
+    def test_proprietary_compression_gated(self, compression):
+        """LVQ / LEANVEC need the prebuilt SVS C API (--svs-prebuilt) on an
+        Intel CPU. Where supported, they hit the not-implemented fence
+        until the storage stubs in vector_svs.cc are filled in."""
+        client: Valkey = self.server.get_new_client()
+        info = client.execute_command("INFO", "SEARCH")
+        supported = int(info["search_svs_lvq_leanvec_supported"])
+        with pytest.raises(Exception) as exc_info:
+            client.execute_command(
+                "FT.CREATE", f"comp_{compression.lower()}_idx",
+                "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
+                "8", "TYPE", "FLOAT32", "DIM", str(DIM),
+                "DISTANCE_METRIC", "L2", "COMPRESSION", compression,
+            )
+        if supported:
+            assert "not implemented yet" in str(exc_info.value)
+        else:
+            assert "requires an SVS build with LVQ/LeanVec" in \
+                str(exc_info.value)
+
+    def test_reduce_requires_leanvec(self):
+        """REDUCE / TRAINING_THRESHOLD only apply to LEANVEC compression."""
+        client: Valkey = self.server.get_new_client()
+        with pytest.raises(Exception) as exc_info:
+            client.execute_command(
+                "FT.CREATE", "reduce_idx",
+                "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
+                "8", "TYPE", "FLOAT32", "DIM", str(DIM),
+                "DISTANCE_METRIC", "L2", "REDUCE", "2",
+            )
+        assert "REDUCE" in str(exc_info.value)
+
     @pytest.mark.parametrize("compression", ["NONE", "FP16"])
     def test_ft_create_supports_each_open_compression(self, compression):
         """NONE / FP16 are the v1 open compression kinds. SQ8 is fenced
         (see test_compression_sq8_rejected_at_parse); LVQ / LEANVEC are
-        proprietary and rejected at parse."""
+        covered by test_proprietary_compression_gated."""
         client: Valkey = self.server.get_new_client()
         idx = f"comp_{compression.lower()}_idx"
         client.execute_command(

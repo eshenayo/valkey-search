@@ -46,6 +46,9 @@ struct SVSBuildConfig {
   uint32_t search_window_size{0};
   float alpha{0.0f};
   data_model::SVSCompressionType compression{data_model::SVS_COMPRESSION_NONE};
+  // LeanVec only; 0 selects the SVS default.
+  uint32_t leanvec_dims{0};
+  uint32_t leanvec_training_threshold{0};
 };
 
 template <typename T>

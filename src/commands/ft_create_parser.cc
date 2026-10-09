@@ -28,6 +28,7 @@
 #include "src/index_schema.h"
 #include "src/index_schema.pb.h"
 #include "src/indexes/index_base.h"
+#include "src/indexes/svs_capabilities.h"
 #include "src/indexes/vector_base.h"
 #include "vmsdk/src/command_parser.h"
 #include "vmsdk/src/module_config.h"
@@ -50,6 +51,8 @@ constexpr absl::string_view kConstructionWindowSizeParam{
 constexpr absl::string_view kSearchWindowSizeParam{"SEARCH_WINDOW_SIZE"};
 constexpr absl::string_view kAlphaParam{"ALPHA"};
 constexpr absl::string_view kCompressionParam{"COMPRESSION"};
+constexpr absl::string_view kReduceParam{"REDUCE"};
+constexpr absl::string_view kTrainingThresholdParam{"TRAINING_THRESHOLD"};
 
 const absl::NoDestructor<
     absl::flat_hash_map<absl::string_view, data_model::SVSCompressionType>>
@@ -57,6 +60,13 @@ const absl::NoDestructor<
         {"NONE", data_model::SVS_COMPRESSION_NONE},
         {"FP16", data_model::SVS_COMPRESSION_FP16},
         {"SQ8", data_model::SVS_COMPRESSION_SQ8},
+        {"LVQ4", data_model::SVS_COMPRESSION_LVQ4},
+        {"LVQ8", data_model::SVS_COMPRESSION_LVQ8},
+        {"LVQ4X4", data_model::SVS_COMPRESSION_LVQ4X4},
+        {"LVQ4X8", data_model::SVS_COMPRESSION_LVQ4X8},
+        {"LEANVEC4X4", data_model::SVS_COMPRESSION_LEANVEC4X4},
+        {"LEANVEC4X8", data_model::SVS_COMPRESSION_LEANVEC4X8},
+        {"LEANVEC8X8", data_model::SVS_COMPRESSION_LEANVEC8X8},
     });
 
 constexpr absl::string_view kDimensionsParam{"DIM"};
@@ -405,6 +415,11 @@ vmsdk::KeyValueParser<SVSVamanaParameters> CreateSVSParser() {
   parser.AddParamParser(kCompressionParam,
                         GENERATE_ENUM_PARSER(SVSVamanaParameters, compression,
                                              *kSVSCompressionByStr));
+  parser.AddParamParser(kReduceParam,
+                        GENERATE_VALUE_PARSER(SVSVamanaParameters, reduce));
+  parser.AddParamParser(
+      kTrainingThresholdParam,
+      GENERATE_VALUE_PARSER(SVSVamanaParameters, training_threshold));
   return parser;
 }
 vmsdk::KeyValueParser<FlatParameters> CreateFlatParamParser() {
@@ -1014,6 +1029,24 @@ absl::Status SVSVamanaParameters::Verify() const {
         kConstructionWindowSizeParam, " (", construction_window_size,
         ") must be >= ", kGraphMaxDegreeParam, " (", graph_max_degree, ")."));
   }
+  const bool is_leanvec = indexes::IsSvsLeanVecCompression(compression);
+  if (!is_leanvec && (reduce != 0 || training_threshold != 0)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(kReduceParam, " and ", kTrainingThresholdParam,
+                     " require a LEANVEC ", kCompressionParam, "."));
+  }
+  if (reduce != 0 && reduce >= static_cast<uint32_t>(*dimensions)) {
+    return absl::InvalidArgumentError(absl::StrCat(kReduceParam, " (", reduce,
+                                                   ") must be less than DIM (",
+                                                   *dimensions, ")."));
+  }
+  VMSDK_RETURN_IF_ERROR(indexes::CheckSvsCompressionAvailable(compression));
+  // Fenced until the storage stubs in vector_svs.cc are implemented.
+  if (is_leanvec || indexes::IsSvsLvqCompression(compression)) {
+    return absl::UnimplementedError(
+        "LVQ and LEANVEC compression are not implemented yet for "
+        "SVS_VAMANA.");
+  }
   return absl::OkStatus();
 }
 
@@ -1025,6 +1058,8 @@ std::unique_ptr<data_model::VectorIndex> SVSVamanaParameters::ToProto() const {
   svs_algorithm_proto->set_search_window_size(search_window_size);
   svs_algorithm_proto->set_alpha(alpha);
   svs_algorithm_proto->set_compression(compression);
+  svs_algorithm_proto->set_leanvec_dims(reduce);
+  svs_algorithm_proto->set_leanvec_training_threshold(training_threshold);
   vector_index_proto->set_allocated_svs_vamana_algorithm(
       svs_algorithm_proto.release());
   return vector_index_proto;
