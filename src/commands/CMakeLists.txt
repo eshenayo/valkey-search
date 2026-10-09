@@ -62,6 +62,7 @@ target_link_libraries(ft_create_parser PUBLIC attribute_data_type)
 target_link_libraries(ft_create_parser PUBLIC index_schema_cc_proto)
 target_link_libraries(ft_create_parser PUBLIC index_base)
 target_link_libraries(ft_create_parser PUBLIC vector_base)
+target_link_libraries(ft_create_parser PUBLIC vector_svs)
 target_link_libraries(ft_create_parser PUBLIC vmsdklib)
 target_link_libraries(ft_create_parser PUBLIC valkey_module)
 

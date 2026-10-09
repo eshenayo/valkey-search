@@ -2094,6 +2094,26 @@ INSTANTIATE_TEST_SUITE_P(
                      .min_stem_size = 4,  // Default value
                  }
              },
+         },
+         {
+             .test_name = "svs_reduce_requires_leanvec",
+             .success = false,
+             .command_str = "idx1 SChema v vector svs_vamana 10 TYPE FLOAT32 "
+                            "DIM 4 DISTANCE_METRIC L2 COMPRESSION LVQ8 "
+                            "REDUCE 2",
+             .expected_error_message =
+                 "Invalid field type for field `v`: REDUCE and "
+                 "TRAINING_THRESHOLD require a LEANVEC COMPRESSION.",
+         },
+         {
+             .test_name = "svs_reduce_must_be_less_than_dim",
+             .success = false,
+             .command_str = "idx1 SChema v vector svs_vamana 10 TYPE FLOAT32 "
+                            "DIM 4 DISTANCE_METRIC L2 COMPRESSION LEANVEC4X8 "
+                            "REDUCE 4",
+             .expected_error_message =
+                 "Invalid field type for field `v`: REDUCE (4) must be less "
+                 "than DIM (4).",
          }}),
     [](const TestParamInfo<FTCreateParserTestCase> &info) {
       return info.param.test_name;

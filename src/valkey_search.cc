@@ -28,6 +28,7 @@
 #include "src/coordinator/metadata_manager.h"
 #include "src/coordinator/server.h"
 #include "src/coordinator/util.h"
+#include "src/indexes/svs_capabilities.h"
 #include "src/metrics.h"
 #include "src/rdb_serialization.h"
 #include "src/schema_manager.h"
@@ -575,6 +576,18 @@ static vmsdk::info_field::Integer svs_duplicate_label_on_load_count(
     "svs", "svs_duplicate_label_on_load_count",
     vmsdk::info_field::IntegerBuilder().App().Computed([]() -> long long {
       return Metrics::GetStats().svs_duplicate_label_on_load_cnt;
+    }));
+
+static vmsdk::info_field::Integer svs_c_api_prebuilt(
+    "svs", "svs_c_api_prebuilt",
+    vmsdk::info_field::IntegerBuilder().App().Computed([]() -> long long {
+      return indexes::SvsCApiPrebuilt();
+    }));
+
+static vmsdk::info_field::Integer svs_lvq_leanvec_supported(
+    "svs", "svs_lvq_leanvec_supported",
+    vmsdk::info_field::IntegerBuilder().App().Computed([]() -> long long {
+      return indexes::SvsLvqLeanVecSupported();
     }));
 
 static vmsdk::info_field::Integer string_interning_store_size(

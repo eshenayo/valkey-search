@@ -139,6 +139,9 @@ struct SVSVamanaParameters : public FTCreateVectorParameters {
   // 0.95 for IP/COSINE) when the user does not pass ALPHA.
   float alpha{kDefaultSVSAlphaSentinel};
   data_model::SVSCompressionType compression{data_model::SVS_COMPRESSION_NONE};
+  // LeanVec only; 0 selects the SVS default.
+  uint32_t reduce{0};
+  uint32_t training_threshold{0};
   absl::Status Verify() const;
   std::unique_ptr<data_model::VectorIndex> ToProto() const;
 };
