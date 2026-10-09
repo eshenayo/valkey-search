@@ -390,8 +390,7 @@ absl::StatusOr<svs_index_h> BootstrapIndex(
   }
 
   // TODO(LeanVec): a one-vector build cannot train LeanVec. Buffer until
-  // leanvec_training_threshold, or rebuild via svs_index_convert_dynamic
-  // (available when VALKEY_SEARCH_HAVE_SVS_INDEX_CONVERT is defined).
+  // leanvec_training_threshold, or rebuild via svs_index_convert_dynamic.
   svs_index_h index = svs_index_build_dynamic(
       builder.get(), fp32_vector, &label, /*num_vectors=*/1,
       /*blocksize_bytes=*/kSvsBlockSizeBytes, err.get());

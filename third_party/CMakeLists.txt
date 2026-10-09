@@ -12,17 +12,11 @@ option(SVS_C_API_PREBUILT
        "Link the prebuilt SVS C API (LVQ/LeanVec) instead of compiling third_party/svs" OFF)
 set(SVS_C_API_URL
     "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-c-api-nightly-2026-10-09-99.tar.gz"
-    CACHE STRING "Prebuilt SVS C API tarball fetched when SVS_C_API_PREBUILT=ON")
-set(SVS_C_API_URL_HASH
-    "SHA256=ec4870de2ee5390d030c6322d237853aec2d4c7933edd867591950f2a2ee013f"
-    CACHE STRING "Hash of SVS_C_API_URL; empty skips verification")
-set(SVS_C_API_PREBUILT_DIR
-    ""
-    CACHE PATH "Extracted prebuilt SVS C API tarball; implies SVS_C_API_PREBUILT")
+    CACHE STRING "Prebuilt SVS C API tarball: a release URL or a local path")
 
 if(NOT (UNIX AND NOT APPLE
         AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$"))
-  if(SVS_C_API_PREBUILT OR SVS_C_API_PREBUILT_DIR)
+  if(SVS_C_API_PREBUILT)
     message(FATAL_ERROR "The prebuilt SVS C API requires x86_64 Linux")
   endif()
   message(STATUS "SVS C API: unavailable on this platform")
@@ -31,22 +25,14 @@ endif()
 
 find_package(OpenMP REQUIRED)
 
-if(SVS_C_API_PREBUILT OR SVS_C_API_PREBUILT_DIR)
-  set(SVS_C_API_ROOT "${SVS_C_API_PREBUILT_DIR}")
-  if(NOT SVS_C_API_ROOT)
-    include(FetchContent)
-    set(_svs_fetch_args URL "${SVS_C_API_URL}")
-    if(SVS_C_API_URL_HASH)
-      list(APPEND _svs_fetch_args URL_HASH "${SVS_C_API_URL_HASH}")
-    endif()
-    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
-      list(APPEND _svs_fetch_args DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-    endif()
-    FetchContent_Declare(svs_c_api ${_svs_fetch_args})
-    FetchContent_MakeAvailable(svs_c_api)
-    set(SVS_C_API_ROOT "${svs_c_api_SOURCE_DIR}")
+if(SVS_C_API_PREBUILT)
+  include(FetchContent)
+  if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
   endif()
-  set(SVS_C_API_INCLUDE_DIR "${SVS_C_API_ROOT}/include")
+  FetchContent_Declare(svs_c_api URL "${SVS_C_API_URL}")
+  FetchContent_MakeAvailable(svs_c_api)
+  set(SVS_C_API_ROOT "${svs_c_api_SOURCE_DIR}")
   # The archive bundles fmt/spdlog/MKL; --exclude-libs,ALL on libsearch keeps
   # those symbols out of the module's dynamic table.
   find_package(svs_c_api_static CONFIG REQUIRED
@@ -91,12 +77,4 @@ else()
   target_compile_definitions(svs_c_api_static INTERFACE
       VALKEY_SEARCH_SVS_PREBUILT=0)
   message(STATUS "SVS C API: source (public, no LVQ/LeanVec)")
-endif()
-
-# Newer C API releases add svs_index_convert, needed for LeanVec bootstrap.
-file(STRINGS "${SVS_C_API_INCLUDE_DIR}/svs/c/svs_c.h" _svs_has_convert
-     REGEX "svs_index_convert\\(")
-if(_svs_has_convert)
-  target_compile_definitions(svs_c_api_static INTERFACE
-      VALKEY_SEARCH_HAVE_SVS_INDEX_CONVERT=1)
 endif()
