@@ -11,10 +11,10 @@ add_subdirectory(icu)
 option(SVS_C_API_PREBUILT
        "Link the prebuilt SVS C API (LVQ/LeanVec) instead of compiling third_party/svs" OFF)
 set(SVS_C_API_URL
-    "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-c-api-nightly-2026-10-08-318.tar.gz"
+    "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-c-api-nightly-2026-10-09-99.tar.gz"
     CACHE STRING "Prebuilt SVS C API tarball fetched when SVS_C_API_PREBUILT=ON")
 set(SVS_C_API_URL_HASH
-    "SHA256=620bdfe0f459e06f7a7dcee1ee5e836ec71f4f06902807a9ebadd02e0f36bc47"
+    "SHA256=ec4870de2ee5390d030c6322d237853aec2d4c7933edd867591950f2a2ee013f"
     CACHE STRING "Hash of SVS_C_API_URL; empty skips verification")
 set(SVS_C_API_PREBUILT_DIR
     ""
@@ -46,20 +46,16 @@ if(SVS_C_API_PREBUILT OR SVS_C_API_PREBUILT_DIR)
     FetchContent_MakeAvailable(svs_c_api)
     set(SVS_C_API_ROOT "${svs_c_api_SOURCE_DIR}")
   endif()
-  set(SVS_C_API_ARCHIVE "${SVS_C_API_ROOT}/lib/libsvs_c_api.a")
-  if(NOT EXISTS "${SVS_C_API_ARCHIVE}")
-    message(FATAL_ERROR "Prebuilt SVS C API: ${SVS_C_API_ARCHIVE} not found")
-  endif()
   set(SVS_C_API_INCLUDE_DIR "${SVS_C_API_ROOT}/include")
-  # The tarball's svs_c_apiConfig.cmake only exports the shared library.
   # The archive bundles fmt/spdlog/MKL; --exclude-libs,ALL on libsearch keeps
   # those symbols out of the module's dynamic table.
-  add_library(svs_c_api_static STATIC IMPORTED GLOBAL)
-  set_target_properties(svs_c_api_static PROPERTIES
-      IMPORTED_LOCATION "${SVS_C_API_ARCHIVE}"
-      INTERFACE_INCLUDE_DIRECTORIES "${SVS_C_API_INCLUDE_DIR}")
-  target_link_libraries(svs_c_api_static INTERFACE
-      OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS} m)
+  find_package(svs_c_api_static CONFIG REQUIRED
+               PATHS "${SVS_C_API_ROOT}" NO_DEFAULT_PATH)
+  # Imported targets are scoped to this directory; src/indexes links it too.
+  set_target_properties(svs::svs_c_api_static PROPERTIES IMPORTED_GLOBAL TRUE)
+  # Wrapped under one name so src/indexes links the same target either way.
+  add_library(svs_c_api_static INTERFACE)
+  target_link_libraries(svs_c_api_static INTERFACE svs::svs_c_api_static)
   target_compile_definitions(svs_c_api_static INTERFACE
       VALKEY_SEARCH_SVS_PREBUILT=1)
   message(STATUS "SVS C API: prebuilt (LVQ/LeanVec) from ${SVS_C_API_ROOT}")
