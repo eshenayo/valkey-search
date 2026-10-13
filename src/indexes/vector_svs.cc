@@ -846,10 +846,15 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
   // searches. Safe in the fork child, where suspended pools hold no locks.
   absl::WriterMutexLock lock(&resize_mutex_);
 
+  // Deletes only mark SVS slots, so a handle can outlive its last live
+  // entry; SVS's save cannot compact an index with none, so save it as the
+  // handle-less empty index and bootstrap afresh on the next write.
+  const bool has_index = svs_index_ != nullptr && !label_to_record_.empty();
+
   data_model::SVSIndexHeader header;
   header.set_format_version(kSvsHeaderFormatVersion);
   header.set_svs_version(svs_get_version());
-  header.set_has_index(svs_index_ != nullptr);
+  header.set_has_index(has_index);
   header.set_element_type(GetVectorDataType());
   header.set_dimensionality(static_cast<uint32_t>(dimensions_));
   FillSvsVamanaProto(build_config_, header.mutable_build_config());
@@ -862,7 +867,7 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
   // from tellp() at its stream's start, so a prefix would shift alignment.
   VMSDK_RETURN_IF_ERROR(chunked_out.SaveString(serialized));
 
-  if (svs_index_ == nullptr) {
+  if (!has_index) {
     // Handle-less empty index: nothing to hand to SVS. chunked_out's
     // destructor still emits the EOF sentinel below.
     return absl::OkStatus();
