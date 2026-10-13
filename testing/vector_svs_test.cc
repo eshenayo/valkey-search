@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -188,6 +189,51 @@ INSTANTIATE_TEST_SUITE_P(
     [](const testing::TestParamInfo<data_model::SVSCompressionType> &info) {
       return data_model::SVSCompressionType_Name(info.param);
     });
+
+// A foreground SAVE / DEBUG RELOAD runs on the main thread while reader
+// threads keep searching; SVS compacts the live index during the save, so
+// the two must not overlap. Meaningful under TSAN; a plain build only checks
+// that concurrent searches keep returning results.
+TEST_F(VectorSVSTest, SaveWhileSearchingIsExclusive) {
+  const size_t kNumVectors = 200;
+  auto vectors =
+      DeterministicallyGenerateVectors(kNumVectors, kDimensions, 5.0);
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  for (size_t i = 0; i < kNumVectors; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  // Deleted slots give consolidate() and compact() real work to do.
+  for (size_t i = 0; i < kNumVectors; i += 4) {
+    VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(i), DeletionType::kNone));
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> failed_searches{0};
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; ++t) {
+    readers.emplace_back([&, t] {
+      for (size_t q = t; !stop.load(); q = (q + 1) % kNumVectors) {
+        auto result =
+            (*index)->Search(VectorToStr(vectors[q]), 5, CancelNever());
+        if (!result.ok() || result->empty()) ++failed_searches;
+      }
+    });
+  }
+  for (int round = 0; round < 5; ++round) {
+    FakeSafeRDB rdb;
+    auto status = (*index)->SaveIndex(RDBChunkOutputStream(&rdb));
+    EXPECT_TRUE(status.ok()) << status;
+  }
+  stop = true;
+  for (auto &reader : readers) reader.join();
+  EXPECT_EQ(failed_searches.load(), 0u);
+}
 
 // -- Recall and payload span verification ------------------------------------
 

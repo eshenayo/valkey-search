@@ -841,7 +841,10 @@ template <typename T>
 absl::Status VectorSVS<T>::SaveIndexImpl(
     RDBChunkOutputStream chunked_out) const {
 #if defined(__linux__) && defined(__x86_64__)
-  absl::ReaderMutexLock lock(&resize_mutex_);
+  // Writer, not reader: svs_index_save_stream consolidates and compacts the
+  // live index before serializing, so a foreground save must exclude
+  // searches. Safe in the fork child, where suspended pools hold no locks.
+  absl::WriterMutexLock lock(&resize_mutex_);
 
   data_model::SVSIndexHeader header;
   header.set_format_version(kSvsHeaderFormatVersion);
