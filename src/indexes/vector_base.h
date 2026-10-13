@@ -411,6 +411,14 @@ class VectorBase : public IndexBase {
 
   virtual std::shared_ptr<const VectorRecord> &GetVectorLockFree(
       uint64_t internal_id) const = 0;
+
+  // During LoadTrackedKeys, allow an index implementation to create missing
+  // labels instead of crashing on the CHECK in GetVectorLockFree.
+  virtual std::shared_ptr<const VectorRecord> &GetOrCreateVectorLockFree(
+      uint64_t internal_id) {
+    return GetVectorLockFree(internal_id);
+  }
+
   virtual std::shared_ptr<const VectorRecord> &GetVector(
       uint64_t internal_id) const = 0;
 
