@@ -571,7 +571,10 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
     }
     // Hand the handle to instance before the check below, so ~VectorSVS owns
     // it on every path out of here and no path needs its own free.
-    instance->svs_index_ = index;
+    {
+      absl::WriterMutexLock lock(&instance->resize_mutex_);
+      instance->svs_index_ = index;
+    }
 
     // Terminator invariant (design.md): consumed_sentinel() implies AtEnd();
     // AtEnd() == false either way means SVS stopped before the payload end.
