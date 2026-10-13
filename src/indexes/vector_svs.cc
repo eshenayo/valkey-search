@@ -694,9 +694,11 @@ absl::Status VectorSVS<T>::AddRecordImpl(
     return absl::AlreadyExistsError(
         absl::StrCat("SVS internal_id already present: ", internal_id));
   }
-  absl::Cleanup rollback = [this, internal_id] {
-    label_to_record_.erase(internal_id);
-  };
+  // Declared after `lock`, so it runs before the lock is released.
+  absl::Cleanup rollback = [this, internal_id]()
+                               ABSL_EXCLUSIVE_LOCKS_REQUIRED(resize_mutex_) {
+                                 label_to_record_.erase(internal_id);
+                               };
 
   if (svs_index_ == nullptr) {
     auto result = BootstrapIndex(build_config_, this->distance_metric_,
