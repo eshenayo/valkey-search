@@ -1,6 +1,8 @@
 """Issue #8 integration checks: SVS_VAMANA creates no threads (the installed
-pool has size() == 1) and search latency under load stays in HNSW's regime."""
+pool has size() == 1), search latency under load stays in HNSW's regime, and
+8 writer threads ingesting one index concurrently leave it complete."""
 
+import random
 import struct
 import threading
 import time
@@ -172,3 +174,82 @@ class TestSVSThreadpool(ValkeySearchTestCaseBase):
                   f"(n={samples['lat_hnsw']}), bound {LATENCY_BOUND}x")
         print(detail)
         assert p99["lat_svs"] <= LATENCY_BOUND * p99["lat_hnsw"], detail
+
+
+class TestSVSConcurrentWriters(ValkeySearchTestCaseBase):
+    """Writers on one SVS_VAMANA index run concurrently; SVS guards the index."""
+
+    NUM_WRITERS = 8
+    DOCS_PER_WRITER = 500
+    DIM = 8
+
+    def append_startup_args(self, args: dict[str, str]) -> dict[str, str]:
+        args = super().append_startup_args(args)
+        args["search.writer-threads"] = str(self.NUM_WRITERS)
+        return args
+
+    def test_eight_writers_ingest_one_index_completely(self):
+        client: Valkey = self.server.get_new_client()
+        pid = self.server.pid()
+        n = self.NUM_WRITERS * self.DOCS_PER_WRITER
+        rng = random.Random(8)
+        vectors = [[rng.uniform(-1.0, 1.0) for _ in range(self.DIM)]
+                   for _ in range(n)]
+
+        baseline = _threads(pid)
+        client.execute_command(
+            "FT.CREATE", "cw", "PREFIX", "1", "cw:",
+            "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
+            "6", "TYPE", "FLOAT32", "DIM", str(self.DIM),
+            "DISTANCE_METRIC", "L2")
+
+        # Each HSET blocks its client until a writer applies it: 8 clients keep
+        # 8 mutations in flight.
+        errors = []
+
+        def ingest(w, c):
+            try:
+                for i in range(w * self.DOCS_PER_WRITER,
+                               (w + 1) * self.DOCS_PER_WRITER):
+                    c.hset(f"cw:{i}", mapping={"v": _fp32(vectors[i])})
+            except Exception as exc:  # surfaced on the main thread below
+                errors.append(exc)
+
+        clients = [self.server.get_new_client()
+                   for _ in range(self.NUM_WRITERS)]
+        threads = [threading.Thread(target=ingest, args=(w, c))
+                   for w, c in enumerate(clients)]
+        for t in threads:
+            t.start()
+        during = []
+        while any(t.is_alive() for t in threads):
+            during.append(_threads(pid))
+            time.sleep(0.05)
+        for t in threads:
+            t.join()
+        assert not errors, errors[0]
+        _wait_indexed(client, "cw", n)
+
+        info = FTInfoParser(client.execute_command("FT.INFO", "cw"))
+        assert info.num_docs == n
+        assert info.hash_indexing_failures == 0
+        assert info.attributes[0]["index"]["size"] == n
+        assert _threads(pid) == baseline and max(during) == baseline, (
+            f"threads moved: baseline {baseline}, during {set(during)}, "
+            f"after {_threads(pid)}")
+
+        # A KNN with the window widened to the index size returns all n keys.
+        reply = client.execute_command(
+            "FT.SEARCH", "cw", f"*=>[KNN {n} @v $q EF_RUNTIME {n}]",
+            "PARAMS", "2", "q", _fp32(vectors[0]),
+            "DIALECT", "2", "NOCONTENT", "LIMIT", "0", str(n))
+        assert reply[0] == n, reply[0]
+        assert set(reply[1:]) == {f"cw:{i}".encode() for i in range(n)}
+
+        # And every sampled key is its own nearest neighbour.
+        for i in range(0, n, n // 100):
+            reply = client.execute_command(
+                "FT.SEARCH", "cw", f"*=>[KNN 1 @v $q EF_RUNTIME {n}]",
+                "PARAMS", "2", "q", _fp32(vectors[i]),
+                "DIALECT", "2", "NOCONTENT")
+            assert reply[0] == 1 and reply[1] == f"cw:{i}".encode(), (i, reply)

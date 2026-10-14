@@ -14,10 +14,11 @@
 #include <vector>
 
 #include "absl/base/thread_annotations.h"
-#include "absl/container/flat_hash_map.h"
+#include "absl/container/node_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "src/attribute_data_type.h"
 #include "src/indexes/vector_base.h"
 #include "src/indexes/vector_type.h"
@@ -137,10 +138,30 @@ class VectorSVS : public VectorType<T> {
   VectorSVS(int dimensions, absl::string_view attribute_identifier,
             data_model::AttributeDataType attribute_data_type, int db_num);
 
+#if defined(__linux__) && defined(__x86_64__)
+  // Adds one vector, building the index from it when there is no handle yet
+  // (writer lock only for that first build, double-checked).
+  absl::Status InsertVector(uint64_t internal_id, const float *fp32)
+      ABSL_LOCKS_EXCLUDED(resize_mutex_);
+  absl::Status AddPoint(uint64_t internal_id, const float *fp32)
+      ABSL_SHARED_LOCKS_REQUIRED(resize_mutex_);
+#endif
+
+  // Concurrency: the index is built with SVS_SYNC_KIND_FINE_GRAIN and guards
+  // itself, so SVS calls run under the reader side of resize_mutex_ (as in
+  // VectorHNSW); the writer side is taken only to install the first handle.
+  // label_to_record_ is guarded by label_mutex_ (acquired after resize_mutex_,
+  // never held across an SVS call) and is a node_hash_map so references from
+  // GetVector survive concurrent inserts. Search relies on the index-schema
+  // phase gate, so GetVectorLockFree stays lock-free and the delete-then-add
+  // gap inside modify is never observed.
   svs_index_h svs_index_ ABSL_GUARDED_BY(resize_mutex_){nullptr};
   SVSBuildConfig build_config_;
-  mutable absl::flat_hash_map<uint64_t, std::shared_ptr<const VectorRecord>>
-      label_to_record_ ABSL_GUARDED_BY(resize_mutex_);
+  mutable absl::Mutex label_mutex_ ABSL_ACQUIRED_AFTER(resize_mutex_);
+  mutable absl::node_hash_map<uint64_t, std::shared_ptr<const VectorRecord>>
+      label_to_record_ ABSL_GUARDED_BY(label_mutex_);
+
+  friend class VectorSVSTestPeer;
 };
 
 }  // namespace valkey_search::indexes

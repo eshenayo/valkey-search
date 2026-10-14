@@ -5,8 +5,9 @@
  *
  */
 
-// Tests for the SVS_VAMANA sequential threadpool vtable and the
-// create-failure counter. Built only where the SVS C API is (x86_64 Linux).
+// Tests for the SVS_VAMANA threading model: the sequential threadpool vtable,
+// the create-failure counter, the FINE_GRAIN build and concurrent writers.
+// Built only where the SVS C API is (x86_64 Linux).
 
 #include "src/indexes/vector_svs.h"
 
@@ -15,10 +16,15 @@
 #include <memory>
 #include <numeric>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/notification.h"
+#include "src/attribute_data.h"
 #include "absl/strings/str_cat.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -32,6 +38,15 @@
 #include "vmsdk/src/testing_infra/utils.h"
 
 namespace valkey_search::indexes {
+
+class VectorSVSTestPeer {
+ public:
+  static svs_index_h Handle(const VectorSVS<float> &index)
+      ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    return index.svs_index_;
+  }
+};
+
 namespace {
 
 using ::testing::HasSubstr;
@@ -239,6 +254,210 @@ TEST_F(VectorSVSThreadpoolTest,
                                                  VectorToStr(vectors[1])));
   EXPECT_EQ(counter.load(), before + 1);
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), 2u);
+}
+
+// -- (e) the index is built with FINE_GRAIN synchronization -----------------
+
+TEST_F(VectorSVSThreadpoolTest, BootstrapBuildsWithFineGrainSyncKind) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok());
+  EXPECT_EQ(VectorSVSTestPeer::Handle(**index), nullptr);
+
+  auto vectors = DeterministicallyGenerateVectors(1, kDimensions, 10.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  svs_index_h handle = VectorSVSTestPeer::Handle(**index);
+  ASSERT_NE(handle, nullptr);
+
+  svs_error_h err = svs_error_create();
+  svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE;
+  ASSERT_TRUE(svs_index_dynamic_get_sync_kind(handle, &sync_kind, err))
+      << svs_error_get_message(err);
+  svs_error_free(err);
+  EXPECT_EQ(sync_kind, SVS_SYNC_KIND_FINE_GRAIN);
+}
+
+// -- (f) concurrent writers ---------------------------------------------------
+
+// Records are built on the test thread (VectorRegistry is not thread-safe).
+struct PreparedRecord {
+  InternedStringPtr key;
+  AttributeData data;
+};
+
+PreparedRecord PrepareRecord(VectorBase &index, int i,
+                             const std::vector<float> &vector) {
+  auto key = IndexToKey(i);
+  auto valkey_str = vmsdk::MakeUniqueValkeyString(VectorToStr(vector));
+  auto vec = VectorRegistry::Instance().DedupOrConstruct(
+      key, valkey_str.get(), data_model::ATTRIBUTE_DATA_TYPE_HASH,
+      index.GetDBNum(), &index);
+  return PreparedRecord{key, AttributeData(std::move(vec))};
+}
+
+// Runs work(w) on `writers` threads released together; returns their statuses.
+template <typename Work>
+std::vector<absl::Status> RunWriters(int writers, Work work) {
+  absl::Notification go;
+  std::vector<absl::Status> statuses(writers);
+  std::vector<std::thread> threads;
+  threads.reserve(writers);
+  for (int w = 0; w < writers; ++w) {
+    threads.emplace_back([&, w] {
+      go.WaitForNotification();
+      statuses[w] = work(w);
+    });
+  }
+  go.Notify();
+  for (auto &t : threads) t.join();
+  return statuses;
+}
+
+// Each id must be its own nearest neighbour, window widened to the index.
+void ExpectEachIsItsOwnNearest(VectorSVS<float> &index,
+                               const std::vector<int> &ids,
+                               const std::vector<std::vector<float>> &vectors,
+                               size_t live) {
+  for (int i : ids) {
+    auto result = index.Search(VectorToStr(vectors[i]), 1, CancelNever(),
+                               nullptr, /*ef_runtime=*/live);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_EQ(result->size(), 1u) << "id " << i;
+    EXPECT_EQ((*result)[0].external_id, IndexToKey(i)) << "id " << i;
+    EXPECT_NEAR((*result)[0].distance, 0.0f, 1e-3f) << "id " << i;
+  }
+}
+
+constexpr int kWriters = 8;
+constexpr int kPerWriter = 50;
+constexpr int kConcurrentVectors = kWriters * kPerWriter;
+
+TEST_F(VectorSVSThreadpoolTest, EightWritersAddConcurrentlyAndEveryIdIsFound) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok());
+  // Bootstrap first so every writer below goes through add_points.
+  auto vectors =
+      DeterministicallyGenerateVectors(kConcurrentVectors + 1, kDimensions,
+                                       10.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
+      **index, IndexToKey(kConcurrentVectors),
+      VectorToStr(vectors[kConcurrentVectors])));
+
+  std::vector<PreparedRecord> records;
+  records.reserve(kConcurrentVectors);
+  for (int i = 0; i < kConcurrentVectors; ++i) {
+    records.push_back(PrepareRecord(**index, i, vectors[i]));
+  }
+  auto statuses = RunWriters(kWriters, [&](int w) {
+    for (int i = w * kPerWriter; i < (w + 1) * kPerWriter; ++i) {
+      auto result =
+          (*index)->AddRecord(records[i].key, std::move(records[i].data));
+      if (!result.ok()) return result.status();
+    }
+    return absl::OkStatus();
+  });
+  for (const auto &status : statuses) VMSDK_EXPECT_OK(status);
+
+  EXPECT_EQ(AsBase(*index)->GetLabelCount(),
+            static_cast<size_t>(kConcurrentVectors + 1));
+  std::vector<int> ids(kConcurrentVectors + 1);
+  std::iota(ids.begin(), ids.end(), 0);
+  ExpectEachIsItsOwnNearest(**index, ids, vectors, kConcurrentVectors + 1);
+}
+
+TEST_F(VectorSVSThreadpoolTest, FirstAddRaceBuildsOnceAndLosersAdd) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok());
+  auto &counter = Metrics::GetStats().svs_create_exceptions_cnt;
+  const uint64_t before = counter.load();
+
+  auto vectors = DeterministicallyGenerateVectors(kWriters, kDimensions, 10.0);
+  std::vector<PreparedRecord> records;
+  for (int i = 0; i < kWriters; ++i) {
+    records.push_back(PrepareRecord(**index, i, vectors[i]));
+  }
+  // All writers start on an empty index: exactly one builds.
+  auto statuses = RunWriters(kWriters, [&](int w) {
+    return (*index)->AddRecord(records[w].key, std::move(records[w].data))
+        .status();
+  });
+  for (const auto &status : statuses) VMSDK_EXPECT_OK(status);
+
+  EXPECT_EQ(counter.load(), before);
+  EXPECT_NE(VectorSVSTestPeer::Handle(**index), nullptr);
+  EXPECT_EQ(AsBase(*index)->GetLabelCount(), static_cast<size_t>(kWriters));
+  std::vector<int> ids(kWriters);
+  std::iota(ids.begin(), ids.end(), 0);
+  ExpectEachIsItsOwnNearest(**index, ids, vectors, kWriters);
+}
+
+TEST_F(VectorSVSThreadpoolTest, ConcurrentAddsAndRemovesStayConsistent) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok());
+  // Prefill [0, N); four writers remove even ids of their slice, four add
+  // [N, 2N).
+  auto vectors = DeterministicallyGenerateVectors(2 * kConcurrentVectors,
+                                                  kDimensions, 10.0);
+  for (int i = 0; i < kConcurrentVectors; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  std::vector<PreparedRecord> records;
+  for (int i = kConcurrentVectors; i < 2 * kConcurrentVectors; ++i) {
+    records.push_back(PrepareRecord(**index, i, vectors[i]));
+  }
+  const int half = kWriters / 2;
+  const int per_remover = kConcurrentVectors / half;
+  const int per_adder = kConcurrentVectors / half;
+  auto statuses = RunWriters(kWriters, [&](int w) -> absl::Status {
+    if (w < half) {
+      for (int i = w * per_remover; i < (w + 1) * per_remover; i += 2) {
+        auto removed =
+            (*index)->RemoveRecord(IndexToKey(i), DeletionType::kRecord);
+        if (!removed.ok()) return removed.status();
+        if (!*removed) {
+          return absl::NotFoundError(absl::StrCat("id ", i, " not removed"));
+        }
+      }
+    } else {
+      const int a = w - half;
+      for (int i = a * per_adder; i < (a + 1) * per_adder; ++i) {
+        auto result =
+            (*index)->AddRecord(records[i].key, std::move(records[i].data));
+        if (!result.ok()) return result.status();
+      }
+    }
+    return absl::OkStatus();
+  });
+  for (const auto &status : statuses) VMSDK_EXPECT_OK(status);
+
+  std::vector<int> live_ids;
+  for (int i = 1; i < kConcurrentVectors; i += 2) live_ids.push_back(i);
+  for (int i = kConcurrentVectors; i < 2 * kConcurrentVectors; ++i) {
+    live_ids.push_back(i);
+  }
+  EXPECT_EQ(AsBase(*index)->GetLabelCount(), live_ids.size());
+  ExpectEachIsItsOwnNearest(**index, live_ids, vectors, live_ids.size());
+  // A removed vector's nearest neighbour is never the removed id.
+  for (int i = 0; i < kConcurrentVectors; i += 2) {
+    auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever(),
+                                   nullptr, /*ef_runtime=*/live_ids.size());
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_NE((*result)[0].external_id, IndexToKey(i)) << "id " << i;
+  }
 }
 
 }  // namespace
