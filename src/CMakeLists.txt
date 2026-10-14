@@ -100,7 +100,8 @@ if(UNIX AND NOT APPLE AND NOT SAN_BUILD)
     POST_BUILD
     COMMAND ${CMAKE_SOURCE_DIR}/ci/check_module_allocators.sh
             $<TARGET_FILE:libsearch> ${CMAKE_BINARY_DIR}
-    COMMENT "Verifying static-init deferral and allocator usage")
+    COMMAND ${CMAKE_SOURCE_DIR}/ci/check_svs_link.sh $<TARGET_FILE:libsearch>
+    COMMENT "Verifying static-init deferral, allocator usage and SVS linkage")
 endif()
 
 target_link_libraries(libsearch PUBLIC keyspace_event_manager)
