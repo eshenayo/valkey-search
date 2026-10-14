@@ -33,9 +33,18 @@
 extern "C" {
 struct svs_index;
 typedef struct svs_index *svs_index_h;
+struct svs_threadpool_interface_ops;
+struct svs_threadpool_interface;
 }
 
 namespace valkey_search::indexes {
+
+#if defined(__linux__) && defined(__x86_64__)
+// Sequential threadpool vtable installed on every SVS builder; exposed for
+// the unit tests.
+extern svs_threadpool_interface_ops kSvsThreadpoolOps;
+extern svs_threadpool_interface kSvsThreadpoolIface;
+#endif
 
 // Build-time configuration retained on the class so the first HSET can
 // bootstrap the SVS index once it has an actual vector to build with;

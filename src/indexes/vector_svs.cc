@@ -91,9 +91,14 @@ bool SvsThreadpoolParallelFor(void* /*self*/,
   return true;
 }
 
+}  // namespace
+
+// Declared in vector_svs.h for the unit tests.
 svs_threadpool_ops_t kSvsThreadpoolOps =
     SVS_INIT_THREADPOOL_OPS(SvsThreadpoolSize, SvsThreadpoolParallelFor);
 svs_threadpool_t kSvsThreadpoolIface{&kSvsThreadpoolOps, nullptr};
+
+namespace {
 
 // Huge-page-aware custom allocator vtable. Requests at least one huge
 // page in size try three tiers in order: 2 MiB huge pages via
