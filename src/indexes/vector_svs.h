@@ -7,6 +7,7 @@
 
 #ifndef VALKEYSEARCH_SRC_INDEXES_VECTOR_SVS_H_
 #define VALKEYSEARCH_SRC_INDEXES_VECTOR_SVS_H_
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -126,7 +127,7 @@ class VectorSVS : public VectorType<T> {
   // deletes away), so every label LoadTrackedKeys re-encounters is new to
   // it; try_emplace instead of the base class's CHECK.
   std::shared_ptr<const VectorRecord> &GetOrCreateVectorLockFree(
-      uint64_t internal_id) override ABSL_NO_THREAD_SAFETY_ANALYSIS;
+      uint64_t internal_id) override ABSL_LOCKS_EXCLUDED(label_mutex_);
   std::shared_ptr<const VectorRecord> &GetVector(
       uint64_t internal_id) const override ABSL_NO_THREAD_SAFETY_ANALYSIS;
   std::optional<hnswlib::tableint> GetAlgoIdLockFree(
@@ -156,6 +157,13 @@ class VectorSVS : public VectorType<T> {
   // phase gate, so GetVectorLockFree stays lock-free and the delete-then-add
   // gap inside modify is never observed.
   svs_index_h svs_index_ ABSL_GUARDED_BY(resize_mutex_){nullptr};
+  // Mutations hold the reader side of resize_mutex_ when SVS guards the index
+  // itself (built with SVS_SYNC_KIND_FINE_GRAIN). An index restored from RDB
+  // comes back with SVS_SYNC_KIND_NONE at the pinned revision (the stream load
+  // takes no parameters), so its mutations take the writer side instead and
+  // stay serialized, as before. Set once in LoadFromRDB before the instance is
+  // published; read on every mutation.
+  std::atomic<bool> mutations_exclusive_{false};
   SVSBuildConfig build_config_;
   mutable absl::Mutex label_mutex_ ABSL_ACQUIRED_AFTER(resize_mutex_);
   mutable absl::node_hash_map<uint64_t, std::shared_ptr<const VectorRecord>>

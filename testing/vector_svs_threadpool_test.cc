@@ -9,8 +9,6 @@
 // the create-failure counter, the FINE_GRAIN build and concurrent writers.
 // Built only where the SVS C API is (x86_64 Linux).
 
-#include "src/indexes/vector_svs.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -23,13 +21,14 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "absl/synchronization/notification.h"
-#include "src/attribute_data.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "src/attribute_data.h"
 #include "src/index_schema.pb.h"
 #include "src/indexes/vector_base.h"
+#include "src/indexes/vector_svs.h"
 #include "src/metrics.h"
 #include "src/utils/cancel.h"
 #include "src/utils/string_interning.h"
@@ -185,11 +184,10 @@ TEST_P(VectorSVSThreadpoolCompressionTest,
   auto vectors =
       DeterministicallyGenerateVectors(kNumVectors, kDimensions, 10.0);
   for (int i = 0; i < kNumVectors; ++i) {
-    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
-        **index, IndexToKey(i), VectorToStr(vectors[i])));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
   }
-  EXPECT_EQ(AsBase(*index)->GetLabelCount(),
-            static_cast<size_t>(kNumVectors));
+  EXPECT_EQ(AsBase(*index)->GetLabelCount(), static_cast<size_t>(kNumVectors));
 
   for (int planted : {0, 42, kNumVectors - 1}) {
     auto result =
@@ -221,9 +219,7 @@ TEST_F(VectorSVSThreadpoolTest,
   // so the first AddRecord fails inside BootstrapIndex.
   auto *saved_size = kSvsThreadpoolOps.size;
   kSvsThreadpoolOps.size = &ZeroThreadpoolSize;
-  absl::Cleanup restore = [saved_size] {
-    kSvsThreadpoolOps.size = saved_size;
-  };
+  absl::Cleanup restore = [saved_size] { kSvsThreadpoolOps.size = saved_size; };
 
   auto &counter = Metrics::GetStats().svs_create_exceptions_cnt;
   const uint64_t before = counter.load();
@@ -342,12 +338,11 @@ TEST_F(VectorSVSThreadpoolTest, EightWritersAddConcurrentlyAndEveryIdIsFound) {
       attribute_identifier, attribute_data_type, 0);
   ASSERT_TRUE(index.ok());
   // Bootstrap first so every writer below goes through add_points.
-  auto vectors =
-      DeterministicallyGenerateVectors(kConcurrentVectors + 1, kDimensions,
-                                       10.0);
-  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
-      **index, IndexToKey(kConcurrentVectors),
-      VectorToStr(vectors[kConcurrentVectors])));
+  auto vectors = DeterministicallyGenerateVectors(kConcurrentVectors + 1,
+                                                  kDimensions, 10.0);
+  VMSDK_EXPECT_OK(
+      testing_infra::AddVectorRecord(**index, IndexToKey(kConcurrentVectors),
+                                     VectorToStr(vectors[kConcurrentVectors])));
 
   std::vector<PreparedRecord> records;
   records.reserve(kConcurrentVectors);
@@ -387,7 +382,8 @@ TEST_F(VectorSVSThreadpoolTest, FirstAddRaceBuildsOnceAndLosersAdd) {
   }
   // All writers start on an empty index: exactly one builds.
   auto statuses = RunWriters(kWriters, [&](int w) {
-    return (*index)->AddRecord(records[w].key, std::move(records[w].data))
+    return (*index)
+        ->AddRecord(records[w].key, std::move(records[w].data))
         .status();
   });
   for (const auto &status : statuses) VMSDK_EXPECT_OK(status);
