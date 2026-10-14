@@ -44,6 +44,7 @@
 #include "src/index_schema.pb.h"
 #include "src/indexes/svs_index.pb.h"
 #include "src/indexes/svs_stream_adapter.h"
+#include "src/metrics.h"
 #include "vmsdk/src/utils.h"
 #endif
 
@@ -399,7 +400,7 @@ absl::StatusOr<BuilderPtr> AssembleIndexBuilder(
 
 // Builds the first svs_index on the first HSET after Create() left
 // svs_index_ null. svs_index_build_dynamic requires num_vectors > 0.
-absl::StatusOr<svs_index_h> BootstrapIndex(
+absl::StatusOr<svs_index_h> BootstrapIndexImpl(
     const SVSBuildConfig& config, data_model::DistanceMetric distance_metric,
     int dimensions, uint64_t label, const float* fp32_vector) {
   ScopedSvsError err;
@@ -414,6 +415,18 @@ absl::StatusOr<svs_index_h> BootstrapIndex(
     return SvsErrorToStatus(err.get(), "index_build_dynamic");
   }
   return index;
+}
+
+// Counts every failure once in svs_create_exceptions_cnt (INFO).
+absl::StatusOr<svs_index_h> BootstrapIndex(
+    const SVSBuildConfig& config, data_model::DistanceMetric distance_metric,
+    int dimensions, uint64_t label, const float* fp32_vector) {
+  auto result = BootstrapIndexImpl(config, distance_metric, dimensions, label,
+                                   fp32_vector);
+  if (!result.ok()) {
+    ++Metrics::GetStats().svs_create_exceptions_cnt;
+  }
+  return result;
 }
 
 // Compares the v1 fields that determine SVS's on-disk layout
