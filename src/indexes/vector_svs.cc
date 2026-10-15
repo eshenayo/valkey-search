@@ -8,6 +8,7 @@
 #include "src/indexes/vector_svs.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -118,6 +119,10 @@ constexpr size_t kSvsAllocatorHugePageSize = 2 * 1024 * 1024;
 // 16 MiB keeps the first-add reservation bounded. Measured 16–64 MiB
 // behave identically; smaller wastes per-block overhead at large DIM.
 constexpr size_t kSvsBlockSizeBytes = 16 * 1024 * 1024;
+// svs_index_build_dynamic_ex rejects a block size that is not a power of two,
+// while the stream load rounds one down silently; keep the two paths agreeing.
+static_assert(std::has_single_bit(kSvsBlockSizeBytes),
+              "kSvsBlockSizeBytes must be a power of two");
 
 // In the pinned SVS revision FINE_GRAIN is an alias of GLOBAL; once upstream
 // implements it, writers on one index run in parallel with no module change.
