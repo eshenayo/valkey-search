@@ -33,6 +33,7 @@
 #include "src/rdb_serialization.h"
 #include "src/utils/cancel.h"
 #include "third_party/hnswlib/hnswlib.h"
+#include "vmsdk/src/debug.h"
 #include "vmsdk/src/status/status_macros.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
@@ -762,6 +763,8 @@ absl::Status VectorSVS<T>::AddRecordImpl(
           absl::StrCat("SVS internal_id already present: ", internal_id));
     }
   }
+  // Test hook: the map holds the id, SVS does not yet. No lock is held here.
+  BACKGROUND_PAUSEPOINT("svs_add_after_map_reserve");
   absl::Status status = InsertVector(internal_id, fp32);
   absl::MutexLock map_lock(&label_mutex_);
   if (!status.ok()) {
@@ -801,6 +804,9 @@ absl::Status VectorSVS<T>::RemoveRecordImpl(uint64_t internal_id) {
       }
     }
   }
+  // Test hook: SVS no longer holds the id, the map still does. No lock is
+  // held here.
+  BACKGROUND_PAUSEPOINT("svs_remove_after_svs_delete");
   // Erase the authoritative label mapping regardless of the SVS
   // delete outcome. If SVS reports failure, its internal state for
   // this id is unknown; dropping the map entry ensures search paths
@@ -953,8 +959,17 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
 
   // Deletes only mark SVS slots, so a handle can outlive its last live
   // entry; SVS's save cannot compact an index with none, so save it as the
-  // handle-less empty index and bootstrap afresh on the next write.
-  const bool has_index = svs_index_ != nullptr && GetLabelCount() > 0;
+  // handle-less empty index and bootstrap afresh on the next write. Ask SVS
+  // for its live count: writers update label_to_record_ outside
+  // resize_mutex_, so the map can disagree with SVS here.
+  size_t live_entries = 0;
+  if (svs_index_ != nullptr) {
+    ScopedSvsError size_err;
+    if (!svs_index_get_size(svs_index_, &live_entries, size_err.get())) {
+      return SvsErrorToStatus(size_err.get(), "index_get_size");
+    }
+  }
+  const bool has_index = live_entries > 0;
 
   data_model::SVSIndexHeader header;
   header.set_format_version(kSvsHeaderFormatVersion);

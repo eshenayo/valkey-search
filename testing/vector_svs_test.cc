@@ -28,8 +28,11 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "src/attribute_data.h"
@@ -45,6 +48,7 @@
 #include "src/utils/string_interning.h"
 #include "svs/c/svs_c.h"
 #include "testing/common.h"
+#include "vmsdk/src/debug.h"
 #include "vmsdk/src/managed_pointers.h"
 #include "vmsdk/src/testing_infra/module.h"
 #include "vmsdk/src/testing_infra/utils.h"
@@ -954,6 +958,82 @@ TEST_F(VectorSVSTest, EightWritersAddConcurrentlyAfterLoad) {
   }
   ValkeyModule_FreeString(nullptr, records[0]);
 }
+
+// A foreground SAVE runs on the main thread while writer threads mutate, and
+// writers update the label map outside resize_mutex_. Each case parks a writer
+// where the map and SVS disagree on whether any entry is live, then saves:
+// the save must succeed and its RDB must load back.
+struct SaveRaceCase {
+  const char *name;
+  const char *pause_point;
+};
+
+class VectorSVSSaveRaceTest : public VectorSVSTest,
+                              public testing::WithParamInterface<SaveRaceCase> {
+};
+
+TEST_P(VectorSVSSaveRaceTest, SaveWhileWriterIsBetweenMapAndSvs) {
+  const char *pause_point = GetParam().pause_point;
+  const bool remove_case =
+      absl::string_view(pause_point) == "svs_remove_after_svs_delete";
+  auto vectors = DeterministicallyGenerateVectors(2, kDimensions, 5.0);
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  ASSERT_TRUE(index.ok()) << index.status();
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  if (!remove_case) {
+    // Leave an SVS handle with no live entries for the add to land in.
+    VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(0), DeletionType::kNone));
+  }
+
+  // The vector record is built on the main thread, as the writer pool's
+  // callers do; only the mutation runs on the writer thread.
+  PreparedRecord to_add = PrepareRecord(**index, 1, vectors[1]);
+  vmsdk::debug::PausePointControl(pause_point, true);
+  absl::Status writer_status;
+  std::thread writer([&] {
+    if (remove_case) {
+      writer_status =
+          (*index)->RemoveRecord(IndexToKey(0), DeletionType::kNone).status();
+    } else {
+      writer_status =
+          (*index)->AddRecord(to_add.key, std::move(to_add.data)).status();
+    }
+  });
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while (vmsdk::debug::PausePointWaiters(pause_point).value_or(0) == 0 &&
+         absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  const bool parked =
+      vmsdk::debug::PausePointWaiters(pause_point).value_or(0) == 1;
+
+  FakeSafeRDB rdb;
+  auto save_status = (*index)->SaveIndex(RDBChunkOutputStream(&rdb));
+  vmsdk::debug::PausePointControl(pause_point, false);
+  writer.join();
+
+  ASSERT_TRUE(parked) << "writer never reached " << pause_point;
+  EXPECT_TRUE(writer_status.ok()) << writer_status;
+  ASSERT_TRUE(save_status.ok()) << save_status;
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  EXPECT_TRUE(loaded.ok()) << loaded.status();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    SaveRaceCases, VectorSVSSaveRaceTest,
+    testing::Values(
+        SaveRaceCase{"RemoveOfLastEntry", "svs_remove_after_svs_delete"},
+        SaveRaceCase{"AddIntoEmptyHandle", "svs_add_after_map_reserve"}),
+    [](const testing::TestParamInfo<SaveRaceCase> &info) {
+      return std::string(info.param.name);
+    });
 
 }  // namespace
 }  // namespace valkey_search::indexes
