@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -64,6 +65,9 @@ class VectorSVSTestPeer {
   static bool MutationsExclusive(const VectorSVS<float> &index) {
     return index.mutations_exclusive_.load();
   }
+  static absl::Mutex &ResizeMutex(VectorSVS<float> &index) {
+    return index.resize_mutex_;
+  }
 };
 
 namespace {
@@ -84,6 +88,13 @@ VectorBase *AsBase(const std::shared_ptr<VectorSVS<float>> &p) {
 
 class VectorSVSTest : public ValkeySearchTest {
  public:
+  // Enabling a pause point flips a process-global switch that makes every
+  // BACKGROUND_PAUSEPOINT take a mutex; put it back so later tests keep
+  // their interleavings.
+  void TearDown() override {
+    vmsdk::debug::pause_points_enabled = false;
+    ValkeySearchTest::TearDown();
+  }
   HashAttributeDataType hash_attribute_data_type_;
   const char *attribute_identifier = "attribute_identifier_1";
   data_model::AttributeDataType attribute_data_type =
@@ -966,6 +977,7 @@ TEST_F(VectorSVSTest, EightWritersAddConcurrentlyAfterLoad) {
 struct SaveRaceCase {
   const char *name;
   const char *pause_point;
+  bool remove;  // true: park a remove after its SVS delete; false: an add
 };
 
 class VectorSVSSaveRaceTest : public VectorSVSTest,
@@ -974,8 +986,7 @@ class VectorSVSSaveRaceTest : public VectorSVSTest,
 
 TEST_P(VectorSVSSaveRaceTest, SaveWhileWriterIsBetweenMapAndSvs) {
   const char *pause_point = GetParam().pause_point;
-  const bool remove_case =
-      absl::string_view(pause_point) == "svs_remove_after_svs_delete";
+  const bool remove_case = GetParam().remove;
   auto vectors = DeterministicallyGenerateVectors(2, kDimensions, 5.0);
   auto proto =
       CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
@@ -1028,12 +1039,91 @@ TEST_P(VectorSVSSaveRaceTest, SaveWhileWriterIsBetweenMapAndSvs) {
 
 INSTANTIATE_TEST_SUITE_P(
     SaveRaceCases, VectorSVSSaveRaceTest,
-    testing::Values(
-        SaveRaceCase{"RemoveOfLastEntry", "svs_remove_after_svs_delete"},
-        SaveRaceCase{"AddIntoEmptyHandle", "svs_add_after_map_reserve"}),
+    testing::Values(SaveRaceCase{"RemoveOfLastEntry",
+                                 "svs_remove_after_svs_delete",
+                                 /*remove=*/true},
+                    SaveRaceCase{"AddIntoEmptyHandle",
+                                 "svs_add_after_map_reserve",
+                                 /*remove=*/false}),
     [](const testing::TestParamInfo<SaveRaceCase> &info) {
       return std::string(info.param.name);
     });
+
+// Observes the lock mode rather than the flag: with the test thread holding
+// the shared side of resize_mutex_, an add on a built index proceeds (it
+// takes the shared side too) while an add on a restored index waits for the
+// exclusive side until the test lets go.
+void HoldSharedWhile(absl::Mutex &mu, const std::function<void()> &body)
+    ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  mu.ReaderLock();
+  body();
+  mu.ReaderUnlock();
+}
+
+TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
+  FakeSafeRDB rdb;
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto built = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(built);
+  auto vectors = DeterministicallyGenerateVectors(3, kDimensions, 2.0);
+  std::vector<ValkeyModuleString *> records(1);
+  records[0] = ValkeyModule_CreateString(
+      nullptr, (const char *)vectors[0].data(), kDimensions * sizeof(float));
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**built, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  VMSDK_EXPECT_OK((*built)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*built)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto restored = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(restored);
+  VMSDK_EXPECT_OK(
+      (*restored)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                   SupplementalContentChunkIter(&rdb)));
+
+  // The writer is parked at svs_add_after_map_reserve, just before it takes
+  // resize_mutex_, so it is demonstrably running when the test takes the
+  // shared side and lets it go. `wait` bounds the add from there: generous
+  // where it must finish (a slow runner is not a failure), short where it
+  // must not (the writer is only ever blocked, never slow).
+  constexpr absl::string_view kPark = "svs_add_after_map_reserve";
+  auto add_while_shared_held = [&](VectorSVS<float> &index, int id,
+                                   absl::Duration wait) {
+    PreparedRecord record = PrepareRecord(index, id, vectors[id]);
+    absl::Notification done;
+    absl::Status status;
+    bool finished_while_held = false;
+    vmsdk::debug::PausePointControl(kPark, true);
+    std::thread writer([&] {
+      status = index.AddRecord(record.key, std::move(record.data)).status();
+      done.Notify();
+    });
+    const absl::Time deadline = absl::Now() + absl::Seconds(10);
+    while (vmsdk::debug::PausePointWaiters(kPark).value_or(0) == 0 &&
+           absl::Now() < deadline) {
+      absl::SleepFor(absl::Milliseconds(1));
+    }
+    EXPECT_EQ(vmsdk::debug::PausePointWaiters(kPark).value_or(0), 1u)
+        << "writer never reached the pause point";
+    HoldSharedWhile(VectorSVSTestPeer::ResizeMutex(index), [&] {
+      vmsdk::debug::PausePointControl(kPark, false);  // release the writer
+      finished_while_held = done.WaitForNotificationWithTimeout(wait);
+    });
+    writer.join();
+    VMSDK_EXPECT_OK(status);
+    return finished_while_held;
+  };
+  EXPECT_TRUE(add_while_shared_held(**built, 1, absl::Seconds(10)))
+      << "a built index mutates under the shared lock";
+  EXPECT_FALSE(add_while_shared_held(**restored, 1, absl::Milliseconds(300)))
+      << "a restored index must wait for the exclusive lock";
+  EXPECT_EQ(AsBase(*restored)->GetLabelCount(), 2u);
+  ValkeyModule_FreeString(nullptr, records[0]);
+}
 
 }  // namespace
 }  // namespace valkey_search::indexes

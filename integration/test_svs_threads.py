@@ -20,6 +20,8 @@ NUM_CLIENTS = 8
 LOAD_SECONDS = 2.0
 KNN_K = 10
 LATENCY_BOUND = 10.0
+LAT_DOCS = 2000      # latency test only; the thread-count tests keep NUM_DOCS
+LAT_ROUNDS = 3
 
 
 def _fp32(values):
@@ -61,7 +63,8 @@ def _knn(client: Valkey, index: str, query, k: int = KNN_K):
         "PARAMS", "2", "q", _fp32(query), "DIALECT", "2", "LIMIT", "0", str(k))
 
 
-def _search_load(clients, index: str, seconds: float, sampler=None):
+def _search_load(clients, index: str, seconds: float, sampler=None,
+                 query=None):
     """Run one FT.SEARCH loop per client for `seconds`. Returns the list of
     per-call latencies (seconds) across all clients. `sampler`, if given, is
     called every 100 ms on the main thread while the load runs."""
@@ -70,11 +73,11 @@ def _search_load(clients, index: str, seconds: float, sampler=None):
     errors = []
 
     def worker(i, client):
-        query = [NUM_DOCS / 2 + 0.5] + [0.0] * (DIM - 1)
+        q = query if query is not None else [NUM_DOCS / 2 + 0.5] + [0.0] * (DIM - 1)
         try:
             while not stop.is_set():
                 t0 = time.perf_counter()
-                reply = _knn(client, index, query)
+                reply = _knn(client, index, q)
                 latencies[i].append(time.perf_counter() - t0)
                 assert reply[0] == KNN_K, reply[0]
         except Exception as exc:  # surfaced on the main thread below
@@ -145,30 +148,41 @@ class TestSVSThreadpool(ValkeySearchTestCaseBase):
         assert all(v == baseline for v in observed.values()), observed
 
     def test_p99_search_latency_under_8_clients_within_10x_of_hnsw(self):
-        """One search occupies one reader thread, like HNSW; same 200 docs in
-        both indexes."""
+        """One search occupies one reader thread, like HNSW. Same docs in both
+        indexes; three interleaved samples per index so drift on the runner
+        hits both alike, compared on the median p99. Client scheduling
+        dominates both numbers on a small index, hence the loose bound; the
+        thread-count test above is the sharp check."""
         client: Valkey = self.server.get_new_client()
         self._create(client, "lat_svs", "SVS_VAMANA", "lat:")
         self._create(client, "lat_hnsw", "HNSW", "lat:")
-        self._populate(client, "lat:")
-        _wait_indexed(client, "lat_svs", NUM_DOCS)
-        _wait_indexed(client, "lat_hnsw", NUM_DOCS)
+        pipe = client.pipeline(transaction=False)
+        for i in range(LAT_DOCS):
+            pipe.hset(f"lat:{i}", mapping={"v": _fp32(_doc_vector(i))})
+            if i % 200 == 199:
+                pipe.execute()
+        pipe.execute()
+        _wait_indexed(client, "lat_svs", LAT_DOCS)
+        _wait_indexed(client, "lat_hnsw", LAT_DOCS)
 
-        query = [NUM_DOCS / 2 + 0.5] + [0.0] * (DIM - 1)
+        query = [LAT_DOCS / 2 + 0.5] + [0.0] * (DIM - 1)
         for index in ("lat_svs", "lat_hnsw"):
             for _ in range(50):  # warm up
                 _knn(client, index, query)
 
         clients = self._clients()
-        p99 = {}
-        samples = {}
-        for index in ("lat_hnsw", "lat_svs"):
-            lat = _search_load(clients, index, LOAD_SECONDS)
-            assert len(lat) >= 100, f"{index}: only {len(lat)} searches"
-            p99[index] = _p99(lat)
-            samples[index] = len(lat)
+        p99s = {"lat_hnsw": [], "lat_svs": []}
+        samples = {"lat_hnsw": 0, "lat_svs": 0}
+        for _ in range(LAT_ROUNDS):
+            for index in ("lat_hnsw", "lat_svs"):
+                lat = _search_load(clients, index, LOAD_SECONDS, query=query)
+                assert len(lat) >= 100, f"{index}: only {len(lat)} searches"
+                p99s[index].append(_p99(lat))
+                samples[index] += len(lat)
+        p99 = {index: sorted(v)[len(v) // 2] for index, v in p99s.items()}
 
-        detail = (f"p99 svs={p99['lat_svs'] * 1e3:.3f} ms "
+        detail = (f"median p99 over {LAT_ROUNDS} rounds: "
+                  f"svs={p99['lat_svs'] * 1e3:.3f} ms "
                   f"(n={samples['lat_svs']}) vs "
                   f"hnsw={p99['lat_hnsw'] * 1e3:.3f} ms "
                   f"(n={samples['lat_hnsw']}), bound {LATENCY_BOUND}x")

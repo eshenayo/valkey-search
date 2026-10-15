@@ -277,6 +277,12 @@ TEST_F(VectorSVSThreadpoolTest, BootstrapBuildsWithFineGrainSyncKind) {
 }
 
 // -- (f) concurrent writers ---------------------------------------------------
+//
+// At the pinned SVS revision SVS_SYNC_KIND_FINE_GRAIN is an alias of GLOBAL:
+// SVS serializes writers on one lock inside the index. These tests therefore
+// exercise the module's label map, slot reservation and first-build paths
+// under concurrency, not parallel SVS mutation; they become that acceptance
+// when upstream implements FINE_GRAIN.
 
 // Records are built on the test thread (VectorRegistry is not thread-safe).
 struct PreparedRecord {
@@ -454,6 +460,48 @@ TEST_F(VectorSVSThreadpoolTest, ConcurrentAddsAndRemovesStayConsistent) {
     ASSERT_EQ(result->size(), 1u);
     EXPECT_NE((*result)[0].external_id, IndexToKey(i)) << "id " << i;
   }
+}
+
+TEST_F(VectorSVSThreadpoolTest,
+       EightWritersModifyConcurrentlyAndEveryIdIsFound) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok());
+  auto vectors =
+      DeterministicallyGenerateVectors(kConcurrentVectors, kDimensions, 10.0);
+  for (int i = 0; i < kConcurrentVectors; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+
+  // Replace every vector from 8 threads at once (delete + add inside SVS,
+  // under the shared lock); each id must end up on its new vector.
+  std::vector<std::vector<float>> replaced(vectors);
+  for (auto &v : replaced) {
+    for (auto &x : v) x = -x - 1.0f;
+  }
+  std::vector<PreparedRecord> records;
+  records.reserve(kConcurrentVectors);
+  for (int i = 0; i < kConcurrentVectors; ++i) {
+    records.push_back(PrepareRecord(**index, i, replaced[i]));
+  }
+  auto statuses = RunWriters(kWriters, [&](int w) {
+    for (int i = w * kPerWriter; i < (w + 1) * kPerWriter; ++i) {
+      auto result =
+          (*index)->ModifyRecord(records[i].key, std::move(records[i].data));
+      if (!result.ok()) return result.status();
+    }
+    return absl::OkStatus();
+  });
+  for (const auto &status : statuses) VMSDK_EXPECT_OK(status);
+
+  EXPECT_EQ(AsBase(*index)->GetLabelCount(),
+            static_cast<size_t>(kConcurrentVectors));
+  std::vector<int> ids(kConcurrentVectors);
+  std::iota(ids.begin(), ids.end(), 0);
+  ExpectEachIsItsOwnNearest(**index, ids, replaced, kConcurrentVectors);
 }
 
 }  // namespace
