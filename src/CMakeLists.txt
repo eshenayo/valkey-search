@@ -100,8 +100,18 @@ if(UNIX AND NOT APPLE AND NOT SAN_BUILD)
     POST_BUILD
     COMMAND ${CMAKE_SOURCE_DIR}/ci/check_module_allocators.sh
             $<TARGET_FILE:libsearch> ${CMAKE_BINARY_DIR}
+    COMMENT "Verifying static-init deferral and allocator usage")
+endif()
+
+# SVS is built on x86_64 Linux only (src/indexes/CMakeLists.txt); gate its
+# linkage there under the same condition.
+if(UNIX AND NOT APPLE AND NOT SAN_BUILD
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  add_custom_command(
+    TARGET libsearch
+    POST_BUILD
     COMMAND ${CMAKE_SOURCE_DIR}/ci/check_svs_link.sh $<TARGET_FILE:libsearch>
-    COMMENT "Verifying static-init deferral, allocator usage and SVS linkage")
+    COMMENT "Verifying SVS linkage")
 endif()
 
 target_link_libraries(libsearch PUBLIC keyspace_event_manager)
