@@ -175,7 +175,9 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
     @pytest.mark.parametrize("metric,alpha_args,expected", [
         ("L2", [], 1.2),
         ("IP", [], 0.95),
+        ("COSINE", [], 0.95),
         ("L2", ["ALPHA", "1.5"], 1.5),
+        ("COSINE", ["ALPHA", "0.9"], 0.9),
     ])
     def test_ft_info_reports_effective_alpha(self, metric, alpha_args,
                                              expected):
