@@ -457,7 +457,7 @@ TEST_F(VectorSVSTest, SaveAndLoadSvsWithRecallAndMultipleChunks) {
 // later gate in the same header can be exercised instead. Mirrors
 // kSvsHeaderFormatVersion (vector_svs.cc, private to that file); update this
 // if that constant ever bumps.
-constexpr uint32_t kKnownGoodFormatVersion = 1;
+constexpr uint32_t kKnownGoodFormatVersion = 2;
 
 // Builds a header that matches `proto` on every field the corrupt-* mutators
 // below don't touch, with has_index=false so no real SVS stream is needed.
@@ -1198,6 +1198,96 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   VMSDK_EXPECT_OK(result);
   ASSERT_EQ(result->size(), 1u);
   EXPECT_EQ((*result)[0].external_id, IndexToKey(0));
+}
+
+// -- Per-field footprint
+// -------------------------------------------------------
+
+size_t SvsDataBytes(const VectorSVS<float> &index) {
+  svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+  svs_error_h err = svs_error_create();
+  EXPECT_TRUE(svs_index_get_memory_breakdown(VectorSVSTestPeer::Handle(index),
+                                             &breakdown, err))
+      << svs_error_get_message(err);
+  svs_error_free(err);
+  return breakdown.data_bytes;
+}
+
+// INITIAL_CAP sizes SVS's allocation block, so a small index no longer
+// reserves the full 16 MiB on its first add; an index without INITIAL_CAP
+// keeps the maximum.
+TEST_F(VectorSVSTest, InitialCapSizesTheFirstReservation) {
+  auto vectors = DeterministicallyGenerateVectors(1, kDimensions, 1.0);
+  auto data_bytes_for = [&](uint32_t initial_cap) {
+    auto proto =
+        CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                  data_model::SVS_COMPRESSION_NONE);
+    proto.set_initial_cap(initial_cap);
+    auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                          attribute_data_type, 0);
+    CHECK(index.ok());
+    CHECK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                         VectorToStr(vectors[0]))
+              .ok());
+    EXPECT_EQ(AsBase(*index)->GetCapacity(), size_t{initial_cap});
+    EXPECT_EQ(AsBase(*index)->ToProto()->vector_index().initial_cap(),
+              initial_cap);
+    return SvsDataBytes(**index);
+  };
+  EXPECT_LE(data_bytes_for(100), 64u * 1024);
+  EXPECT_GE(data_bytes_for(0), 16u * 1024 * 1024);
+}
+
+// A payload with an older header format may have another layout (format 2
+// stores FP16 for TYPE FLOAT16 with COMPRESSION NONE), so it is rebuilt from
+// the keyspace like an SVS version mismatch.
+TEST_F(VectorSVSTest, RebuildsFromKeyspaceOnOlderHeaderFormat) {
+  const size_t kNumVectors = 10;
+  auto vectors =
+      DeterministicallyGenerateVectors(kNumVectors, kDimensions, 5.0);
+  std::vector<ValkeyModuleString *> records(kNumVectors);
+  for (size_t i = 0; i < kNumVectors; ++i) {
+    records[i] = ValkeyModule_CreateString(
+        nullptr, (const char *)vectors[i].data(), kDimensions * sizeof(float));
+  }
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  for (size_t i = 0; i < kNumVectors; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  FakeSafeRDB rdb;
+  data_model::SVSIndexHeader header = ValidHeaderFor(proto);
+  header.set_format_version(kKnownGoodFormatVersion - 1);
+  header.set_has_index(true);
+  {
+    RDBChunkOutputStream out(&rdb);
+    VMSDK_EXPECT_OK(out.SaveString(header.SerializeAsString()));
+    VMSDK_EXPECT_OK(out.SaveString("payload in the older layout"));
+    VMSDK_EXPECT_OK(out.Close());
+  }
+  VMSDK_EXPECT_OK((*index)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(loaded);
+  VMSDK_EXPECT_OK(
+      (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                 SupplementalContentChunkIter(&rdb)));
+  auto result = (*loaded)->Search(VectorToStr(vectors[3]), 1, CancelNever());
+  VMSDK_EXPECT_OK(result);
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_EQ((*result)[0].external_id, IndexToKey(3));
+
+  for (auto *record : records) {
+    ValkeyModule_FreeString(nullptr, record);
+  }
 }
 
 // -- SVS version mismatch on load --------------------------------------------
