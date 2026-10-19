@@ -76,9 +76,9 @@ void FillSvsVamanaProto(const SVSBuildConfig& config,
 
 namespace {
 
-// RDB header format, bumped whenever SVSIndexHeader's shape or the payload
-// layout changes. 2: TYPE FLOAT16 with COMPRESSION NONE stores FP16.
-constexpr uint32_t kSvsHeaderFormatVersion = 2;
+// RDB header format, bumped whenever SVSIndexHeader's shape changes in a
+// way that breaks backward compatibility with older readers.
+constexpr uint32_t kSvsHeaderFormatVersion = 1;
 
 // Sequential threadpool vtable: SVS invokes parallel_for on the calling
 // reader thread. Matches HNSW's concurrency model (one search occupies
@@ -647,7 +647,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
       return absl::InternalError("Could not deserialize SVS index header");
     }
 
-    if (header.format_version() > kSvsHeaderFormatVersion) {
+    if (header.format_version() != kSvsHeaderFormatVersion) {
       return absl::InvalidArgumentError(absl::StrCat(
           "SVS_VAMANA RDB header format_version mismatch: expected ",
           kSvsHeaderFormatVersion, ", got ", header.format_version()));
@@ -658,9 +658,6 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
     const uint32_t current_svs_version = svs_get_version();
     const bool svs_version_mismatch =
         header.svs_version() != current_svs_version;
-    // An older header format means the payload layout may have changed
-    // since (see kSvsHeaderFormatVersion); rebuild it the same way.
-    const bool older_format = header.format_version() < kSvsHeaderFormatVersion;
 
     if (header.dimensionality() != vector_index_proto.dimension_count()) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -682,13 +679,11 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
           "SVS_VAMANA RDB header element_type mismatch: expected ",
           instance->GetVectorDataType(), ", got ", header.element_type()));
     }
-    if (svs_version_mismatch || older_format) {
+    if (svs_version_mismatch) {
       VMSDK_LOG(WARNING, nullptr)
           << "SVS_VAMANA index " << attribute_identifier
           << " was saved with SVS version " << header.svs_version()
-          << " and header format " << header.format_version()
           << "; this build is SVS version " << current_svs_version
-          << " and header format " << kSvsHeaderFormatVersion
           << ". Rebuilding it from the keyspace.";
       instance->rebuild_from_keyspace_ = header.has_index();
       return instance;
