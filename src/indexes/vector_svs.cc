@@ -1160,16 +1160,25 @@ SVSBuildConfig VectorSVS<T>::StorageConfig() const {
 
 template <typename T>
 void VectorSVS<T>::MaybeConvert() {
-  auto due = [this]() {
-    return compression_pending_.load(std::memory_order_acquire) &&
-           GetLabelCount() >= build_config_.training_threshold;
-  };
-  if (!due()) return;
+  // The label map also holds adds still in flight, so it only says a
+  // conversion may be due; SVS's own count decides, under the lock.
+  if (!compression_pending_.load(std::memory_order_acquire) ||
+      GetLabelCount() < build_config_.training_threshold) {
+    return;
+  }
   // Conversion copies the index, so it excludes writers; searches are already
   // excluded by the mutation phase.
   absl::WriterMutexLock lock(&resize_mutex_);
-  if (svs_index_ == nullptr || !due()) return;
+  if (svs_index_ == nullptr ||
+      !compression_pending_.load(std::memory_order_relaxed)) {
+    return;
+  }
   ScopedSvsError err;
+  size_t in_svs = 0;
+  if (!svs_index_get_size(svs_index_, &in_svs, err.get()) ||
+      in_svs < build_config_.training_threshold) {
+    return;
+  }
   auto builder = AssembleIndexBuilder(build_config_, this->distance_metric_,
                                       dimensions_, err.get());
   svs_index_h converted = nullptr;
