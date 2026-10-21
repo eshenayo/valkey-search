@@ -400,7 +400,7 @@ class TestSvsSaveRestoreSq8(ValkeySearchTestCaseDebugMode):
     must load as one, convert when it reaches TRAINING_THRESHOLD, and then
     round-trip compressed."""
 
-    THRESHOLD = 20
+    THRESHOLD = 64  # the minimum TRAINING_THRESHOLD
 
     def _reload(self, how: str):
         if how == "debug_reload":
@@ -432,6 +432,7 @@ class TestSvsSaveRestoreSq8(ValkeySearchTestCaseDebugMode):
         pre = _collect_knn(client, index, half)
         self._reload(how)
         wait_size(half)
+        assert _v_index(client, index)["algorithm"]["compression_pending"] == 1
         self._assert_knn_preserved(pre, _collect_knn(client, index, half))
 
         # Reaching the threshold converts the index; it keeps answering.
@@ -445,6 +446,7 @@ class TestSvsSaveRestoreSq8(ValkeySearchTestCaseDebugMode):
         info = _v_index(client, index)
         assert info["algorithm"]["compression"] == "SVS_COMPRESSION_SQ8"
         assert info["algorithm"]["training_threshold"] == self.THRESHOLD
+        assert info["algorithm"]["compression_pending"] == 0
         self._assert_knn_preserved(pre,
                                    _collect_knn(client, index, self.THRESHOLD))
 

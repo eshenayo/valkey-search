@@ -1230,7 +1230,7 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   EmitDataTypeInfo(ctx);
   ValkeyModule_ReplyWithSimpleString(ctx, "algorithm");
   const bool trained = build_config_.training_threshold > 0;
-  ValkeyModule_ReplyWithArray(ctx, trained ? 14 : 12);
+  ValkeyModule_ReplyWithArray(ctx, trained ? 16 : 12);
   ValkeyModule_ReplyWithSimpleString(ctx, "name");
   ValkeyModule_ReplyWithSimpleString(
       ctx, std::string(
@@ -1254,6 +1254,9 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   if (trained) {
     ValkeyModule_ReplyWithSimpleString(ctx, "training_threshold");
     ValkeyModule_ReplyWithLongLong(ctx, build_config_.training_threshold);
+    ValkeyModule_ReplyWithSimpleString(ctx, "compression_pending");
+    ValkeyModule_ReplyWithLongLong(
+        ctx, compression_pending_.load(std::memory_order_acquire) ? 1 : 0);
   }
   return 4;
 }

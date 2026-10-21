@@ -1169,8 +1169,19 @@ INSTANTIATE_TEST_SUITE_P(
                             "TRAINING_THRESHOLD 0",
              .expected_error_message =
                  "Invalid field type for field `embedding`: Invalid range: "
-                 "Value below minimum; TRAINING_THRESHOLD must be a positive "
-                 "integer and cannot exceed 1000000.",
+                 "Value below minimum; TRAINING_THRESHOLD must be an integer "
+                 "of at least 64 and cannot exceed 1000000.",
+         },
+         {
+             .test_name = "svs_sq8_training_threshold_below_min",
+             .success = false,
+             .command_str = "idx1 SCHEMA embedding VECTOR SVS_VAMANA 10 "
+                            "TYPE FLOAT32 DIM 3 DISTANCE_METRIC L2 COMPRESSION SQ8 "
+                            "TRAINING_THRESHOLD 63",
+             .expected_error_message =
+                 "Invalid field type for field `embedding`: Invalid range: "
+                 "Value below minimum; TRAINING_THRESHOLD must be an integer "
+                 "of at least 64 and cannot exceed 1000000.",
          },
          {
              .test_name = "svs_sq8_training_threshold_above_max",
@@ -1180,8 +1191,8 @@ INSTANTIATE_TEST_SUITE_P(
                             "TRAINING_THRESHOLD 1000001",
              .expected_error_message =
                  "Invalid field type for field `embedding`: Invalid range: "
-                 "Value above maximum; TRAINING_THRESHOLD must be a positive "
-                 "integer and cannot exceed 1000000.",
+                 "Value above maximum; TRAINING_THRESHOLD must be an integer "
+                 "of at least 64 and cannot exceed 1000000.",
          },
          {
              .test_name = "svs_training_threshold_with_compression_none",

@@ -1001,10 +1001,11 @@ absl::Status SVSVamanaParameters::Verify() const {
       return absl::InvalidArgumentError(absl::StrCat(
           kTrainingThresholdParam, " only applies to COMPRESSION SQ8."));
     }
-    VMSDK_RETURN_IF_ERROR(
-        vmsdk::VerifyRange(*training_threshold, 1, kMaxSVSTrainingThreshold))
-        << kTrainingThresholdParam
-        << " must be a positive integer and cannot exceed "
+    VMSDK_RETURN_IF_ERROR(vmsdk::VerifyRange(*training_threshold,
+                                             kMinSVSTrainingThreshold,
+                                             kMaxSVSTrainingThreshold))
+        << kTrainingThresholdParam << " must be an integer of at least "
+        << kMinSVSTrainingThreshold << " and cannot exceed "
         << kMaxSVSTrainingThreshold << ".";
   }
   // ALPHA sentinel (-1.0) means "use SVS's metric-specific default".

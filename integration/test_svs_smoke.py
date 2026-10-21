@@ -9,6 +9,7 @@ break SVS?" during iteration on the branch, and is what to run before
 opening a review.
 """
 
+import math
 import random
 import struct
 
@@ -48,11 +49,20 @@ def _fp16(values):
     return struct.pack(f"<{len(values)}e", *values)
 
 
-# Docs and queries for the SQ8 calibration checks, as in vector_svs_test.cc.
+# Docs and queries for the SQ8 calibration checks, as in vector_svs_test.cc,
+# padded to the minimum TRAINING_THRESHOLD (64) with docs inside each case's
+# range, so the range and each doc's error bound stay the same.
+SQ8_MIN_THRESHOLD = 64
+_SQ8_FILLERS = SQ8_MIN_THRESHOLD - 4
 SQ8_CASES = {
-    "L2": ([[1, 0, 0, 0], [100, 0, 0, 0], [200, 0, 0, 0], [300, 0, 0, 0]],
+    "L2": ([[1, 0, 0, 0], [100, 0, 0, 0], [200, 0, 0, 0], [300, 0, 0, 0]]
+           + [[2 + 297 * i / (_SQ8_FILLERS - 1), 0, 0, 0]
+              for i in range(_SQ8_FILLERS)],
            [200, 0, 0, 0]),
-    "COSINE": ([[2, 0, 0, 0], [-3, 0, 0, 0], [0, -4, 0, 0], [0, 0, 5, 0]],
+    "COSINE": ([[2, 0, 0, 0], [-3, 0, 0, 0], [0, -4, 0, 0], [0, 0, 5, 0]]
+               + [[math.cos(math.pi / 2 * (i + 1) / (_SQ8_FILLERS + 1)),
+                   math.sin(math.pi / 2 * (i + 1) / (_SQ8_FILLERS + 1)),
+                   0, 0] for i in range(_SQ8_FILLERS)],
                [-7, 0, 0, 0]),
 }
 
@@ -336,19 +346,24 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
                 lambda: _v_index(client, index)["size"], n, timeout=5)
             reply = client.execute_command(
                 "FT.SEARCH", index, f"*=>[KNN {n} @v $q]",
-                "PARAMS", "2", "q", _fp32(query), "DIALECT", "2",
+                "PARAMS", "2", "q", _fp32(query), "LIMIT", "0", str(n),
+                "DIALECT", "2",
             )
             assert reply[0] == n, reply
             return _score_map(reply)
 
         for i, values in enumerate(docs[:-1]):
             client.hset(f"s:{i}", mapping={"v": _fp32(values)})
+        assert _v_index(client, "sq8")["algorithm"]["compression_pending"] \
+            == 1
         uncompressed = scores("sq8", len(docs) - 1)
         assert uncompressed == pytest.approx(scores("flat", len(docs) - 1),
                                        abs=1e-5)
 
         client.hset(f"s:{len(docs) - 1}", mapping={"v": _fp32(docs[-1])})
         built = scores("sq8", len(docs))
+        assert _v_index(client, "sq8")["algorithm"]["compression_pending"] \
+            == 0
         exact = scores("flat", len(docs))
         for i, values in enumerate(docs):
             key = f"s:{i}".encode()
@@ -709,9 +724,11 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         assert idx_info["size"] == 3
         assert idx_info["algorithm"]["compression"] == \
             f"SVS_COMPRESSION_{compression}"
-        # SQ8 waits for 1024 docs by default before its first build.
+        # SQ8 stays uncompressed until 1024 docs by default.
         assert idx_info["algorithm"].get("training_threshold") == \
             (1024 if compression == "SQ8" else None)
+        assert idx_info["algorithm"].get("compression_pending") == \
+            (1 if compression == "SQ8" else None)
 
 
 class TestSVSVamanaDebugMode(ValkeySearchTestCaseDebugMode):
