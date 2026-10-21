@@ -32,6 +32,7 @@
 #include "src/indexes/bfloat16.h"
 #include "src/indexes/fp16.h"
 #include "src/indexes/index_base.h"
+#include "src/indexes/svs_capabilities.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
 #include "src/query/search.h"
@@ -83,6 +84,7 @@ void FillSvsVamanaProto(const SVSBuildConfig& config,
   proto->set_alpha(config.alpha);
   proto->set_compression(config.compression);
   proto->set_training_threshold(config.training_threshold);
+  proto->set_leanvec_dims(config.leanvec_dims);
 }
 }  // namespace
 
@@ -285,7 +287,7 @@ std::optional<svs_data_type_t> CompressionToSvsDataType(
       // SQ8 option; symmetric quantization around zero.
       return SVS_DATA_TYPE_INT8;
     default:
-      // Not available in this build; rejected here.
+      // LVQ / LEANVEC storage is built by MakeSvsStorage.
       return std::nullopt;
   }
 }
@@ -333,6 +335,41 @@ struct StorageDeleter {
 };
 using StoragePtr =
     std::unique_ptr<std::remove_pointer_t<svs_storage_h>, StorageDeleter>;
+
+// Maps the compression proto value to an SVS storage configuration.
+absl::StatusOr<StoragePtr> MakeSvsStorage(const SVSBuildConfig& config) {
+  switch (config.compression) {
+    // TODO(LVQ): svs_storage_create_lvq(primary, residual); LVQ<P>X<R> maps
+    // P/R bits to SVS_DATA_TYPE_UINT4/UINT8, and LVQ4/LVQ8 use residual VOID.
+    case data_model::SVS_COMPRESSION_LVQ4:
+    case data_model::SVS_COMPRESSION_LVQ8:
+    case data_model::SVS_COMPRESSION_LVQ4X4:
+    case data_model::SVS_COMPRESSION_LVQ4X8:
+      return absl::UnimplementedError(
+          "SVS_VAMANA: LVQ storage is not implemented yet");
+    // TODO(LeanVec): svs_storage_create_leanvec(config.leanvec_dims, primary,
+    // secondary).
+    case data_model::SVS_COMPRESSION_LEANVEC4X4:
+    case data_model::SVS_COMPRESSION_LEANVEC4X8:
+    case data_model::SVS_COMPRESSION_LEANVEC8X8:
+      return absl::UnimplementedError(
+          "SVS_VAMANA: LeanVec storage is not implemented yet");
+    default:
+      break;
+  }
+  auto storage_type =
+      CompressionToSvsDataType(config.compression, config.input_type);
+  if (!storage_type.has_value()) {
+    return absl::InvalidArgumentError("SVS_VAMANA: unknown COMPRESSION");
+  }
+  ScopedSvsError err;
+  StoragePtr storage(
+      config.compression == data_model::SVS_COMPRESSION_SQ8
+          ? svs_storage_create_sq(*storage_type, err.get())
+          : svs_storage_create_simple(*storage_type, err.get()));
+  if (!storage) return SvsErrorToStatus(err.get(), "storage_create");
+  return storage;
+}
 
 struct AlgorithmDeleter {
   void operator()(svs_algorithm_h h) const {
@@ -514,13 +551,7 @@ absl::StatusOr<BuilderPtr> AssembleIndexBuilder(
     return absl::InvalidArgumentError(
         "SVS_VAMANA: unsupported DISTANCE_METRIC");
   }
-  auto storage_type =
-      CompressionToSvsDataType(config.compression, config.input_type);
-  if (!storage_type.has_value()) {
-    return absl::InvalidArgumentError(
-        "SVS_VAMANA: COMPRESSION is proprietary / v2 and not available "
-        "in this build");
-  }
+  VMSDK_ASSIGN_OR_RETURN(auto storage, MakeSvsStorage(config));
 
   AlgorithmPtr algo(svs_algorithm_create_vamana(
       config.graph_max_degree, config.construction_window_size,
@@ -532,14 +563,6 @@ absl::StatusOr<BuilderPtr> AssembleIndexBuilder(
       return SvsErrorToStatus(err, "algorithm_vamana_set_alpha");
     }
   }
-
-  StoragePtr storage;
-  if (config.compression == data_model::SVS_COMPRESSION_SQ8) {
-    storage.reset(svs_storage_create_sq(*storage_type, err));
-  } else {
-    storage.reset(svs_storage_create_simple(*storage_type, err));
-  }
-  if (!storage) return SvsErrorToStatus(err, "storage_create");
 
   BuilderPtr builder(svs_index_builder_create(
       *metric, static_cast<size_t>(dimensions), algo.get(), err));
@@ -614,7 +637,8 @@ bool BuildConfigMatches(const SVSBuildConfig& expected,
          expected.construction_window_size ==
              header_config.construction_window_size() &&
          expected.alpha == header_config.alpha() &&
-         expected.compression == header_config.compression();
+         expected.compression == header_config.compression() &&
+         expected.leanvec_dims == header_config.leanvec_dims();
 }
 
 }  // namespace
@@ -659,11 +683,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
         "SVS_VAMANA: unsupported DISTANCE_METRIC");
   }
   const auto& svs_proto = vector_index_proto.svs_vamana_algorithm();
-  if (!CompressionToSvsDataType(svs_proto.compression()).has_value()) {
-    return absl::InvalidArgumentError(
-        "SVS_VAMANA: COMPRESSION is proprietary / v2 and not available in "
-        "this build");
-  }
+  VMSDK_RETURN_IF_ERROR(CheckSvsCompressionAvailable(svs_proto.compression()));
 
   auto instance = std::shared_ptr<VectorSVS<T>>(
       new VectorSVS<T>(vector_index_proto.dimension_count(),
@@ -671,17 +691,20 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
       vmsdk::DestructByMainThread<VectorSVS<T>>{});
   instance->Init(vector_index_proto.distance_metric());
   instance->build_config_ = SVSBuildConfig{
-      svs_proto.graph_max_degree(),   svs_proto.construction_window_size(),
-      svs_proto.search_window_size(), svs_proto.alpha(),
+      svs_proto.graph_max_degree(),
+      svs_proto.construction_window_size(),
+      svs_proto.search_window_size(),
+      svs_proto.alpha(),
       svs_proto.compression(),
   };
+  instance->build_config_.leanvec_dims = svs_proto.leanvec_dims();
   instance->build_config_.input_type = instance->GetVectorDataType();
   instance->build_config_.initial_cap = vector_index_proto.initial_cap();
   instance->build_config_.blocksize_bytes =
       SvsBlockSizeBytes(instance->build_config_, instance->dimensions_);
-  // SQ8 calibrates its range once, from the vectors it compresses, so the
+  // These compressions calibrate from the vectors they compress, so the
   // index starts uncompressed and converts at the training threshold.
-  if (svs_proto.compression() == data_model::SVS_COMPRESSION_SQ8) {
+  if (SvsCompressionUsesTrainingThreshold(svs_proto.compression())) {
     instance->build_config_.training_threshold = svs_proto.training_threshold();
     instance->compression_pending_.store(
         instance->build_config_.training_threshold > 0,

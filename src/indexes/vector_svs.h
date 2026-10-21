@@ -70,6 +70,8 @@ struct SVSBuildConfig {
   // uncompressed until it holds this many vectors, then converts. 0 compresses
   // from the first add.
   uint32_t training_threshold{0};
+  // LeanVec only; 0 selects the SVS default.
+  uint32_t leanvec_dims{0};
 };
 
 // Routes SVS's default logger to the Valkey log. Call once at module load.
