@@ -2,6 +2,7 @@
 
 BUILD_CONFIG=release
 RUN_CMAKE="no"
+SVS_PREBUILT="no"
 ROOT_DIR=$(readlink -f $(dirname $0))
 VERBOSE_ARGS=""
 CMAKE_TARGET=""
@@ -40,6 +41,7 @@ Usage: build.sh [options...]
     --no-system-modules               Disable system dependencies and force building from submodules.
     --asan                            Build with address sanitizer enabled.
     --tsan                            Build with thread sanitizer enabled.
+    --svs-prebuilt                    Link the prebuilt SVS C API (LVQ/LeanVec) instead of compiling third_party/svs.
     --retries=N                       Attempt to run integration tests N times. Default is 1.
     --jobs=N                          Limit the build workers to N. Default: use all available cores.
 
@@ -186,6 +188,12 @@ while [ $# -gt 0 ]; do
         CMAKE_EXTRA_ARGS="${CMAKE_EXTRA_ARGS} -DSAN_BUILD=thread"
         SAN_BUILD="thread"
         export TSAN_BUILD=1
+        shift || true
+        echo "Using extra cmake arguments: ${CMAKE_EXTRA_ARGS}"
+        ;;
+    --svs-prebuilt)
+        CMAKE_EXTRA_ARGS="${CMAKE_EXTRA_ARGS} -DSVS_C_API_PREBUILT=ON"
+        SVS_PREBUILT="yes"
         shift || true
         echo "Using extra cmake arguments: ${CMAKE_EXTRA_ARGS}"
         ;;
@@ -566,6 +574,9 @@ if [[ "${SAN_BUILD}" != "no" ]]; then
     else
         BUILD_DIR=${BUILD_DIR}-tsan
     fi
+fi
+if [[ "${SVS_PREBUILT}" == "yes" ]]; then
+    BUILD_DIR=${BUILD_DIR}-svs-prebuilt
 fi
 
 check_and_clean_on_branch_change

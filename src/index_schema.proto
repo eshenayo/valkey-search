@@ -133,8 +133,14 @@ enum SVSCompressionType {
   SVS_COMPRESSION_FP16 = 1;
   SVS_COMPRESSION_SQ8 = 9;
 
-  // Kept out of this build; reserved so they are not reused.
-  reserved 2 to 8;
+  // LVQ / LeanVec (proprietary SVS C API).
+  SVS_COMPRESSION_LVQ4 = 2;
+  SVS_COMPRESSION_LVQ8 = 3;
+  SVS_COMPRESSION_LVQ4X4 = 4;
+  SVS_COMPRESSION_LVQ4X8 = 5;
+  SVS_COMPRESSION_LEANVEC4X4 = 6;
+  SVS_COMPRESSION_LEANVEC4X8 = 7;
+  SVS_COMPRESSION_LEANVEC8X8 = 8;
 }
 
 enum RawVectorStorage {
@@ -165,8 +171,10 @@ message SVSVamanaAlgorithm {
   // Number of vectors to accumulate before building an index whose
   // compression trains on the data (SQ8). 0 for the other compressions.
   uint32 training_threshold = 7;
-  // 6 is kept out of this build; reserved so it is not reused.
-  reserved 6, 9;
+  reserved 9;
   reserved "distance_match_epsilon_per_dim";
+  // Required when compression is one of the LEANVEC* variants. Number of
+  // dimensions the LeanVec projection reduces to; must be < dim.
+  uint32 leanvec_dims = 6;
 }
 
