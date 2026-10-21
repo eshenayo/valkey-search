@@ -1337,7 +1337,8 @@ INSTANTIATE_TEST_SUITE_P(
                             "TRAINING_THRESHOLD 100",
              .expected_error_message =
                  "Invalid field type for field `embedding`: "
-                 "TRAINING_THRESHOLD only applies to COMPRESSION SQ8.",
+                 "TRAINING_THRESHOLD only applies to COMPRESSION SQ8, LVQ and "
+                 "LEANVEC.",
          },
          {
              .test_name = "svs_training_threshold_with_compression_fp16",
@@ -1347,7 +1348,8 @@ INSTANTIATE_TEST_SUITE_P(
                             "TRAINING_THRESHOLD 100",
              .expected_error_message =
                  "Invalid field type for field `embedding`: "
-                 "TRAINING_THRESHOLD only applies to COMPRESSION SQ8.",
+                 "TRAINING_THRESHOLD only applies to COMPRESSION SQ8, LVQ and "
+                 "LEANVEC.",
          },
          {
              .test_name = "invalid_m_negative",
@@ -2823,6 +2825,26 @@ INSTANTIATE_TEST_SUITE_P(
                      .min_stem_size = 4,
                  }
              },
+         },
+         {
+             .test_name = "svs_reduce_requires_leanvec",
+             .success = false,
+             .command_str = "idx1 SChema v vector svs_vamana 10 TYPE FLOAT32 "
+                            "DIM 4 DISTANCE_METRIC L2 COMPRESSION LVQ8 "
+                            "REDUCE 2",
+             .expected_error_message =
+                 "Invalid field type for field `v`: REDUCE requires a "
+                 "LEANVEC COMPRESSION.",
+         },
+         {
+             .test_name = "svs_reduce_must_be_less_than_dim",
+             .success = false,
+             .command_str = "idx1 SChema v vector svs_vamana 10 TYPE FLOAT32 "
+                            "DIM 4 DISTANCE_METRIC L2 COMPRESSION LEANVEC4X8 "
+                            "REDUCE 4",
+             .expected_error_message =
+                 "Invalid field type for field `v`: REDUCE (4) must be less "
+                 "than DIM (4).",
          }}),
     [](const TestParamInfo<FTCreateParserTestCase> &info) {
       return info.param.test_name;
