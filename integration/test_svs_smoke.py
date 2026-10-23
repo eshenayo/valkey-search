@@ -724,7 +724,7 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         until the storage stubs in vector_svs.cc are filled in."""
         client: Valkey = self.server.get_new_client()
         info = client.execute_command("INFO", "SEARCH")
-        supported = int(info["search_svs_lvq_leanvec_supported"])
+        supported = int(info.get("search_svs_lvq_leanvec_supported", 0))
         with pytest.raises(Exception) as exc_info:
             client.execute_command(
                 "FT.CREATE", f"comp_{compression.lower()}_idx",
