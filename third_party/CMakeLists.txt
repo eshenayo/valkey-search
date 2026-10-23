@@ -84,14 +84,17 @@ if(SVS_C_API_PREBUILT)
         "Prebuilt SVS C API ${SVS_C_API_ARCHIVE} was built with OpenMP. Use "
         "an archive built with SVS_ENABLE_OMP=OFF.")
   endif()
-  # The archive bundles fmt/spdlog/MKL; --exclude-libs,ALL on libsearch keeps
-  # those symbols out of the module's dynamic table.
+  # The archive bundles fmt/spdlog/MKL; --exclude-libs keeps those symbols out
+  # of the module's dynamic table, independent of libsearch's own link flags.
   add_library(svs_c_api_static STATIC IMPORTED GLOBAL)
   set_target_properties(svs_c_api_static PROPERTIES
       IMPORTED_LOCATION "${SVS_C_API_ARCHIVE}"
       INTERFACE_INCLUDE_DIRECTORIES "${SVS_C_API_ROOT}/include"
       IMPORTED_LINK_INTERFACE_LANGUAGES CXX)
-  target_link_libraries(svs_c_api_static INTERFACE ${CMAKE_DL_LIBS} m)
+  # A link item, not INTERFACE_LINK_OPTIONS: those skip PRIVATE static deps
+  # under CMP0099 OLD (cmake_minimum_required 3.16).
+  target_link_libraries(svs_c_api_static INTERFACE ${CMAKE_DL_LIBS} m
+      "-Wl,--exclude-libs,libsvs_c_api.a")
   target_compile_definitions(svs_c_api_static INTERFACE
       VALKEY_SEARCH_SVS_PREBUILT=1)
   message(STATUS "SVS C API: prebuilt (LVQ/LeanVec) from ${SVS_C_API_ROOT}")
