@@ -363,10 +363,9 @@ absl::StatusOr<StoragePtr> MakeSvsStorage(const SVSBuildConfig& config) {
     return absl::InvalidArgumentError("SVS_VAMANA: unknown COMPRESSION");
   }
   ScopedSvsError err;
-  StoragePtr storage(
-      config.compression == data_model::SVS_COMPRESSION_SQ8
-          ? svs_storage_create_sq(*storage_type, err.get())
-          : svs_storage_create_simple(*storage_type, err.get()));
+  StoragePtr storage(config.compression == data_model::SVS_COMPRESSION_SQ8
+                         ? svs_storage_create_sq(*storage_type, err.get())
+                         : svs_storage_create_simple(*storage_type, err.get()));
   if (!storage) return SvsErrorToStatus(err.get(), "storage_create");
   return storage;
 }
@@ -691,10 +690,8 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
       vmsdk::DestructByMainThread<VectorSVS<T>>{});
   instance->Init(vector_index_proto.distance_metric());
   instance->build_config_ = SVSBuildConfig{
-      svs_proto.graph_max_degree(),
-      svs_proto.construction_window_size(),
-      svs_proto.search_window_size(),
-      svs_proto.alpha(),
+      svs_proto.graph_max_degree(),   svs_proto.construction_window_size(),
+      svs_proto.search_window_size(), svs_proto.alpha(),
       svs_proto.compression(),
   };
   instance->build_config_.leanvec_dims = svs_proto.leanvec_dims();
