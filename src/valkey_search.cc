@@ -599,9 +599,12 @@ static vmsdk::info_field::Integer svs_c_api_prebuilt(
 
 static vmsdk::info_field::Integer svs_lvq_leanvec_supported(
     "svs", "svs_lvq_leanvec_supported",
-    vmsdk::info_field::IntegerBuilder().App().Computed([]() -> long long {
-      return indexes::SvsLvqLeanVecSupported();
-    }));
+    vmsdk::info_field::IntegerBuilder()
+        .App()
+        .VisibleIf(indexes::SvsCApiPrebuilt)
+        .Computed([]() -> long long {
+          return indexes::SvsLvqLeanVecSupported();
+        }));
 
 static vmsdk::info_field::Integer string_interning_store_size(
     "string_interning", "string_interning_store_size",
