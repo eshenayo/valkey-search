@@ -6,8 +6,8 @@
 #
 # POST_BUILD check of how the SVS C API (svs_c_api_static) is linked into
 # the module: no libgomp in DT_NEEDED (SVS is built without OpenMP), no
-# svs_* symbol exported (LINKER:--exclude-libs,ALL keeps it internal), no
-# undefined svs:: symbol (every C API source compiled), and
+# svs_* or bundled-library symbol exported (--exclude-libs keeps them
+# internal), no undefined svs:: symbol (every C API source compiled), and
 # svs_get_version_string present so the first checks are not vacuous.
 #
 # Usage: check_svs_link.sh <module.so>
@@ -25,9 +25,11 @@ if readelf -d "${MODULE_SO}" | grep -q 'gomp'; then
     exit 1
 fi
 
-EXPORTED=$(nm -D "${MODULE_SO}" 2>/dev/null | grep -E ' [TWD] svs_' || true)
+# svs_* plus what the prebuilt archive bundles: MKL, spdlog, fmt, namespace svs.
+EXPORTED=$(nm -D --defined-only "${MODULE_SO}" 2>/dev/null |
+    grep -E ' [TWDVBR] (svs_|mkl_|MKL_|cblas_|LAPACKE_|_ZN6spdlog|_ZN3fmt|_Z[A-Z]*N3svs)' || true)
 if [ -n "${EXPORTED}" ]; then
-    echo "check_svs_link: FAIL: svs_* symbols exported from the module:" >&2
+    echo "check_svs_link: FAIL: SVS or bundled-library symbols exported from the module:" >&2
     echo "${EXPORTED}" | head -5 >&2
     exit 1
 fi
