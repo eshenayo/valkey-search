@@ -711,26 +711,51 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
             assert int(key.split(b":")[1]) % 2 == 0, \
                 f"filter leaked non-red doc: {key!r}"
 
-    @pytest.mark.parametrize("compression", ["LVQ8", "LVQ4X8", "LEANVEC4X8"])
+    @pytest.mark.parametrize("compression", [
+        "LVQ4", "LVQ8", "LVQ4X4", "LVQ4X8",
+        "LEANVEC4X4", "LEANVEC4X8", "LEANVEC8X8",
+    ])
     def test_proprietary_compression_gated(self, compression):
         """LVQ / LEANVEC need the prebuilt SVS C API (--svs-prebuilt) on an
-        Intel CPU. Where supported, they hit the not-implemented fence
-        until the storage stubs in vector_svs.cc are filled in."""
+        Intel CPU. Where supported, the index is created and stays
+        uncompressed until its training threshold."""
         client: Valkey = self.server.get_new_client()
         info = client.execute_command("INFO", "SEARCH")
         supported = int(info.get("search_svs_lvq_leanvec_supported", 0))
+        idx = f"comp_{compression.lower()}_idx"
+        reduce = ["REDUCE", "1"] if compression.startswith("LEANVEC") else []
+        create = [
+            "FT.CREATE", idx,
+            "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
+            str(8 + len(reduce)), "TYPE", "FLOAT32", "DIM", str(DIM),
+            "DISTANCE_METRIC", "L2", "COMPRESSION", compression, *reduce,
+        ]
+        if not supported:
+            with pytest.raises(Exception) as exc_info:
+                client.execute_command(*create)
+            assert "requires an SVS build with LVQ/LeanVec" in \
+                str(exc_info.value)
+            return
+        client.execute_command(*create)
+        algorithm = _v_index(client, idx)["algorithm"]
+        assert algorithm["compression"] == f"SVS_COMPRESSION_{compression}"
+        assert algorithm["training_threshold"] == 1024
+        assert algorithm["compression_pending"] == 1
+
+    @pytest.mark.parametrize("compression",
+                             ["LEANVEC4X4", "LEANVEC4X8", "LEANVEC8X8"])
+    def test_leanvec_requires_reduce(self, compression):
+        """LeanVec has no default reduced dimension count."""
+        client: Valkey = self.server.get_new_client()
         with pytest.raises(Exception) as exc_info:
             client.execute_command(
-                "FT.CREATE", f"comp_{compression.lower()}_idx",
+                "FT.CREATE", f"{compression.lower()}_no_reduce_idx",
                 "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
                 "8", "TYPE", "FLOAT32", "DIM", str(DIM),
                 "DISTANCE_METRIC", "L2", "COMPRESSION", compression,
             )
-        if supported:
-            assert "not implemented yet" in str(exc_info.value)
-        else:
-            assert "requires an SVS build with LVQ/LeanVec" in \
-                str(exc_info.value)
+        assert "REDUCE is required for a LEANVEC COMPRESSION" in \
+            str(exc_info.value)
 
     def test_reduce_requires_leanvec(self):
         """REDUCE only applies to LEANVEC compression."""

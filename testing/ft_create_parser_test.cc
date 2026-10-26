@@ -2845,6 +2845,16 @@ INSTANTIATE_TEST_SUITE_P(
              .expected_error_message =
                  "Invalid field type for field `v`: REDUCE (4) must be less "
                  "than DIM (4).",
+         },
+         {
+             .test_name = "svs_leanvec_requires_reduce",
+             .success = false,
+             .command_str = "idx1 SChema v vector svs_vamana 8 TYPE FLOAT32 "
+                            "DIM 4 DISTANCE_METRIC L2 COMPRESSION LEANVEC4X8",
+             .expected_error_message =
+                 "Invalid field type for field `v`: REDUCE is required for a "
+                 "LEANVEC COMPRESSION and must be greater than 0 and less "
+                 "than DIM.",
          }}),
     [](const TestParamInfo<FTCreateParserTestCase> &info) {
       return info.param.test_name;

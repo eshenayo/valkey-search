@@ -25,6 +25,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -45,7 +46,9 @@
 #include "src/attribute_data.h"
 #include "src/attribute_data_type.h"
 #include "src/index_schema.pb.h"
+#include "src/indexes/fp16.h"
 #include "src/indexes/index_base.h"
+#include "src/indexes/svs_capabilities.h"
 #include "src/indexes/svs_index.pb.h"
 #include "src/indexes/vector_base.h"
 #include "src/indexes/vector_flat.h"
@@ -79,7 +82,8 @@ class VectorSVSTestPeer {
   static size_t DeletedSinceConsolidate(const VectorSVS<float> &index) {
     return index.deleted_since_consolidate_.load();
   }
-  static bool CompressionPending(const VectorSVS<float> &index) {
+  template <typename T>
+  static bool CompressionPending(const VectorSVS<T> &index) {
     return index.compression_pending_.load();
   }
   static absl::Status AddPoint(VectorSVS<float> &index, uint64_t id,
@@ -105,7 +109,8 @@ auto IndexToKey = [](int i) {
 // re-declares its overrides under `protected:` (they're implementation
 // detail there); access control resolves on the static type, so a caller
 // outside the class needs the VectorBase view to reach them at all.
-VectorBase *AsBase(const std::shared_ptr<VectorSVS<float>> &p) {
+template <typename T>
+VectorBase *AsBase(const std::shared_ptr<VectorSVS<T>> &p) {
   return p.get();
 }
 
@@ -1544,6 +1549,249 @@ INSTANTIATE_TEST_SUITE_P(
                     data_model::DISTANCE_METRIC_COSINE),
     [](const testing::TestParamInfo<data_model::DistanceMetric> &info) {
       return data_model::DistanceMetric_Name(info.param);
+    });
+
+// -- LVQ / LeanVec ------------------------------------------------------------
+
+// LVQ and LeanVec train on the data like SQ8: the index fills uncompressed and
+// converts at the training threshold. They need the prebuilt SVS C API on an
+// Intel CPU, so the suite skips elsewhere. FLOAT16 input fills an FP16 index,
+// so its conversion starts from a different source than FLOAT32's.
+using LvqLeanVecParam =
+    std::tuple<data_model::SVSCompressionType, data_model::DistanceMetric,
+               data_model::VectorDataType>;
+
+// Encodes a vector as the bytes of an index whose elements are T.
+template <typename T>
+std::string EncodeAs(const std::vector<float> &vector) {
+  std::vector<T> converted;
+  converted.reserve(vector.size());
+  for (float v : vector) converted.push_back(static_cast<T>(v));
+  return std::string(reinterpret_cast<const char *>(converted.data()),
+                     converted.size() * sizeof(T));
+}
+
+class VectorSVSLvqLeanVecTest
+    : public VectorSVSTest,
+      public testing::WithParamInterface<LvqLeanVecParam> {
+ protected:
+  static constexpr uint32_t kThreshold = 64;
+  static constexpr size_t kTopK = 10;
+
+  void SetUp() override {
+    VectorSVSTest::SetUp();
+    if (!SvsLvqLeanVecSupported()) {
+      GTEST_SKIP() << "needs the prebuilt SVS C API on an Intel CPU";
+    }
+  }
+
+  data_model::VectorIndex Proto() const {
+    const auto [compression, metric, data_type] = GetParam();
+    auto proto = CreateSVSVectorIndexProto(kDimensions, metric, compression);
+    auto *svs = proto.mutable_svs_vamana_algorithm();
+    svs->set_training_threshold(kThreshold);
+    if (IsSvsLeanVecCompression(compression)) {
+      svs->set_leanvec_dims(kDimensions / 4);
+      // LeanVec searches on the reduced vectors and reranks the search window
+      // at full dimension, so a window of k leaves recall to the reduced
+      // vectors alone. The default window for LeanVec is not tuned yet.
+      svs->set_search_window_size(4 * kTopK);
+    }
+    return proto;
+  }
+
+  bool Float16() const {
+    return std::get<2>(GetParam()) == data_model::VECTOR_DATA_TYPE_FLOAT16;
+  }
+
+  template <typename T>
+  void ConvertsAtThresholdAndRoundTrips();
+  template <typename T>
+  void PendingIndexRoundTrip();
+};
+
+// The add that reaches the threshold converts the index once, after which it
+// keeps accepting writes and agrees with FLAT on most of the top 10. A saved
+// and reloaded copy answers with the same keys and scores.
+template <typename T>
+void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
+  constexpr size_t kNumVectors = 2 * kThreshold;
+  auto &stats = Metrics::GetStats();
+  const auto proto = Proto();
+  auto index =
+      VectorSVS<T>::Create(proto, attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok()) << index.status();
+  auto flat = VectorFlat<float>::Create(
+      CreateFlatVectorIndexProto(kDimensions, std::get<1>(GetParam()),
+                                 /*initial_cap=*/kNumVectors,
+                                 /*block_size=*/kNumVectors),
+      "attribute_identifier_2", attribute_data_type, 0);
+  ASSERT_TRUE(flat.ok()) << flat.status();
+  auto vectors = RandomVectors(kNumVectors, kDimensions);
+  std::vector<ValkeyModuleString *> records(kNumVectors);
+  absl::Cleanup free_records = [&records]() {
+    for (auto *record : records) ValkeyModule_FreeString(nullptr, record);
+  };
+  const uint64_t done_before = stats.svs_conversions_cnt;
+  const uint64_t failed_before = stats.svs_conversion_failures_cnt;
+  for (size_t i = 0; i < kNumVectors; ++i) {
+    const auto encoded = EncodeAs<T>(vectors[i]);
+    records[i] =
+        ValkeyModule_CreateString(nullptr, encoded.data(), encoded.size());
+    VMSDK_EXPECT_OK(
+        testing_infra::AddVectorRecord(**index, IndexToKey(i), encoded));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**flat, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+    if (i + 2 == kThreshold) {
+      EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(**index));
+      EXPECT_EQ(stats.svs_conversions_cnt, done_before);
+    } else if (i + 1 == kThreshold) {
+      EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
+      EXPECT_EQ(stats.svs_conversions_cnt, done_before + 1);
+    }
+  }
+  EXPECT_EQ(stats.svs_conversions_cnt, done_before + 1);
+  EXPECT_EQ(stats.svs_conversion_failures_cnt, failed_before);
+  ASSERT_EQ(AsBase(*index)->GetLabelCount(), kNumVectors);
+
+  // Lossy storage reorders close neighbors, so compare key sets, not scores.
+  size_t agreed = 0;
+  const auto queries = RandomVectors(kNumVectors + 16, kDimensions);
+  for (size_t q = kNumVectors; q < queries.size(); ++q) {
+    auto result =
+        (*index)->Search(EncodeAs<T>(queries[q]), kTopK, CancelNever());
+    ASSERT_TRUE(result.ok()) << result.status();
+    auto expected =
+        (*flat)->Search(VectorToStr(queries[q]), kTopK, CancelNever());
+    ASSERT_TRUE(expected.ok()) << expected.status();
+    ASSERT_EQ(result->size(), kTopK);
+    for (const auto &neighbor : *result) {
+      agreed += absl::c_count_if(*expected, [&](const auto &e) {
+        return e.external_id == neighbor.external_id;
+      });
+    }
+  }
+  EXPECT_GE(agreed, 0.7 * kTopK * (queries.size() - kNumVectors));
+
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*index)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto loaded = VectorSVS<T>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_3",
+      SupplementalContentChunkIter(&rdb), 0);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  VMSDK_EXPECT_OK(
+      (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                 SupplementalContentChunkIter(&rdb)));
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**loaded));
+  EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kNumVectors);
+  EXPECT_EQ(stats.svs_conversions_cnt, done_before + 1);
+  for (size_t q = kNumVectors; q < queries.size(); ++q) {
+    const auto query = EncodeAs<T>(queries[q]);
+    auto before = (*index)->Search(query, kTopK, CancelNever());
+    ASSERT_TRUE(before.ok()) << before.status();
+    auto after = (*loaded)->Search(query, kTopK, CancelNever());
+    ASSERT_TRUE(after.ok()) << after.status();
+    ASSERT_EQ(after->size(), before->size());
+    for (size_t r = 0; r < after->size(); ++r) {
+      EXPECT_EQ((*after)[r].external_id, (*before)[r].external_id)
+          << "query " << q << " rank " << r;
+      EXPECT_FLOAT_EQ((*after)[r].distance, (*before)[r].distance)
+          << "query " << q << " rank " << r;
+    }
+  }
+}
+
+// An index saved before its conversion loads uncompressed and converts once it
+// reaches the threshold.
+template <typename T>
+void VectorSVSLvqLeanVecTest::PendingIndexRoundTrip() {
+  constexpr size_t kStaged = kThreshold / 2;
+  auto &stats = Metrics::GetStats();
+  const auto proto = Proto();
+  auto index =
+      VectorSVS<T>::Create(proto, attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok()) << index.status();
+  auto vectors = RandomVectors(kThreshold, kDimensions);
+  std::vector<ValkeyModuleString *> records(kStaged);
+  absl::Cleanup free_records = [&records]() {
+    for (auto *record : records) ValkeyModule_FreeString(nullptr, record);
+  };
+  for (size_t i = 0; i < kStaged; ++i) {
+    const auto encoded = EncodeAs<T>(vectors[i]);
+    records[i] =
+        ValkeyModule_CreateString(nullptr, encoded.data(), encoded.size());
+    VMSDK_EXPECT_OK(
+        testing_infra::AddVectorRecord(**index, IndexToKey(i), encoded));
+  }
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*index)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto loaded = VectorSVS<T>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  VMSDK_EXPECT_OK(
+      (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                 SupplementalContentChunkIter(&rdb)));
+  EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(**loaded));
+  EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kStaged);
+
+  const uint64_t done_before = stats.svs_conversions_cnt;
+  const uint64_t failed_before = stats.svs_conversion_failures_cnt;
+  for (size_t i = kStaged; i < kThreshold; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**loaded, IndexToKey(i),
+                                                   EncodeAs<T>(vectors[i])));
+  }
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**loaded));
+  EXPECT_EQ(stats.svs_conversions_cnt, done_before + 1);
+  EXPECT_EQ(stats.svs_conversion_failures_cnt, failed_before);
+  auto result =
+      (*loaded)->Search(EncodeAs<T>(vectors[0]), kTopK, CancelNever());
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(result->size(), kTopK);
+}
+
+TEST_P(VectorSVSLvqLeanVecTest, ConvertsAtThresholdAndRoundTrips) {
+  if (Float16()) {
+    ConvertsAtThresholdAndRoundTrips<float16>();
+  } else {
+    ConvertsAtThresholdAndRoundTrips<float>();
+  }
+}
+
+TEST_P(VectorSVSLvqLeanVecTest, PendingIndexRoundTrip) {
+  if (Float16()) {
+    PendingIndexRoundTrip<float16>();
+  } else {
+    PendingIndexRoundTrip<float>();
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Kinds, VectorSVSLvqLeanVecTest,
+    testing::Combine(testing::Values(data_model::SVS_COMPRESSION_LVQ4,
+                                     data_model::SVS_COMPRESSION_LVQ8,
+                                     data_model::SVS_COMPRESSION_LVQ4X4,
+                                     data_model::SVS_COMPRESSION_LVQ4X8,
+                                     data_model::SVS_COMPRESSION_LEANVEC4X4,
+                                     data_model::SVS_COMPRESSION_LEANVEC4X8,
+                                     data_model::SVS_COMPRESSION_LEANVEC8X8),
+                     testing::Values(data_model::DISTANCE_METRIC_L2,
+                                     data_model::DISTANCE_METRIC_COSINE),
+                     testing::Values(data_model::VECTOR_DATA_TYPE_FLOAT32,
+                                     data_model::VECTOR_DATA_TYPE_FLOAT16)),
+    [](const testing::TestParamInfo<LvqLeanVecParam> &info) {
+      return absl::StrCat(
+          absl::StripPrefix(
+              data_model::SVSCompressionType_Name(std::get<0>(info.param)),
+              "SVS_COMPRESSION_"),
+          "_", data_model::DistanceMetric_Name(std::get<1>(info.param)), "_",
+          absl::StripPrefix(
+              data_model::VectorDataType_Name(std::get<2>(info.param)),
+              "VECTOR_DATA_TYPE_"));
     });
 
 // SQ8 fixes one scale and bias for every component from the min and max of

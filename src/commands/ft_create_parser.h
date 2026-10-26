@@ -142,7 +142,7 @@ struct SVSVamanaParameters : public FTCreateVectorParameters {
   data_model::SVSCompressionType compression{data_model::SVS_COMPRESSION_NONE};
   // Unset: SQ8 uses kDefaultSVSTrainingThreshold.
   std::optional<uint32_t> training_threshold;
-  // LeanVec only; 0 selects the SVS default.
+  // LeanVec only; required (> 0) for LEANVEC, 0 for the other compressions.
   uint32_t reduce{0};
   absl::Status Verify() const;
   std::unique_ptr<data_model::VectorIndex> ToProto() const;
