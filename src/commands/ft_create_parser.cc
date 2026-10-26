@@ -1067,18 +1067,18 @@ absl::Status SVSVamanaParameters::Verify() const {
     return absl::InvalidArgumentError(absl::StrCat(
         kReduceParam, " requires a LEANVEC ", kCompressionParam, "."));
   }
+  // SVS has no default LeanVec dimension count.
+  if (is_leanvec && reduce == 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        kReduceParam, " is required for a LEANVEC ", kCompressionParam,
+        " and must be greater than 0 and less than DIM."));
+  }
   if (reduce != 0 && reduce >= static_cast<uint32_t>(*dimensions)) {
     return absl::InvalidArgumentError(absl::StrCat(kReduceParam, " (", reduce,
                                                    ") must be less than DIM (",
                                                    *dimensions, ")."));
   }
   VMSDK_RETURN_IF_ERROR(indexes::CheckSvsCompressionAvailable(compression));
-  // Fenced until the storage stubs in vector_svs.cc are implemented.
-  if (is_leanvec || indexes::IsSvsLvqCompression(compression)) {
-    return absl::UnimplementedError(
-        "LVQ and LEANVEC compression are not implemented yet for "
-        "SVS_VAMANA.");
-  }
   return absl::OkStatus();
 }
 
