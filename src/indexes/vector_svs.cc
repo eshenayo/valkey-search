@@ -338,34 +338,49 @@ using StoragePtr =
 
 // Maps the compression proto value to an SVS storage configuration.
 absl::StatusOr<StoragePtr> MakeSvsStorage(const SVSBuildConfig& config) {
-  switch (config.compression) {
-    // TODO(LVQ): svs_storage_create_lvq(primary, residual); LVQ<P>X<R> maps
-    // P/R bits to SVS_DATA_TYPE_UINT4/UINT8, and LVQ4/LVQ8 use residual VOID.
-    case data_model::SVS_COMPRESSION_LVQ4:
-    case data_model::SVS_COMPRESSION_LVQ8:
-    case data_model::SVS_COMPRESSION_LVQ4X4:
-    case data_model::SVS_COMPRESSION_LVQ4X8:
-      return absl::UnimplementedError(
-          "SVS_VAMANA: LVQ storage is not implemented yet");
-    // TODO(LeanVec): svs_storage_create_leanvec(config.leanvec_dims, primary,
-    // secondary).
-    case data_model::SVS_COMPRESSION_LEANVEC4X4:
-    case data_model::SVS_COMPRESSION_LEANVEC4X8:
-    case data_model::SVS_COMPRESSION_LEANVEC8X8:
-      return absl::UnimplementedError(
-          "SVS_VAMANA: LeanVec storage is not implemented yet");
-    default:
-      break;
-  }
-  auto storage_type =
-      CompressionToSvsDataType(config.compression, config.input_type);
-  if (!storage_type.has_value()) {
-    return absl::InvalidArgumentError("SVS_VAMANA: unknown COMPRESSION");
-  }
+  // LVQ<P>X<R> and LEANVEC<P>X<S> name the primary and second-level bit
+  // widths; LVQ4 and LVQ8 have no residual.
+  constexpr svs_data_type_t kU4 = SVS_DATA_TYPE_UINT4;
+  constexpr svs_data_type_t kU8 = SVS_DATA_TYPE_UINT8;
+  constexpr svs_data_type_t kNone = SVS_DATA_TYPE_VOID;
   ScopedSvsError err;
-  StoragePtr storage(config.compression == data_model::SVS_COMPRESSION_SQ8
-                         ? svs_storage_create_sq(*storage_type, err.get())
-                         : svs_storage_create_simple(*storage_type, err.get()));
+  StoragePtr storage;
+  switch (config.compression) {
+    case data_model::SVS_COMPRESSION_LVQ4:
+      storage.reset(svs_storage_create_lvq(kU4, kNone, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_LVQ8:
+      storage.reset(svs_storage_create_lvq(kU8, kNone, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_LVQ4X4:
+      storage.reset(svs_storage_create_lvq(kU4, kU4, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_LVQ4X8:
+      storage.reset(svs_storage_create_lvq(kU4, kU8, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_LEANVEC4X4:
+      storage.reset(
+          svs_storage_create_leanvec(config.leanvec_dims, kU4, kU4, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_LEANVEC4X8:
+      storage.reset(
+          svs_storage_create_leanvec(config.leanvec_dims, kU4, kU8, err.get()));
+      break;
+    case data_model::SVS_COMPRESSION_LEANVEC8X8:
+      storage.reset(
+          svs_storage_create_leanvec(config.leanvec_dims, kU8, kU8, err.get()));
+      break;
+    default: {
+      auto storage_type =
+          CompressionToSvsDataType(config.compression, config.input_type);
+      if (!storage_type.has_value()) {
+        return absl::InvalidArgumentError("SVS_VAMANA: unknown COMPRESSION");
+      }
+      storage.reset(config.compression == data_model::SVS_COMPRESSION_SQ8
+                        ? svs_storage_create_sq(*storage_type, err.get())
+                        : svs_storage_create_simple(*storage_type, err.get()));
+    }
+  }
   if (!storage) return SvsErrorToStatus(err.get(), "storage_create");
   return storage;
 }
