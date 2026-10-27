@@ -158,6 +158,8 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
         assert info["algorithm"]["compression_pending"] == 0
         assert info["algorithm"]["compression"] == \
             f"SVS_COMPRESSION_{compression}"
+        assert info["algorithm"].get("leanvec_dims") == \
+            (DIM // 4 if compression.startswith("LEANVEC") else None)
         for q, (query, result) in enumerate(zip(queries, saved)):
             after = _knn(client, "svs", query)
             assert list(after) == list(result), f"query {q} keys"

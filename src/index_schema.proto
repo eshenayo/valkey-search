@@ -173,8 +173,8 @@ message SVSVamanaAlgorithm {
   uint32 training_threshold = 7;
   reserved 9;
   reserved "distance_match_epsilon_per_dim";
-  // Required when compression is one of the LEANVEC* variants. Number of
-  // dimensions the LeanVec projection reduces to; must be < dim.
+  // LEANVEC* only: number of dimensions the LeanVec projection reduces to,
+  // < dim. FT.CREATE stores the resolved value (REDUCE, or its default).
   uint32 leanvec_dims = 6;
 }
 
