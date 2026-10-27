@@ -529,6 +529,13 @@ const HeaderGateCase kHeaderGateCases[] = {
            data_model::SVS_COMPRESSION_FP16);
      },
      "build_config does not match the index definition"},
+    {"LeanVecDims",
+     [](data_model::SVSIndexHeader &h) {
+       // The payload's reduced dimension count is fixed when it is built.
+       h.mutable_build_config()->set_leanvec_dims(
+           h.build_config().leanvec_dims() + 1);
+     },
+     "build_config does not match the index definition"},
     {"Dimensionality",
      [](data_model::SVSIndexHeader &h) {
        h.set_dimensionality(h.dimensionality() + 1);

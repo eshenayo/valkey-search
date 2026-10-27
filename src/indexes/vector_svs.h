@@ -70,7 +70,7 @@ struct SVSBuildConfig {
   // uncompressed until it holds this many vectors, then converts. 0 compresses
   // from the first add.
   uint32_t training_threshold{0};
-  // LeanVec only; required (> 0) for LEANVEC, 0 for the other compressions.
+  // LeanVec only: the reduced dimension count, resolved at FT.CREATE.
   uint32_t leanvec_dims{0};
 };
 

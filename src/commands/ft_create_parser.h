@@ -131,6 +131,8 @@ constexpr float kDefaultSVSAlphaSentinel = -1.0f;
 constexpr uint32_t kDefaultSVSTrainingThreshold = 1024;
 constexpr uint32_t kMinSVSTrainingThreshold = 64;
 constexpr uint32_t kMaxSVSTrainingThreshold = 1000000;
+// LeanVec reduces to DIM / this when REDUCE is absent or 0, as Redis does.
+constexpr uint32_t kDefaultSVSLeanVecReduceDivisor = 2;
 
 struct SVSVamanaParameters : public FTCreateVectorParameters {
   uint32_t graph_max_degree{kDefaultSVSGraphMaxDegree};
@@ -142,7 +144,8 @@ struct SVSVamanaParameters : public FTCreateVectorParameters {
   data_model::SVSCompressionType compression{data_model::SVS_COMPRESSION_NONE};
   // Unset: SQ8 uses kDefaultSVSTrainingThreshold.
   std::optional<uint32_t> training_threshold;
-  // LeanVec only; required (> 0) for LEANVEC, 0 for the other compressions.
+  // LeanVec only; 0 selects DIM / kDefaultSVSLeanVecReduceDivisor. Must be
+  // less than DIM.
   uint32_t reduce{0};
   absl::Status Verify() const;
   std::unique_ptr<data_model::VectorIndex> ToProto() const;

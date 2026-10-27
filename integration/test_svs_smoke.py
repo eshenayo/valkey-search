@@ -26,6 +26,8 @@ from valkeytestframework.conftest import resource_port_tracker
 
 
 DIM = 4
+# kDefaultSVSLeanVecReduceDivisor in src/commands/ft_create_parser.h.
+LEANVEC_REDUCE_DIVISOR = 2
 
 # Five documents per metric whose scores against METRIC_QUERY are
 # METRIC_EXPECTED (doc number -> 1 - similarity). IP uses unit vectors.
@@ -747,21 +749,44 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         assert algorithm["compression"] == f"SVS_COMPRESSION_{compression}"
         assert algorithm["training_threshold"] == 1024
         assert algorithm["compression_pending"] == 1
+        # Only LeanVec reduces, so only LeanVec reports leanvec_dims.
+        assert algorithm.get("leanvec_dims") == \
+            (1 if compression.startswith("LEANVEC") else None)
 
+    @pytest.mark.parametrize("reduce", [None, "0"])
     @pytest.mark.parametrize("compression",
                              ["LEANVEC4X4", "LEANVEC4X8", "LEANVEC8X8"])
-    def test_leanvec_requires_reduce(self, compression):
-        """LeanVec has no default reduced dimension count."""
+    def test_leanvec_reduce_defaults(self, compression, reduce):
+        """REDUCE absent or 0 defaults to DIM / LEANVEC_REDUCE_DIVISOR, and
+        FT.INFO reports the value in effect."""
+        client: Valkey = self.server.get_new_client()
+        if not int(client.info("SEARCH").get(
+                "search_svs_lvq_leanvec_supported", 0)):
+            pytest.skip("needs the prebuilt SVS C API on an Intel CPU")
+        idx = f"{compression.lower()}_default_reduce_idx"
+        extra = ["REDUCE", reduce] if reduce is not None else []
+        client.execute_command(
+            "FT.CREATE", idx,
+            "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
+            str(8 + len(extra)), "TYPE", "FLOAT32", "DIM", str(DIM),
+            "DISTANCE_METRIC", "L2", "COMPRESSION", compression, *extra,
+        )
+        assert _v_index(client, idx)["algorithm"]["leanvec_dims"] == \
+            DIM // LEANVEC_REDUCE_DIVISOR
+
+    def test_leanvec_rejects_dim_too_small_to_reduce(self):
+        """DIM / LEANVEC_REDUCE_DIVISOR must leave at least one dimension;
+        checked before the LVQ/LeanVec build check, so on every build."""
         client: Valkey = self.server.get_new_client()
         with pytest.raises(Exception) as exc_info:
             client.execute_command(
-                "FT.CREATE", f"{compression.lower()}_no_reduce_idx",
+                "FT.CREATE", "leanvec_dim1_idx",
                 "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
-                "8", "TYPE", "FLOAT32", "DIM", str(DIM),
-                "DISTANCE_METRIC", "L2", "COMPRESSION", compression,
+                "8", "TYPE", "FLOAT32", "DIM", "1",
+                "DISTANCE_METRIC", "L2", "COMPRESSION", "LEANVEC4X8",
             )
-        assert "REDUCE is required for a LEANVEC COMPRESSION" in \
-            str(exc_info.value)
+        assert (f"A LEANVEC COMPRESSION requires DIM >= "
+                f"{LEANVEC_REDUCE_DIVISOR}") in str(exc_info.value)
 
     def test_reduce_requires_leanvec(self):
         """REDUCE only applies to LEANVEC compression."""
