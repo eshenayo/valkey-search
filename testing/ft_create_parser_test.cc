@@ -2847,18 +2847,51 @@ INSTANTIATE_TEST_SUITE_P(
                  "than DIM (4).",
          },
          {
-             .test_name = "svs_leanvec_requires_reduce",
+             .test_name = "svs_leanvec_dim_too_small_to_reduce",
              .success = false,
              .command_str = "idx1 SChema v vector svs_vamana 8 TYPE FLOAT32 "
-                            "DIM 4 DISTANCE_METRIC L2 COMPRESSION LEANVEC4X8",
-             .expected_error_message =
-                 "Invalid field type for field `v`: REDUCE is required for a "
-                 "LEANVEC COMPRESSION and must be greater than 0 and less "
-                 "than DIM.",
+                            "DIM 1 DISTANCE_METRIC L2 COMPRESSION LEANVEC4X8",
+             .expected_error_message = absl::StrCat(
+                 "Invalid field type for field `v`: A LEANVEC COMPRESSION "
+                 "requires DIM >= ",
+                 kDefaultSVSLeanVecReduceDivisor, ": REDUCE defaults to DIM / ",
+                 kDefaultSVSLeanVecReduceDivisor, " and must be less than DIM."),
          }}),
     [](const TestParamInfo<FTCreateParserTestCase> &info) {
       return info.param.test_name;
     });
+
+// FT.CREATE stores the REDUCE in effect: absent or 0 resolves to
+// DIM / kDefaultSVSLeanVecReduceDivisor for LeanVec, so FT.INFO and the RDB
+// header show it. ToProto needs no LVQ/LeanVec-capable build.
+TEST(FTCreateParserSvsTest, LeanVecStoresTheReduceInEffect) {
+  struct Case {
+    data_model::SVSCompressionType compression;
+    int dimensions;
+    uint32_t reduce;
+    uint32_t expected;
+  };
+  for (const auto &c : std::vector<Case>{
+           {data_model::SVS_COMPRESSION_LEANVEC4X8, 128, 0,
+            128 / kDefaultSVSLeanVecReduceDivisor},
+           {data_model::SVS_COMPRESSION_LEANVEC8X8, 7, 0,
+            7 / kDefaultSVSLeanVecReduceDivisor},
+           // The smallest DIM Verify accepts still leaves one dimension.
+           {data_model::SVS_COMPRESSION_LEANVEC4X8,
+            static_cast<int>(kDefaultSVSLeanVecReduceDivisor), 0, 1},
+           {data_model::SVS_COMPRESSION_LEANVEC4X4, 128, 40, 40},
+           {data_model::SVS_COMPRESSION_LVQ8, 128, 0, 0},
+       }) {
+    SVSVamanaParameters params;
+    params.dimensions = c.dimensions;
+    params.compression = c.compression;
+    params.reduce = c.reduce;
+    EXPECT_EQ(params.ToProto()->svs_vamana_algorithm().leanvec_dims(),
+              c.expected)
+        << data_model::SVSCompressionType_Name(c.compression) << " DIM "
+        << c.dimensions << " REDUCE " << c.reduce;
+  }
+}
 
 }  // namespace
 

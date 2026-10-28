@@ -1067,11 +1067,15 @@ absl::Status SVSVamanaParameters::Verify() const {
     return absl::InvalidArgumentError(absl::StrCat(
         kReduceParam, " requires a LEANVEC ", kCompressionParam, "."));
   }
-  // SVS has no default LeanVec dimension count.
-  if (is_leanvec && reduce == 0) {
+  // REDUCE absent or 0 defaults to DIM / kDefaultSVSLeanVecReduceDivisor (see
+  // ToProto), which must leave at least one dimension.
+  if (is_leanvec &&
+      static_cast<uint32_t>(*dimensions) < kDefaultSVSLeanVecReduceDivisor) {
     return absl::InvalidArgumentError(absl::StrCat(
-        kReduceParam, " is required for a LEANVEC ", kCompressionParam,
-        " and must be greater than 0 and less than DIM."));
+        "A LEANVEC ", kCompressionParam,
+        " requires DIM >= ", kDefaultSVSLeanVecReduceDivisor, ": ",
+        kReduceParam, " defaults to DIM / ", kDefaultSVSLeanVecReduceDivisor,
+        " and must be less than DIM."));
   }
   if (reduce != 0 && reduce >= static_cast<uint32_t>(*dimensions)) {
     return absl::InvalidArgumentError(absl::StrCat(kReduceParam, " (", reduce,
@@ -1094,7 +1098,12 @@ std::unique_ptr<data_model::VectorIndex> SVSVamanaParameters::ToProto() const {
     svs_algorithm_proto->set_training_threshold(
         training_threshold.value_or(kDefaultSVSTrainingThreshold));
   }
-  svs_algorithm_proto->set_leanvec_dims(reduce);
+  // The resolved value is stored, so FT.INFO and the RDB header show the
+  // dimension count in effect and a later default doesn't change the index.
+  svs_algorithm_proto->set_leanvec_dims(
+      indexes::IsSvsLeanVecCompression(compression) && reduce == 0
+          ? static_cast<uint32_t>(*dimensions) / kDefaultSVSLeanVecReduceDivisor
+          : reduce);
   vector_index_proto->set_allocated_svs_vamana_algorithm(
       svs_algorithm_proto.release());
   return vector_index_proto;
