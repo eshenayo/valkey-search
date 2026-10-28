@@ -126,6 +126,9 @@ class VectorSVS : public VectorType<T> {
       absl::string_view query, float radius, cancel::Token &cancellation_token,
       std::unique_ptr<hnswlib::BaseFilterFunctor> filter = nullptr) override
       ABSL_NO_THREAD_SAFETY_ANALYSIS;
+  // Consolidates and compacts svs_index_ when deletes left it dirty, so the
+  // BGSAVE fork child does not copy-on-write the whole index on save.
+  void OnForkPrepare() override;
 
  protected:
   absl::Status AddRecordImpl(uint64_t internal_id,
@@ -190,6 +193,9 @@ class VectorSVS : public VectorType<T> {
   // both once enough slots have been deleted, so update-heavy workloads stay
   // bounded.
   void MaybeConsolidate() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
+  // Consolidates svs_index_ and, if it still has live entries, compacts it.
+  // Returns false and logs on any failure.
+  bool ConsolidateAndCompact() ABSL_EXCLUSIVE_LOCKS_REQUIRED(resize_mutex_);
 #endif
 
   // Concurrency: the index is built with SVS_SYNC_KIND_FINE_GRAIN and guards

@@ -1215,12 +1215,17 @@ void VectorSVS<T>::MaybeConsolidate() {
   // searches are already excluded by the mutation phase.
   absl::WriterMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr || !due()) return;
+  ConsolidateAndCompact();
+}
+
+template <typename T>
+bool VectorSVS<T>::ConsolidateAndCompact() {
   ScopedSvsError err;
   if (!svs_index_dynamic_consolidate(svs_index_, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA consolidate failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
-    return;
+    return false;
   }
   // The C API's add_points only fills slots past the last compaction, so the
   // slots consolidate freed are reused only after compacting. SVS can't
@@ -1232,9 +1237,10 @@ void VectorSVS<T>::MaybeConsolidate() {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA compact failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_compact");
-    return;
+    return false;
   }
   deleted_since_consolidate_.store(0, std::memory_order_relaxed);
+  return true;
 }
 
 template <typename T>
@@ -1525,6 +1531,21 @@ template <typename T>
 size_t VectorSVS<T>::GetLabelCount() const {
   absl::ReaderMutexLock lock(&label_mutex_);
   return label_to_record_.size();
+}
+
+template <typename T>
+void VectorSVS<T>::OnForkPrepare() {
+#if defined(__linux__) && defined(__x86_64__)
+  absl::WriterMutexLock lock(&resize_mutex_);
+  if (svs_index_ == nullptr ||
+      deleted_since_consolidate_.load(std::memory_order_relaxed) == 0)
+    return;
+  const absl::Time start = absl::Now();
+  if (!ConsolidateAndCompact()) return;
+  VMSDK_LOG(NOTICE, nullptr)
+      << "SVS_VAMANA pre-fork repair took "
+      << absl::ToInt64Milliseconds(absl::Now() - start) << "ms.";
+#endif
 }
 
 template class VectorSVS<float>;

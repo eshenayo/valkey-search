@@ -86,6 +86,10 @@ class SchemaManager {
   void OnFlushDBEnded(ValkeyModuleCtx *ctx, std::optional<int> dbnum);
   void OnSwapDB(ValkeyModuleSwapDbInfo *swap_db_info);
 
+  // Gives every index a chance to compact before the fork, called from
+  // AtForkPrepare while worker pools are suspended.
+  void OnForkPrepare() ABSL_LOCKS_EXCLUDED(db_to_index_schemas_mutex_);
+
   void OnLoadingEnded(ValkeyModuleCtx *ctx)
       ABSL_LOCKS_EXCLUDED(db_to_index_schemas_mutex_);
   void OnReplicationLoadStart(ValkeyModuleCtx *ctx);
@@ -113,6 +117,9 @@ class SchemaManager {
 
   static void InitInstance(std::unique_ptr<SchemaManager> instance);
   static SchemaManager &Instance();
+  // Startup() starts the worker pools before InitInstance(), so a fork
+  // (e.g. via popen) can land in that window; callers must check this first.
+  static bool HasInstance();
 
   absl::Status LoadIndex(ValkeyModuleCtx *ctx,
                          std::unique_ptr<data_model::RDBSection> section,

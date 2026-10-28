@@ -144,6 +144,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
         ${SVS_C_API_DIR}/src/svs_c.cpp
         ${SVS_C_API_DIR}/src/dispatcher_vamana.cpp
         ${SVS_C_API_DIR}/src/dispatcher_dynamic_vamana.cpp
+        ${SVS_C_API_DIR}/src/dispatcher_concurrent_vamana.cpp
         ${SVS_C_API_DIR}/src/index_builder.cpp
         ${SVS_C_API_DIR}/src/index_vamana.cpp
         ${SVS_C_API_DIR}/src/leanvec_training_data.cpp

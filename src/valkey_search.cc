@@ -1128,6 +1128,15 @@ void ValkeySearch::AtForkPrepare() {
   VMSDK_LOG(WARNING, nullptr) << "At prepare fork callback, suspend gRPC "
                                  "returned message: "
                               << status.message();
+  // The BGSAVE child never repairs the parent's indexes, so compaction must
+  // happen here, where pools are suspended and nothing else can mutate them.
+  if (SchemaManager::HasInstance()) {
+    vmsdk::StopWatch housekeeping_watch;
+    SchemaManager::Instance().OnForkPrepare();
+    VMSDK_LOG(NOTICE, nullptr)
+        << "At prepare fork callback, index housekeeping took "
+        << absl::ToInt64Microseconds(housekeeping_watch.Duration()) << " us";
+  }
 }
 
 void ValkeySearch::AfterForkParent() {

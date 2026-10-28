@@ -2263,9 +2263,9 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param.name;
     });
 
-// A restored index logs through the global default logger: SVS v0.5.0 stream
-// loads ignore the builder's logger (changes once SVS honors it on load).
-TEST_P(VectorSVSL2CosineTest, RestoredIndexLogsAsGlobal) {
+// A restored index keeps its per-index logger: SVS stream loads honor the
+// builder's logger since intel/ScalableVectorSearch#444.
+TEST_P(VectorSVSL2CosineTest, RestoredIndexLogsWithItsTag) {
   VMSDK_EXPECT_OK(vmsdk::InitLogging(nullptr, "debug"));
   absl::Cleanup restore_level = [] {
     VMSDK_EXPECT_OK(vmsdk::InitLogging(nullptr, "notice"));
@@ -2290,7 +2290,7 @@ TEST_P(VectorSVSL2CosineTest, RestoredIndexLogsAsGlobal) {
       SupplementalContentChunkIter(&rdb), 0);
   VMSDK_EXPECT_OK(loaded);
 
-  ExpectSvsLogsTagged("global");
+  ExpectSvsLogsTagged("attribute_identifier_2");
   VMSDK_EXPECT_OK(VectorSVSTestPeer::AddPoint(**loaded, 2, vectors[2].data()));
 }
 
