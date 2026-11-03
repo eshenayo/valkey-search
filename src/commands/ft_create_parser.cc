@@ -1014,6 +1014,16 @@ absl::Status SVSVamanaParameters::Verify() const {
           absl::StrCat(kTrainingThresholdParam,
                        " only applies to COMPRESSION SQ8, LVQ and LEANVEC."));
     }
+    // Checked before the range so the message names the minimum that
+    // applies: the LeanVec floor where it exceeds the general one.
+    if (indexes::IsSvsLeanVecCompression(compression) &&
+        *training_threshold < SVSLeanVecMinTrainingThreshold(*dimensions)) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          kTrainingThresholdParam, " (", *training_threshold,
+          ") must be at least ", SVSLeanVecMinTrainingThreshold(*dimensions),
+          " for a LEANVEC ", kCompressionParam, " with DIM ", *dimensions,
+          "."));
+    }
     VMSDK_RETURN_IF_ERROR(vmsdk::VerifyRange(*training_threshold,
                                              kMinSVSTrainingThreshold,
                                              kMaxSVSTrainingThreshold))
@@ -1077,13 +1087,6 @@ absl::Status SVSVamanaParameters::Verify() const {
         " requires DIM >= ", kDefaultSVSLeanVecReduceDivisor, ": ",
         kReduceParam, " defaults to DIM / ", kDefaultSVSLeanVecReduceDivisor,
         " and must be less than DIM."));
-  }
-  if (is_leanvec && training_threshold.has_value() &&
-      *training_threshold < SVSLeanVecMinTrainingThreshold(*dimensions)) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        kTrainingThresholdParam, " (", *training_threshold,
-        ") must be at least ", SVSLeanVecMinTrainingThreshold(*dimensions),
-        " for a LEANVEC ", kCompressionParam, " with DIM ", *dimensions, "."));
   }
   if (reduce != 0 && reduce >= static_cast<uint32_t>(*dimensions)) {
     return absl::InvalidArgumentError(absl::StrCat(kReduceParam, " (", reduce,

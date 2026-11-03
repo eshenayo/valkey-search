@@ -203,10 +203,25 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
         client.execute_command("FT.CREATE", "flat", "PREFIX", "1", "f:",
                                "SCHEMA", "v", "VECTOR", "FLAT",
                                str(len(flat)), *flat)
-        pipe = client.pipeline(transaction=False)
-        for i, v in enumerate(vectors(n, 1)):
-            pipe.hset(f"f:{i}", mapping={"v": v.tobytes()})
-        pipe.execute()
+        docs = vectors(n, 1)
+
+        def insert(start, stop):
+            pipe = client.pipeline(transaction=False)
+            for i in range(start, stop):
+                pipe.hset(f"f:{i}", mapping={"v": docs[i].tobytes()})
+            pipe.execute()
+
+        # An index converts with every vector it holds by then, and writers
+        # keep adding while a conversion waits for its lock. Insert exactly
+        # the floor first, so the floor indexes train on that many.
+        insert(0, floor)
+        for kind, t in indexes:
+            waiters.wait_for_equal(
+                lambda: (_v_index(client, f"{kind.lower()}_{t}")["size"],
+                         _v_index(client, f"{kind.lower()}_{t}")["algorithm"]
+                         ["compression_pending"]),
+                (floor, 0 if t == floor else 1), timeout=120)
+        insert(floor, n)
         for kind, t in indexes:
             waiters.wait_for_equal(
                 lambda: (_v_index(client, f"{kind.lower()}_{t}")["size"],
