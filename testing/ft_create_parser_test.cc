@@ -10,15 +10,18 @@
 #include <algorithm>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "src/index_schema.pb.h"
 #include "src/indexes/index_base.h"
+#include "src/indexes/svs_capabilities.h"
 #include "src/indexes/text/languages/french.h"
 #include "src/indexes/text/languages/german.h"
 #include "vmsdk/src/testing_infra/module.h"
@@ -2856,40 +2859,140 @@ INSTANTIATE_TEST_SUITE_P(
                  "requires DIM >= ",
                  kDefaultSVSLeanVecReduceDivisor, ": REDUCE defaults to DIM / ",
                  kDefaultSVSLeanVecReduceDivisor, " and must be less than DIM."),
+         },
+         {
+             .test_name = "svs_leanvec_training_threshold_below_floor",
+             .success = false,
+             .command_str = "idx1 SChema v vector svs_vamana 10 TYPE FLOAT32 "
+                            "DIM 128 DISTANCE_METRIC L2 COMPRESSION "
+                            "LEANVEC4X8 TRAINING_THRESHOLD 64",
+             .expected_error_message = absl::StrCat(
+                 "Invalid field type for field `v`: TRAINING_THRESHOLD (64) "
+                 "must be at least ",
+                 SVSLeanVecMinTrainingThreshold(128),
+                 " for a LEANVEC COMPRESSION with DIM 128."),
          }}),
     [](const TestParamInfo<FTCreateParserTestCase> &info) {
       return info.param.test_name;
     });
+
+constexpr data_model::SVSCompressionType kLeanVecKinds[] = {
+    data_model::SVS_COMPRESSION_LEANVEC4X4,
+    data_model::SVS_COMPRESSION_LEANVEC4X8,
+    data_model::SVS_COMPRESSION_LEANVEC8X8,
+};
 
 // FT.CREATE stores the REDUCE in effect: absent or 0 resolves to
 // DIM / kDefaultSVSLeanVecReduceDivisor for LeanVec, so FT.INFO and the RDB
 // header show it. ToProto needs no LVQ/LeanVec-capable build.
 TEST(FTCreateParserSvsTest, LeanVecStoresTheReduceInEffect) {
   struct Case {
-    data_model::SVSCompressionType compression;
     int dimensions;
     uint32_t reduce;
     uint32_t expected;
   };
-  for (const auto &c : std::vector<Case>{
-           {data_model::SVS_COMPRESSION_LEANVEC4X8, 128, 0,
-            128 / kDefaultSVSLeanVecReduceDivisor},
-           {data_model::SVS_COMPRESSION_LEANVEC8X8, 7, 0,
-            7 / kDefaultSVSLeanVecReduceDivisor},
-           // The smallest DIM Verify accepts still leaves one dimension.
-           {data_model::SVS_COMPRESSION_LEANVEC4X8,
-            static_cast<int>(kDefaultSVSLeanVecReduceDivisor), 0, 1},
-           {data_model::SVS_COMPRESSION_LEANVEC4X4, 128, 40, 40},
-           {data_model::SVS_COMPRESSION_LVQ8, 128, 0, 0},
-       }) {
+  for (const auto compression : kLeanVecKinds) {
+    for (const auto &c : std::vector<Case>{
+             {128, 0, 128 / kDefaultSVSLeanVecReduceDivisor},
+             {7, 0, 7 / kDefaultSVSLeanVecReduceDivisor},
+             // The smallest DIM Verify accepts still leaves one dimension.
+             {static_cast<int>(kDefaultSVSLeanVecReduceDivisor), 0, 1},
+             {128, 40, 40},
+         }) {
+      SVSVamanaParameters params;
+      params.dimensions = c.dimensions;
+      params.compression = compression;
+      params.reduce = c.reduce;
+      EXPECT_EQ(params.ToProto()->svs_vamana_algorithm().leanvec_dims(),
+                c.expected)
+          << data_model::SVSCompressionType_Name(compression) << " DIM "
+          << c.dimensions << " REDUCE " << c.reduce;
+    }
+  }
+  SVSVamanaParameters lvq;
+  lvq.dimensions = 128;
+  lvq.compression = data_model::SVS_COMPRESSION_LVQ8;
+  EXPECT_EQ(lvq.ToProto()->svs_vamana_algorithm().leanvec_dims(), 0u);
+}
+
+// The LeanVec checks in Verify run before the LVQ/LeanVec build check, so they
+// hold on every build. Past them, a build without LVQ/LeanVec fails the build
+// check instead.
+TEST(FTCreateParserSvsTest, LeanVecChecksRunOnEveryBuild) {
+  auto verify = [](data_model::SVSCompressionType compression, int dimensions,
+                   std::optional<uint32_t> training_threshold,
+                   uint32_t reduce = 0) {
     SVSVamanaParameters params;
-    params.dimensions = c.dimensions;
-    params.compression = c.compression;
-    params.reduce = c.reduce;
-    EXPECT_EQ(params.ToProto()->svs_vamana_algorithm().leanvec_dims(),
-              c.expected)
-        << data_model::SVSCompressionType_Name(c.compression) << " DIM "
-        << c.dimensions << " REDUCE " << c.reduce;
+    params.dimensions = dimensions;
+    params.distance_metric = data_model::DISTANCE_METRIC_L2;
+    params.vector_data_type = data_model::VECTOR_DATA_TYPE_FLOAT32;
+    params.compression = compression;
+    params.training_threshold = training_threshold;
+    params.reduce = reduce;
+    return params.Verify();
+  };
+  for (const auto compression : kLeanVecKinds) {
+    const std::string kind = data_model::SVSCompressionType_Name(compression);
+    const uint32_t floor = SVSLeanVecMinTrainingThreshold(128);
+    EXPECT_THAT(verify(compression, 128, floor - 1).message(),
+                testing::HasSubstr(absl::StrCat(
+                    "TRAINING_THRESHOLD (", floor - 1, ") must be at least ",
+                    floor, " for a LEANVEC COMPRESSION with DIM 128.")))
+        << kind;
+    EXPECT_THAT(verify(compression, 1, std::nullopt).message(),
+                testing::HasSubstr("A LEANVEC COMPRESSION requires DIM >= "))
+        << kind;
+    EXPECT_THAT(verify(compression, 128, std::nullopt, 128).message(),
+                testing::HasSubstr("REDUCE (128) must be less than DIM (128)."))
+        << kind;
+    const absl::Status at_floor = verify(compression, 128, floor);
+    if (indexes::SvsLvqLeanVecSupported()) {
+      VMSDK_EXPECT_OK(at_floor) << kind;
+    } else {
+      EXPECT_THAT(at_floor.message(),
+                  testing::HasSubstr("requires an SVS build with LVQ/LeanVec"))
+          << kind;
+    }
+  }
+}
+
+// Without TRAINING_THRESHOLD, LeanVec's default is raised to its floor, so
+// FT.CREATE keeps working for any DIM; the other trained kinds keep the plain
+// default. ToProto needs no LVQ/LeanVec-capable build.
+TEST(FTCreateParserSvsTest, LeanVecDefaultThresholdCoversTheFloor) {
+  struct Case {
+    int dimensions;
+    std::optional<uint32_t> training_threshold;
+    uint32_t expected;
+  };
+  for (const auto compression : kLeanVecKinds) {
+    for (const auto &c : std::vector<Case>{
+             {2048, std::nullopt,
+              std::max(kDefaultSVSTrainingThreshold,
+                       SVSLeanVecMinTrainingThreshold(2048))},
+             {128, std::nullopt,
+              std::max(kDefaultSVSTrainingThreshold,
+                       SVSLeanVecMinTrainingThreshold(128))},
+             {2048, 4096, 4096},
+         }) {
+      SVSVamanaParameters params;
+      params.dimensions = c.dimensions;
+      params.compression = compression;
+      params.training_threshold = c.training_threshold;
+      EXPECT_EQ(params.ToProto()->svs_vamana_algorithm().training_threshold(),
+                c.expected)
+          << data_model::SVSCompressionType_Name(compression) << " DIM "
+          << c.dimensions;
+    }
+  }
+  for (const auto compression :
+       {data_model::SVS_COMPRESSION_LVQ8, data_model::SVS_COMPRESSION_SQ8}) {
+    SVSVamanaParameters params;
+    params.dimensions = 2048;
+    params.compression = compression;
+    EXPECT_EQ(params.ToProto()->svs_vamana_algorithm().training_threshold(),
+              kDefaultSVSTrainingThreshold)
+        << data_model::SVSCompressionType_Name(compression);
   }
 }
 

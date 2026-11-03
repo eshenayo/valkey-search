@@ -15,6 +15,7 @@ from valkey.client import Valkey
 from valkeytestframework.util import waiters
 
 from ft_info_parser import FTInfoParser
+from test_svs_smoke import leanvec_min_training_threshold
 from valkey_search_test_case import ValkeySearchTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
 
@@ -165,3 +166,66 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
             assert list(after) == list(result), f"query {q} keys"
             assert list(after.values()) == pytest.approx(
                 list(result.values()), abs=1e-6), f"query {q} scores"
+
+    @pytest.mark.parametrize("metric", ["L2", "COSINE"])
+    def test_leanvec_at_training_floor_matches_full_training(self, metric):
+        """LeanVec trained at its TRAINING_THRESHOLD floor is within 0.05
+        recall@10 of one trained on all 10k vectors (10k x 128-d, variance
+        spread over every dimension). Window 100, so the comparison measures
+        the learned projection rather than the search window."""
+        client: Valkey = self.server.get_new_client()
+        if not int(client.info("SEARCH").get(
+                "search_svs_lvq_leanvec_supported", 0)):
+            pytest.skip("needs the prebuilt SVS C API on an Intel CPU")
+        n, dim, window = 10_000, 128, 100
+        floor = leanvec_min_training_threshold(dim)
+        rot, _ = np.linalg.qr(
+            np.random.default_rng(0).standard_normal((dim, dim)))
+        scale = np.arange(1, dim + 1) ** -0.5
+
+        def vectors(count, seed):
+            rng = np.random.default_rng(seed)
+            return ((rng.standard_normal((count, dim)) * scale) @ rot).astype(
+                np.float32)
+
+        indexes = [(kind, t) for kind in KINDS if kind.startswith("LEANVEC")
+                   for t in (floor, n)]
+        for kind, t in indexes:
+            params = ["TYPE", "FLOAT32", "DIM", str(dim),
+                      "DISTANCE_METRIC", metric, "COMPRESSION", kind,
+                      "TRAINING_THRESHOLD", str(t),
+                      "SEARCH_WINDOW_SIZE", str(window)]
+            client.execute_command(
+                "FT.CREATE", f"{kind.lower()}_{t}", "PREFIX", "1", "f:",
+                "SCHEMA", "v", "VECTOR", "SVS_VAMANA", str(len(params)),
+                *params)
+        flat = ["TYPE", "FLOAT32", "DIM", str(dim), "DISTANCE_METRIC", metric]
+        client.execute_command("FT.CREATE", "flat", "PREFIX", "1", "f:",
+                               "SCHEMA", "v", "VECTOR", "FLAT",
+                               str(len(flat)), *flat)
+        pipe = client.pipeline(transaction=False)
+        for i, v in enumerate(vectors(n, 1)):
+            pipe.hset(f"f:{i}", mapping={"v": v.tobytes()})
+        pipe.execute()
+        for kind, t in indexes:
+            waiters.wait_for_equal(
+                lambda: (_v_index(client, f"{kind.lower()}_{t}")["size"],
+                         _v_index(client, f"{kind.lower()}_{t}")["algorithm"]
+                         ["compression_pending"]),
+                (n, 0), timeout=120)
+        waiters.wait_for_equal(lambda: _v_index(client, "flat")["size"], n,
+                               timeout=120)
+
+        queries = vectors(200, 2)
+        truth = [_knn(client, "flat", q).keys() for q in queries]
+
+        def recall(index):
+            return np.mean([len(_knn(client, index, q).keys() & e) / K
+                            for q, e in zip(queries, truth)])
+
+        for kind in sorted({kind for kind, _ in indexes}):
+            at_floor = recall(f"{kind.lower()}_{floor}")
+            full = recall(f"{kind.lower()}_{n}")
+            assert at_floor >= full - 0.05, (
+                f"{kind} {metric}: recall@{K} {at_floor:.3f} at the floor "
+                f"({floor}) vs {full:.3f} trained on {n}")

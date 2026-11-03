@@ -8,6 +8,7 @@
 
 #include <sys/types.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -1077,6 +1078,13 @@ absl::Status SVSVamanaParameters::Verify() const {
         kReduceParam, " defaults to DIM / ", kDefaultSVSLeanVecReduceDivisor,
         " and must be less than DIM."));
   }
+  if (is_leanvec && training_threshold.has_value() &&
+      *training_threshold < SVSLeanVecMinTrainingThreshold(*dimensions)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        kTrainingThresholdParam, " (", *training_threshold,
+        ") must be at least ", SVSLeanVecMinTrainingThreshold(*dimensions),
+        " for a LEANVEC ", kCompressionParam, " with DIM ", *dimensions, "."));
+  }
   if (reduce != 0 && reduce >= static_cast<uint32_t>(*dimensions)) {
     return absl::InvalidArgumentError(absl::StrCat(kReduceParam, " (", reduce,
                                                    ") must be less than DIM (",
@@ -1095,8 +1103,13 @@ std::unique_ptr<data_model::VectorIndex> SVSVamanaParameters::ToProto() const {
   svs_algorithm_proto->set_alpha(alpha);
   svs_algorithm_proto->set_compression(compression);
   if (indexes::SvsCompressionUsesTrainingThreshold(compression)) {
+    uint32_t default_threshold = kDefaultSVSTrainingThreshold;
+    if (indexes::IsSvsLeanVecCompression(compression)) {
+      default_threshold = std::max(default_threshold,
+                                   SVSLeanVecMinTrainingThreshold(*dimensions));
+    }
     svs_algorithm_proto->set_training_threshold(
-        training_threshold.value_or(kDefaultSVSTrainingThreshold));
+        training_threshold.value_or(default_threshold));
   }
   // The resolved value is stored, so FT.INFO and the RDB header show the
   // dimension count in effect and a later default doesn't change the index.

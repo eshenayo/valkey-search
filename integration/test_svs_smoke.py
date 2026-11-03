@@ -29,6 +29,11 @@ DIM = 4
 # kDefaultSVSLeanVecReduceDivisor in src/commands/ft_create_parser.h.
 LEANVEC_REDUCE_DIVISOR = 2
 
+
+def leanvec_min_training_threshold(dim):
+    """SVSLeanVecMinTrainingThreshold in src/commands/ft_create_parser.h."""
+    return dim
+
 # Five documents per metric whose scores against METRIC_QUERY are
 # METRIC_EXPECTED (doc number -> 1 - similarity). IP uses unit vectors.
 # COSINE scales them, so a missing normalization shows up as a wrong score,
@@ -774,16 +779,61 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         assert _v_index(client, idx)["algorithm"]["leanvec_dims"] == \
             DIM // LEANVEC_REDUCE_DIVISOR
 
-    def test_leanvec_rejects_dim_too_small_to_reduce(self):
+    @pytest.mark.parametrize("compression",
+                             ["LEANVEC4X4", "LEANVEC4X8", "LEANVEC8X8"])
+    def test_leanvec_training_threshold_below_floor_rejected(self,
+                                                             compression):
+        """A LeanVec TRAINING_THRESHOLD below its floor is rejected with the
+        floor in the message; checked before the LVQ/LeanVec build check,
+        so on every build."""
+        client: Valkey = self.server.get_new_client()
+        dim = 128
+        floor = leanvec_min_training_threshold(dim)
+        with pytest.raises(Exception) as exc_info:
+            client.execute_command(
+                "FT.CREATE", f"{compression.lower()}_floor_idx",
+                "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
+                "10", "TYPE", "FLOAT32", "DIM", str(dim),
+                "DISTANCE_METRIC", "L2", "COMPRESSION", compression,
+                "TRAINING_THRESHOLD", str(floor - 1),
+            )
+        assert (f"TRAINING_THRESHOLD ({floor - 1}) must be at least {floor}"
+                f" for a LEANVEC COMPRESSION with DIM {dim}") in \
+            str(exc_info.value)
+
+    @pytest.mark.parametrize("compression",
+                             ["LEANVEC4X4", "LEANVEC4X8", "LEANVEC8X8"])
+    def test_leanvec_default_training_threshold_covers_floor(self,
+                                                             compression):
+        """Without TRAINING_THRESHOLD, a LeanVec index whose floor is above
+        the default trains at the floor, and FT.INFO shows it."""
+        client: Valkey = self.server.get_new_client()
+        if not int(client.info("SEARCH").get(
+                "search_svs_lvq_leanvec_supported", 0)):
+            pytest.skip("needs the prebuilt SVS C API on an Intel CPU")
+        dim = 2048
+        idx = f"{compression.lower()}_wide_idx"
+        client.execute_command(
+            "FT.CREATE", idx,
+            "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
+            "8", "TYPE", "FLOAT32", "DIM", str(dim),
+            "DISTANCE_METRIC", "L2", "COMPRESSION", compression,
+        )
+        assert _v_index(client, idx)["algorithm"]["training_threshold"] == \
+            max(1024, leanvec_min_training_threshold(dim))
+
+    @pytest.mark.parametrize("compression",
+                             ["LEANVEC4X4", "LEANVEC4X8", "LEANVEC8X8"])
+    def test_leanvec_rejects_dim_too_small_to_reduce(self, compression):
         """DIM / LEANVEC_REDUCE_DIVISOR must leave at least one dimension;
         checked before the LVQ/LeanVec build check, so on every build."""
         client: Valkey = self.server.get_new_client()
         with pytest.raises(Exception) as exc_info:
             client.execute_command(
-                "FT.CREATE", "leanvec_dim1_idx",
+                "FT.CREATE", f"{compression.lower()}_dim1_idx",
                 "SCHEMA", "v", "VECTOR", "SVS_VAMANA",
                 "8", "TYPE", "FLOAT32", "DIM", "1",
-                "DISTANCE_METRIC", "L2", "COMPRESSION", "LEANVEC4X8",
+                "DISTANCE_METRIC", "L2", "COMPRESSION", compression,
             )
         assert (f"A LEANVEC COMPRESSION requires DIM >= "
                 f"{LEANVEC_REDUCE_DIVISOR}") in str(exc_info.value)
