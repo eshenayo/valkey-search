@@ -133,6 +133,13 @@ constexpr uint32_t kMinSVSTrainingThreshold = 64;
 constexpr uint32_t kMaxSVSTrainingThreshold = 1000000;
 // LeanVec reduces to DIM / this when REDUCE is absent or 0, as Redis does.
 constexpr uint32_t kDefaultSVSLeanVecReduceDivisor = 2;
+// LeanVec learns its projection from the vectors it holds at the training
+// threshold. Far fewer than DIM leave the DIM-dimensional covariance it is
+// learned from rank-deficient; from DIM up, measured recall matched training
+// on every vector. Also the floor of its default threshold.
+inline uint32_t SVSLeanVecMinTrainingThreshold(int dimensions) {
+  return static_cast<uint32_t>(dimensions);
+}
 
 struct SVSVamanaParameters : public FTCreateVectorParameters {
   uint32_t graph_max_degree{kDefaultSVSGraphMaxDegree};
@@ -142,7 +149,8 @@ struct SVSVamanaParameters : public FTCreateVectorParameters {
   // 0.95 for IP/COSINE) when the user does not pass ALPHA.
   float alpha{kDefaultSVSAlphaSentinel};
   data_model::SVSCompressionType compression{data_model::SVS_COMPRESSION_NONE};
-  // Unset: SQ8 uses kDefaultSVSTrainingThreshold.
+  // Unset: kDefaultSVSTrainingThreshold, raised for LeanVec to
+  // SVSLeanVecMinTrainingThreshold(DIM).
   std::optional<uint32_t> training_threshold;
   // LeanVec only; 0 selects DIM / kDefaultSVSLeanVecReduceDivisor. Must be
   // less than DIM.
