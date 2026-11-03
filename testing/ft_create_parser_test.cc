@@ -2951,6 +2951,14 @@ TEST(FTCreateParserSvsTest, LeanVecChecksRunOnEveryBuild) {
         testing::HasSubstr(absl::StrCat("must be an integer of at least ",
                                         kMinSVSTrainingThreshold)))
         << kind;
+    // Below a floor that is itself under the general minimum, the general
+    // minimum is the one to report.
+    EXPECT_THAT(
+        verify(compression, 32, SVSLeanVecMinTrainingThreshold(32) - 1)
+            .message(),
+        testing::HasSubstr(absl::StrCat("must be an integer of at least ",
+                                        kMinSVSTrainingThreshold)))
+        << kind;
     EXPECT_THAT(verify(compression, 1, std::nullopt).message(),
                 testing::HasSubstr("A LEANVEC COMPRESSION requires DIM >= "))
         << kind;

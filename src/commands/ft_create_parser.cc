@@ -1017,6 +1017,8 @@ absl::Status SVSVamanaParameters::Verify() const {
     // Checked before the range so the message names the minimum that
     // applies: the LeanVec floor where it exceeds the general one.
     if (indexes::IsSvsLeanVecCompression(compression) &&
+        SVSLeanVecMinTrainingThreshold(*dimensions) >
+            kMinSVSTrainingThreshold &&
         *training_threshold < SVSLeanVecMinTrainingThreshold(*dimensions)) {
       return absl::InvalidArgumentError(absl::StrCat(
           kTrainingThresholdParam, " (", *training_threshold,
