@@ -1804,6 +1804,149 @@ INSTANTIATE_TEST_SUITE_P(
               "VECTOR_DATA_TYPE_"));
     });
 
+// Without the prebuilt C API, or on a CPU it doesn't support, an RDB with an
+// LVQ/LeanVec index loads it without storage instead of failing the load: the
+// payload is skipped, keys stay tracked, nothing converts, searches fail with
+// what is missing, and its settings, such as leanvec_dims and the training
+// threshold, are saved unchanged for a build that can rebuild it.
+class VectorSVSLvqLeanVecUnsupportedTest
+    : public VectorSVSTest,
+      public testing::WithParamInterface<LvqLeanVecParam> {
+ protected:
+  template <typename T>
+  void LoadsWithoutStorage();
+};
+
+template <typename T>
+void VectorSVSLvqLeanVecUnsupportedTest::LoadsWithoutStorage() {
+  constexpr uint32_t kThreshold = 256;
+  constexpr size_t kKeys = kThreshold + 44;  // past the threshold
+  const auto [compression, metric, data_type] = GetParam();
+  auto proto = CreateSVSVectorIndexProto(kDimensions, metric, compression);
+  proto.set_vector_data_type(data_type);
+  proto.mutable_svs_vamana_algorithm()->set_training_threshold(kThreshold);
+  if (IsSvsLeanVecCompression(compression)) {
+    proto.mutable_svs_vamana_algorithm()->set_leanvec_dims(kDimensions / 2);
+  }
+  // Tracked keys as a build with LVQ/LeanVec saves them; any index of the
+  // same element type writes the same format.
+  auto source = VectorSVS<T>::Create(
+      CreateSVSVectorIndexProto(kDimensions, metric,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(source.ok()) << source.status();
+  auto vectors = RandomVectors(kKeys + 1, kDimensions);
+  std::vector<ValkeyModuleString *> records(kKeys);
+  absl::Cleanup free_records = [&records]() {
+    for (auto *record : records) ValkeyModule_FreeString(nullptr, record);
+  };
+  for (size_t i = 0; i < kKeys; ++i) {
+    const auto encoded = EncodeAs<T>(vectors[i]);
+    records[i] =
+        ValkeyModule_CreateString(nullptr, encoded.data(), encoded.size());
+    VMSDK_EXPECT_OK(
+        testing_infra::AddVectorRecord(**source, IndexToKey(i), encoded));
+  }
+  FakeSafeRDB rdb;
+  {
+    data_model::SVSIndexHeader header;
+    header.set_format_version(1);
+    header.set_svs_version(svs_get_version());
+    header.set_has_index(true);
+    header.set_compression_pending(true);
+    header.set_element_type(data_type);
+    header.set_dimensionality(kDimensions);
+    *header.mutable_build_config() = proto.svs_vamana_algorithm();
+    std::string serialized;
+    ASSERT_TRUE(header.SerializeToString(&serialized));
+    RDBChunkOutputStream out(&rdb);
+    VMSDK_EXPECT_OK(out.SaveString(serialized));
+    VMSDK_EXPECT_OK(out.SaveString("lvq-or-leanvec-payload"));
+    VMSDK_EXPECT_OK(out.SaveString("this-build-cannot-read"));
+    VMSDK_EXPECT_OK(out.Close());
+  }
+  VMSDK_EXPECT_OK((*source)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+
+  const int64_t before = Metrics::GetStats().svs_unavailable_indexes;
+  ExpectHashGetsForRecords(records);
+  auto loaded = VectorSVS<T>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  VMSDK_EXPECT_OK(
+      (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                 SupplementalContentChunkIter(&rdb)));
+  EXPECT_EQ(Metrics::GetStats().svs_unavailable_indexes, before + 1);
+  EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kKeys);
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**loaded));
+  auto search = (*loaded)->Search(EncodeAs<T>(vectors[0]), 1, CancelNever());
+  EXPECT_EQ(search.status().code(), absl::StatusCode::kUnimplemented);
+  EXPECT_THAT(search.status().message(),
+              testing::HasSubstr("requires an SVS build with LVQ/LeanVec"));
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**loaded, IndexToKey(kKeys),
+                                                 EncodeAs<T>(vectors[kKeys])));
+  EXPECT_TRUE((*loaded)->IsTracked(IndexToKey(kKeys)));
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**loaded));
+  EXPECT_EQ(AsBase(*loaded)
+                ->ToProto()
+                ->vector_index()
+                .svs_vamana_algorithm()
+                .SerializeAsString(),
+            proto.svs_vamana_algorithm().SerializeAsString());
+
+  FakeSafeRDB resaved;
+  VMSDK_EXPECT_OK((*loaded)->SaveIndex(RDBChunkOutputStream(&resaved)));
+  SupplementalContentChunkIter in(&resaved);
+  ASSERT_TRUE(in.HasNext());
+  auto chunk = in.Next();
+  ASSERT_TRUE(chunk.ok());
+  data_model::SVSIndexHeader header;
+  ASSERT_TRUE(header.ParseFromString((*chunk)->binary_content()));
+  EXPECT_EQ(header.svs_version(), 0u);
+  EXPECT_TRUE(header.has_index());
+  EXPECT_FALSE(header.compression_pending());
+  EXPECT_EQ(header.build_config().SerializeAsString(),
+            proto.svs_vamana_algorithm().SerializeAsString());
+  EXPECT_FALSE(in.HasNext());
+  loaded->reset();
+  EXPECT_EQ(Metrics::GetStats().svs_unavailable_indexes, before);
+}
+
+TEST_P(VectorSVSLvqLeanVecUnsupportedTest, LoadsWithoutStorage) {
+  if (SvsLvqLeanVecSupported()) {
+    GTEST_SKIP() << "covers builds or CPUs without LVQ/LeanVec";
+  }
+  if (std::get<2>(GetParam()) == data_model::VECTOR_DATA_TYPE_FLOAT16) {
+    LoadsWithoutStorage<float16>();
+  } else {
+    LoadsWithoutStorage<float>();
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Kinds, VectorSVSLvqLeanVecUnsupportedTest,
+    testing::Combine(testing::Values(data_model::SVS_COMPRESSION_LVQ4,
+                                     data_model::SVS_COMPRESSION_LVQ8,
+                                     data_model::SVS_COMPRESSION_LVQ4X4,
+                                     data_model::SVS_COMPRESSION_LVQ4X8,
+                                     data_model::SVS_COMPRESSION_LEANVEC4X4,
+                                     data_model::SVS_COMPRESSION_LEANVEC4X8,
+                                     data_model::SVS_COMPRESSION_LEANVEC8X8),
+                     testing::Values(data_model::DISTANCE_METRIC_L2,
+                                     data_model::DISTANCE_METRIC_COSINE),
+                     testing::Values(data_model::VECTOR_DATA_TYPE_FLOAT32,
+                                     data_model::VECTOR_DATA_TYPE_FLOAT16)),
+    [](const testing::TestParamInfo<LvqLeanVecParam> &info) {
+      return absl::StrCat(
+          absl::StripPrefix(
+              data_model::SVSCompressionType_Name(std::get<0>(info.param)),
+              "SVS_COMPRESSION_"),
+          "_", data_model::DistanceMetric_Name(std::get<1>(info.param)), "_",
+          absl::StripPrefix(
+              data_model::VectorDataType_Name(std::get<2>(info.param)),
+              "VECTOR_DATA_TYPE_"));
+    });
+
 // SQ8 fixes one scale and bias for every component from the min and max of
 // the vectors it compresses, step = (max - min) / 255. The cases below
 // convert once all their docs are in; compressed from the first doc alone,

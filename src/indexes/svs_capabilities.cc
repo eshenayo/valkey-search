@@ -11,6 +11,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/strip.h"
 #include "src/index_schema.pb.h"
+#include "vmsdk/src/module_config.h"
 
 #if defined(__linux__) && defined(__x86_64__)
 #include <svs/c/svs_c.h>
@@ -48,8 +49,24 @@ bool SvsCompressionUsesTrainingThreshold(
          IsSvsLeanVecCompression(compression);
 }
 
+namespace {
+// Debug mode only: reports LVQ/LeanVec as unsupported, as on a build without
+// the prebuilt C API or a CPU it doesn't support, so those paths can be
+// tested on a host that has both. Ignored outside debug mode, where a config
+// file could otherwise set it.
+auto svs_lvq_leanvec_force_unsupported =
+    vmsdk::config::BooleanBuilder("svs-lvq-leanvec-force-unsupported", false)
+        .Dev()
+        .Build();
+}  // namespace
+
 bool SvsLvqLeanVecSupported() {
 #if defined(__linux__) && defined(__x86_64__)
+  if (vmsdk::config::IsDebugModeEnabled() &&
+      dynamic_cast<vmsdk::config::Boolean &>(*svs_lvq_leanvec_force_unsupported)
+          .GetValue()) {
+    return false;
+  }
   // LVQ and LeanVec share one gate in the C API, checked at storage creation.
   static const bool supported = []() {
     svs_storage_h storage =

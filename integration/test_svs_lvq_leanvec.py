@@ -16,7 +16,12 @@ from valkeytestframework.util import waiters
 
 from ft_info_parser import FTInfoParser
 from test_svs_smoke import leanvec_min_training_threshold
-from valkey_search_test_case import ValkeySearchTestCaseDebugMode
+from indexes import ClusterTestUtils
+from valkey_search_test_case import (
+    ValkeySearchClusterTestCaseDebugMode,
+    ValkeySearchTestCaseBase,
+    ValkeySearchTestCaseDebugMode,
+)
 from valkeytestframework.conftest import resource_port_tracker
 
 
@@ -244,3 +249,224 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
             assert at_floor >= full - 0.05, (
                 f"{kind} {metric}: recall@{K} {at_floor:.3f} at the floor "
                 f"({floor}) vs {full:.3f} trained on {n}")
+
+    @pytest.mark.parametrize("metric", ["L2", "COSINE"])
+    @pytest.mark.parametrize("compression", KINDS)
+    def test_loads_without_storage_where_unsupported(self, compression,
+                                                     metric):
+        """An RDB with an LVQ/LeanVec index loads on a build or CPU that
+        can't create it: the rest of the keyspace loads, the log, FT.INFO
+        and INFO name what is missing, searches that need the index fail
+        with that reason, exact pre-filtered searches still run, and writes
+        stay tracked. Back on a build that supports it, the index is rebuilt
+        from the keyspace, including those writes. The debug-only switch
+        stands in for the build or CPU."""
+        client: Valkey = self.server.get_new_client()
+        if not int(client.info("SEARCH").get(
+                "search_svs_lvq_leanvec_supported", 0)):
+            pytest.skip("needs the prebuilt SVS C API on an Intel CPU")
+        dim, threshold, n = 16, 64, 80
+        params = ["TYPE", "FLOAT32", "DIM", str(dim), "DISTANCE_METRIC",
+                  metric, "COMPRESSION", compression,
+                  "TRAINING_THRESHOLD", str(threshold)]
+        client.execute_command(
+            "FT.CREATE", "svs", "PREFIX", "1", "d:", "SCHEMA", "v", "VECTOR",
+            "SVS_VAMANA", str(len(params)), *params)
+        client.execute_command(
+            "FT.CREATE", "hnsw", "PREFIX", "1", "h:", "SCHEMA", "v", "VECTOR",
+            "HNSW", "6", "TYPE", "FLOAT32", "DIM", str(dim),
+            "DISTANCE_METRIC", metric)
+        rng = np.random.default_rng(3)
+        docs = rng.standard_normal((n + 1, dim)).astype(np.float32)
+        for i in range(n):
+            client.hset(f"d:{i}", mapping={"v": docs[i].tobytes()})
+            client.hset(f"h:{i}", mapping={"v": docs[i].tobytes()})
+        client.set("plain", "value")
+        waiters.wait_for_equal(
+            lambda: (_v_index(client, "svs")["size"],
+                     _v_index(client, "svs")["algorithm"]
+                     ["compression_pending"]), (n, 0), timeout=30)
+        keys = client.dbsize()
+
+        def knn(index, query, inkeys=None):
+            filt = ["INKEYS", str(len(inkeys)), *inkeys] if inkeys else []
+            return client.execute_command(
+                "FT.SEARCH", index, "*=>[KNN 3 @v $q]", *filt, "PARAMS", "2",
+                "q", query.tobytes(), "NOCONTENT", "DIALECT", "2")
+
+        flag = "search.svs-lvq-leanvec-force-unsupported"
+        client.execute_command("CONFIG", "SET", flag, "yes")
+        try:
+            client.execute_command("DEBUG", "RELOAD")
+            assert client.dbsize() == keys
+            assert client.get("plain") == b"value"
+            info = client.info("SEARCH")
+            assert int(info["search_svs_unavailable_indexes"]) == 1
+            assert int(info["search_svs_lvq_leanvec_supported"]) == 0
+            missing = "requires an SVS build with LVQ/LeanVec support"
+            algorithm = _v_index(client, "svs")["algorithm"]
+            assert missing in algorithm["unavailable"]
+            # Nothing converts without storage; the settings are kept.
+            assert algorithm["compression_pending"] == 0
+            assert algorithm["training_threshold"] == threshold
+            assert algorithm.get("leanvec_dims") == \
+                (dim // 2 if compression.startswith("LEANVEC") else None)
+            assert self.server.verify_string_in_logfile(missing)
+            with pytest.raises(Exception) as exc_info:
+                knn("svs", docs[0])
+            assert missing in str(exc_info.value)
+            assert knn("hnsw", docs[0])[0] == 3
+            # Exact pre-filtered search runs from the tracked vectors.
+            near = knn("svs", docs[0], inkeys=["d:0", "d:1", "d:2"])
+            assert near[0] == 3 and near[1] == b"d:0"
+            client.hset(f"d:{n}", mapping={"v": docs[n].tobytes()})
+            waiters.wait_for_equal(
+                lambda: _v_index(client, "svs")["size"], n + 1, timeout=30)
+        finally:
+            client.execute_command("CONFIG", "SET", flag, "no")
+
+        client.execute_command("DEBUG", "RELOAD")
+        assert int(client.info("SEARCH")["search_svs_unavailable_indexes"]) \
+            == 0
+        algorithm = _v_index(client, "svs")["algorithm"]
+        assert "unavailable" not in algorithm
+        waiters.wait_for_equal(
+            lambda: (_v_index(client, "svs")["size"],
+                     _v_index(client, "svs")["algorithm"]
+                     ["compression_pending"]), (n + 1, 0), timeout=30)
+        assert knn("svs", docs[n])[1] == f"d:{n}".encode()
+
+
+class TestSVSLvqLeanVecUnavailableCluster(ValkeySearchClusterTestCaseDebugMode,
+                                          ClusterTestUtils):
+
+    @pytest.mark.parametrize("metric", ["L2", "COSINE"])
+    @pytest.mark.parametrize("compression", KINDS)
+    def test_reason_survives_consistent_fanout(self, compression, metric):
+        """Across shards that can't create an LVQ/LeanVec index, the reason
+        reaches the client under CONSISTENT fan-out (FT.SEARCH) and consistent
+        results (FT.HYBRID), not a consistency-failure message."""
+        if not int(self.client_for_primary(0).info("SEARCH").get(
+                "search_svs_lvq_leanvec_supported", 0)):
+            pytest.skip("needs the prebuilt SVS C API on an Intel CPU")
+        self.execute_primaries(["flushall sync"])
+        cluster = self.new_cluster_client()
+        dim, n = 8, 30
+        cluster.execute_command(
+            "FT.CREATE", "svs", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA",
+            "title", "TEXT", "v", "VECTOR", "SVS_VAMANA", "8", "TYPE",
+            "FLOAT32", "DIM", str(dim), "DISTANCE_METRIC", metric,
+            "COMPRESSION", compression)
+        rng = np.random.default_rng(5)
+        docs = rng.standard_normal((n, dim)).astype(np.float32)
+        for i in range(n):
+            cluster.hset(f"d:{i}", mapping={"title": "hello",
+                                            "v": docs[i].tobytes()})
+        waiters.wait_for_equal(
+            lambda: sum(FTInfoParser(self.client_for_primary(i).execute_command(
+                "FT.INFO", "svs")).num_docs
+                for i in range(self.CLUSTER_SIZE)), n, timeout=30)
+
+        flag = "search.svs-lvq-leanvec-force-unsupported"
+        missing = "requires an SVS build with LVQ/LeanVec support"
+        self.config_set(flag, "yes")
+        try:
+            self.execute_primaries(["DEBUG", "RELOAD"])
+            # A CONSISTENT search aborts a node whose cached cluster map doesn't
+            # yet hold its own shard (CHECK in PerformSlotConsistencyCheck, not
+            # SVS); let the map settle first.
+            self.wait_for_cluster_topology_to_settle()
+            node = self.client_for_primary(0)
+            with pytest.raises(Exception) as exc_info:
+                node.execute_command(
+                    "FT.SEARCH", "svs", "*=>[KNN 3 @v $q]", "PARAMS", "2",
+                    "q", docs[0].tobytes(), "ALLSHARDS", "CONSISTENT",
+                    "DIALECT", "2")
+            assert missing in str(exc_info.value)
+            self.config_set("search.enable-consistent-results", "yes")
+            try:
+                with pytest.raises(Exception) as exc_info:
+                    node.execute_command(
+                        "FT.HYBRID", "svs", "SEARCH", "@title:hello",
+                        "VSIM", "@v", "$q", "KNN", "2", "K", "3",
+                        "PARAMS", "2", "q", docs[0].tobytes())
+                assert missing in str(exc_info.value)
+            finally:
+                self.config_set("search.enable-consistent-results", "no")
+        finally:
+            self.config_set(flag, "no")
+
+    @pytest.mark.parametrize("metric", ["L2", "COSINE"])
+    @pytest.mark.parametrize("compression", KINDS)
+    def test_definition_from_metadata_on_unsupported_shards(self, compression,
+                                                            metric):
+        """An index created on a shard that supports LVQ/LeanVec reaches,
+        through cluster metadata, shards that don't: they load it without
+        storage instead of rejecting it, and a CONSISTENT search reports the
+        reason."""
+        if not int(self.client_for_primary(0).info("SEARCH").get(
+                "search_svs_lvq_leanvec_supported", 0)):
+            pytest.skip("needs the prebuilt SVS C API on an Intel CPU")
+        self.execute_primaries(["flushall sync"])
+        flag = "search.svs-lvq-leanvec-force-unsupported"
+        missing = "requires an SVS build with LVQ/LeanVec support"
+        unsupported = range(1, self.CLUSTER_SIZE)
+        dim = 8
+        for i in unsupported:
+            self.client_for_primary(i).execute_command(
+                "CONFIG", "SET", flag, "yes")
+        try:
+            node = self.client_for_primary(0)
+            node.execute_command(
+                "FT.CREATE", "svs", "ON", "HASH", "PREFIX", "1", "d:",
+                "SCHEMA", "v", "VECTOR", "SVS_VAMANA", "8", "TYPE", "FLOAT32",
+                "DIM", str(dim), "DISTANCE_METRIC", metric,
+                "COMPRESSION", compression)
+            for i in unsupported:
+                waiters.wait_for_true(
+                    lambda: b"svs" in self.client_for_primary(i)
+                    .execute_command("FT._LIST"), timeout=30)
+                assert missing in _v_index(
+                    self.client_for_primary(i), "svs")["algorithm"][
+                        "unavailable"]
+            assert "unavailable" not in _v_index(node, "svs")["algorithm"]
+            cluster = self.new_cluster_client()
+            rng = np.random.default_rng(7)
+            docs = rng.standard_normal((30, dim)).astype(np.float32)
+            for j, v in enumerate(docs):
+                cluster.hset(f"d:{j}", mapping={"v": v.tobytes()})
+            # A CONSISTENT search aborts a node whose cached cluster map doesn't
+            # yet hold its own shard (CHECK in PerformSlotConsistencyCheck, not
+            # SVS); let the map settle first.
+            self.wait_for_cluster_topology_to_settle()
+            with pytest.raises(Exception) as exc_info:
+                node.execute_command(
+                    "FT.SEARCH", "svs", "*=>[KNN 3 @v $q]", "PARAMS", "2",
+                    "q", docs[0].tobytes(), "ALLSHARDS", "CONSISTENT",
+                    "DIALECT", "2")
+            assert missing in str(exc_info.value)
+        finally:
+            for i in unsupported:
+                self.client_for_primary(i).execute_command(
+                    "CONFIG", "SET", flag, "no")
+
+
+class TestSVSLvqLeanVecSwitchNeedsDebugMode(ValkeySearchTestCaseBase):
+    """The switch that makes LVQ/LeanVec unsupported is for tests: set from a
+    config file on a server without debug mode, it is ignored."""
+
+    def get_config_file_lines(self, testdir, port):
+        return super().get_config_file_lines(testdir, port) + [
+            "search.svs-lvq-leanvec-force-unsupported yes"]
+
+    def test_switch_ignored_without_debug_mode(self):
+        client: Valkey = self.server.get_new_client()
+        info = client.info("SEARCH")
+        if not int(info.get("search_svs_c_api_prebuilt", 0)):
+            pytest.skip("needs the prebuilt SVS C API")
+        assert int(info["search_svs_lvq_leanvec_supported"]) == 1
+        client.execute_command(
+            "FT.CREATE", "lvq", "SCHEMA", "v", "VECTOR", "SVS_VAMANA", "8",
+            "TYPE", "FLOAT32", "DIM", "8", "DISTANCE_METRIC", "L2",
+            "COMPRESSION", "LVQ8")
+        assert "unavailable" not in _v_index(client, "lvq")["algorithm"]
