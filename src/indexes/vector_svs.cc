@@ -703,7 +703,6 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
         "SVS_VAMANA: unsupported DISTANCE_METRIC");
   }
   const auto& svs_proto = vector_index_proto.svs_vamana_algorithm();
-  VMSDK_RETURN_IF_ERROR(CheckSvsCompressionAvailable(svs_proto.compression()));
 
   auto instance = std::shared_ptr<VectorSVS<T>>(
       new VectorSVS<T>(vector_index_proto.dimension_count(),
@@ -714,10 +713,15 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
   // arrives from an RDB or a definition written by another build. The index
   // still loads, so the rest of the keyspace does too.
   // LVQ and LeanVec have no CompressionToSvsDataType value (MakeSvsStorage
-  // builds them) but are compressions this build defines.
-  if (!CompressionToSvsDataType(svs_proto.compression()).has_value() &&
-      !IsSvsLvqCompression(svs_proto.compression()) &&
-      !IsSvsLeanVecCompression(svs_proto.compression())) {
+  // builds them) but are compressions this build defines; without the
+  // prebuilt C API or a CPU it supports, they can't be created either.
+  const absl::Status available =
+      CheckSvsCompressionAvailable(svs_proto.compression());
+  if (!available.ok()) {
+    instance->unavailable_ = std::string(available.message());
+  } else if (!CompressionToSvsDataType(svs_proto.compression()).has_value() &&
+             !IsSvsLvqCompression(svs_proto.compression()) &&
+             !IsSvsLeanVecCompression(svs_proto.compression())) {
     instance->unavailable_ = absl::StrCat(
         "SVS_VAMANA: COMPRESSION ", static_cast<int>(svs_proto.compression()),
         " is proprietary / v2 and not available in this build");
@@ -746,8 +750,10 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
   // index starts uncompressed and converts at the training threshold.
   if (SvsCompressionUsesTrainingThreshold(svs_proto.compression())) {
     instance->build_config_.training_threshold = svs_proto.training_threshold();
+    // Without storage there is nothing to convert.
     instance->compression_pending_.store(
-        instance->build_config_.training_threshold > 0,
+        instance->build_config_.training_threshold > 0 &&
+            instance->unavailable_.empty(),
         std::memory_order_relaxed);
   }
   // svs_index_ stays null until the first HSET bootstraps it via
