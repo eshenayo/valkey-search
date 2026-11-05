@@ -13,10 +13,14 @@
 
 #include "src/indexes/vector_svs.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
@@ -2517,6 +2521,262 @@ TEST_P(VectorSVSL2CosineTest, Sq8ConversionsAreCounted) {
   VMSDK_EXPECT_OK(result);
   ASSERT_EQ(result->size(), 1u);
   EXPECT_EQ((*result)[0].external_id, IndexToKey(0));
+}
+
+// -- Conversion back-off and memory check ---------------------------------
+
+// A conversion that fails, or is skipped for want of memory, is tried again
+// after 2, 4, 8, ... more vectors, at most TRAINING_THRESHOLD, instead of on
+// every write; once the cause is gone, the next attempt converts.
+class VectorSVSConversionBackoffTest
+    : public VectorSVSTest,
+      public testing::WithParamInterface<std::tuple<
+          data_model::SVSCompressionType, data_model::DistanceMetric>> {
+ protected:
+  static constexpr uint32_t kThreshold = 16;
+
+  void SetUp() override {
+    VectorSVSTest::SetUp();
+    const auto compression = std::get<0>(GetParam());
+    if ((IsSvsLvqCompression(compression) ||
+         IsSvsLeanVecCompression(compression)) &&
+        !SvsLvqLeanVecSupported()) {
+      GTEST_SKIP() << "needs the prebuilt SVS C API on an Intel CPU";
+    }
+  }
+  void TearDown() override {
+    SetSvsAvailableMemoryForTesting(nullptr);
+    VectorSVSTest::TearDown();
+  }
+
+  std::shared_ptr<VectorSVS<float>> MakeIndex() {
+    const auto [compression, metric] = GetParam();
+    auto proto = CreateSVSVectorIndexProto(kDimensions, metric, compression);
+    proto.mutable_svs_vamana_algorithm()->set_training_threshold(kThreshold);
+    if (IsSvsLeanVecCompression(compression)) {
+      proto.mutable_svs_vamana_algorithm()->set_leanvec_dims(kDimensions / 2);
+    }
+    auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                          attribute_data_type, 0);
+    CHECK(index.ok()) << index.status();
+    return *index;
+  }
+
+  // Adds vectors until `count` are indexed, returning the counts at which a
+  // conversion was attempted and failed.
+  std::vector<size_t> FillTo(VectorSVS<float> &index, size_t from,
+                             size_t count) {
+    std::vector<size_t> failed_at;
+    auto vectors = RandomVectors(count, kDimensions);
+    for (size_t i = from; i < count; ++i) {
+      const uint64_t before = Metrics::GetStats().svs_conversion_failures_cnt;
+      VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(index, IndexToKey(i),
+                                                     VectorToStr(vectors[i])));
+      if (Metrics::GetStats().svs_conversion_failures_cnt != before) {
+        failed_at.push_back(i + 1);
+      }
+    }
+    return failed_at;
+  }
+};
+
+TEST_P(VectorSVSConversionBackoffTest, FailedConversionBacksOff) {
+  auto index = MakeIndex();
+  FillTo(*index, 0, kThreshold - 1);
+  // SVS rejects a conversion to a different graph_max_degree.
+  VectorSVSTestPeer::BuildConfig(*index).graph_max_degree += 1;
+  const uint64_t converted_before = Metrics::GetStats().svs_conversions_cnt;
+  EXPECT_THAT(FillTo(*index, kThreshold - 1, 90),
+              testing::ElementsAre(16, 18, 22, 30, 46, 62, 78));
+  EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(*index));
+  VectorSVSTestPeer::BuildConfig(*index).graph_max_degree -= 1;
+  EXPECT_THAT(FillTo(*index, 90, 94), testing::IsEmpty());
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(*index));
+  EXPECT_EQ(Metrics::GetStats().svs_conversions_cnt, converted_before + 1);
+}
+
+std::optional<uint64_t> NoMemoryAvailable() { return 0; }
+
+TEST_P(VectorSVSConversionBackoffTest, ConversionWithoutMemoryIsSkipped) {
+  auto index = MakeIndex();
+  SetSvsAvailableMemoryForTesting(NoMemoryAvailable);
+  const uint64_t converted_before = Metrics::GetStats().svs_conversions_cnt;
+  EXPECT_THAT(FillTo(*index, 0, 24), testing::ElementsAre(16, 18, 22));
+  EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(*index));
+  EXPECT_EQ(Metrics::GetStats().svs_conversions_cnt, converted_before);
+  SetSvsAvailableMemoryForTesting(nullptr);
+  EXPECT_THAT(FillTo(*index, 24, 31), testing::IsEmpty());
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(*index));
+  EXPECT_EQ(Metrics::GetStats().svs_conversions_cnt, converted_before + 1);
+}
+
+// Retries are counted in writes, so an index that stops growing (here,
+// deletes and re-adds at a constant size) still converts after a skip.
+TEST_P(VectorSVSConversionBackoffTest, ConstantSizeIndexStillRetries) {
+  auto index = MakeIndex();
+  SetSvsAvailableMemoryForTesting(NoMemoryAvailable);
+  EXPECT_THAT(FillTo(*index, 0, kThreshold), testing::ElementsAre(16));
+  SetSvsAvailableMemoryForTesting(nullptr);
+  auto vectors = RandomVectors(kThreshold, kDimensions);
+  for (size_t i = 0; i < 4 && VectorSVSTestPeer::CompressionPending(*index);
+       ++i) {
+    VMSDK_EXPECT_OK(
+        (*index).RemoveRecord(IndexToKey(i), DeletionType::kRecord));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(*index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(*index));
+  EXPECT_EQ(AsBase(index)->GetLabelCount(), kThreshold);
+}
+
+uint64_t g_available_bytes = 0;
+std::optional<uint64_t> AvailableBytes() { return g_available_bytes; }
+
+// An attempt runs when the estimate fits exactly, and is skipped one byte
+// short of it.
+TEST_P(VectorSVSConversionBackoffTest, MemoryCheckBoundary) {
+  for (const uint64_t short_by : {uint64_t{1}, uint64_t{0}}) {
+    auto index = MakeIndex();
+    g_available_bytes =
+        SvsConversionPeakBytes(VectorSVSTestPeer::BuildConfig(*index),
+                               kDimensions, kThreshold) -
+        short_by;
+    SetSvsAvailableMemoryForTesting(AvailableBytes);
+    FillTo(*index, 0, kThreshold);
+    EXPECT_EQ(VectorSVSTestPeer::CompressionPending(*index), short_by != 0)
+        << "short by " << short_by;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Kinds, VectorSVSConversionBackoffTest,
+    testing::Combine(testing::Values(data_model::SVS_COMPRESSION_SQ8,
+                                     data_model::SVS_COMPRESSION_LVQ4,
+                                     data_model::SVS_COMPRESSION_LVQ8,
+                                     data_model::SVS_COMPRESSION_LVQ4X4,
+                                     data_model::SVS_COMPRESSION_LVQ4X8,
+                                     data_model::SVS_COMPRESSION_LEANVEC4X4,
+                                     data_model::SVS_COMPRESSION_LEANVEC4X8,
+                                     data_model::SVS_COMPRESSION_LEANVEC8X8),
+                     testing::Values(data_model::DISTANCE_METRIC_L2,
+                                     data_model::DISTANCE_METRIC_COSINE)),
+    [](const auto &info) {
+      return absl::StrCat(
+          absl::StripPrefix(
+              data_model::SVSCompressionType_Name(std::get<0>(info.param)),
+              "SVS_COMPRESSION_"),
+          "_", data_model::DistanceMetric_Name(std::get<1>(info.param)));
+    });
+
+// The memory check reads a real value on Linux; were it unknown, conversions
+// would run unchecked.
+TEST_F(VectorSVSTest, SystemAvailableMemoryIsRead) {
+  const std::optional<uint64_t> available = SvsSystemAvailableBytes();
+  ASSERT_TRUE(available.has_value());
+  EXPECT_GT(*available, 0u);
+}
+
+// Available memory from MemAvailable and cgroup limits, read from fake /proc
+// and cgroup trees: the tightest of MemAvailable, the cgroup v2 limits up the
+// hierarchy and the v1 limit, each net of reclaimable page cache.
+class SvsAvailableMemoryTest : public testing::Test {
+ protected:
+  void SetUp() override {
+    // The process id keeps concurrent runs (other build trees) apart.
+    root_ = absl::StrCat(
+        testing::TempDir(), "/svs_mem_", getpid(), "_",
+        testing::UnitTest::GetInstance()->current_test_info()->name());
+    std::filesystem::remove_all(root_);
+  }
+  void TearDown() override { std::filesystem::remove_all(root_); }
+  void Write(const std::string &path, const std::string &content) {
+    const std::filesystem::path full = root_ + path;
+    std::filesystem::create_directories(full.parent_path());
+    std::ofstream(full) << content;
+  }
+  std::optional<uint64_t> Read() {
+    return SvsAvailableBytesFrom(root_ + "/proc", root_ + "/cgroup");
+  }
+  std::string root_;
+};
+
+TEST_F(SvsAvailableMemoryTest, MemAvailableAlone) {
+  Write("/proc/meminfo",
+        "MemTotal:       263866144 kB\nMemAvailable:    1000 kB\n"
+        "HugePages_Total:       0\n");
+  EXPECT_EQ(Read(), 1000u * 1024);
+}
+
+TEST_F(SvsAvailableMemoryTest, CgroupV2LimitNetOfReclaimableCache) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/cgroup", "0::/a/b\n");
+  Write("/cgroup/a/b/memory.max", "1000000\n");
+  Write("/cgroup/a/b/memory.current", "600000\n");
+  Write("/cgroup/a/b/memory.stat", "anon 500000\ninactive_file 100000\n");
+  EXPECT_EQ(Read(), 1000000u - (600000u - 100000u));
+}
+
+TEST_F(SvsAvailableMemoryTest, CgroupV2UnlimitedLeafUnderLimitedParent) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/cgroup", "0::/a/b\n");
+  Write("/cgroup/a/b/memory.max", "max\n");
+  Write("/cgroup/a/b/memory.current", "1\n");
+  Write("/cgroup/a/memory.max", "800000\n");
+  Write("/cgroup/a/memory.current", "700000\n");
+  EXPECT_EQ(Read(), 100000u);
+}
+
+TEST_F(SvsAvailableMemoryTest, CgroupV1Limit) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/cgroup", "5:cpu,cpuacct:/x\n4:memory:/docker/x\n");
+  Write("/cgroup/memory/docker/x/memory.limit_in_bytes", "2000000\n");
+  Write("/cgroup/memory/docker/x/memory.usage_in_bytes", "1500000\n");
+  Write("/cgroup/memory/docker/x/memory.stat", "total_inactive_file 500000\n");
+  EXPECT_EQ(Read(), 1000000u);
+}
+
+TEST_F(SvsAvailableMemoryTest, CgroupV1UnlimitedLeafUnderLimitedParent) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/cgroup", "4:memory:/kubepods/pod/c\n");
+  Write("/cgroup/memory/kubepods/pod/c/memory.limit_in_bytes",
+        "9223372036854771712\n");
+  Write("/cgroup/memory/kubepods/pod/c/memory.usage_in_bytes", "300000\n");
+  Write("/cgroup/memory/kubepods/pod/c/memory.stat",
+        "hierarchical_memory_limit 1000000\ntotal_inactive_file 100000\n");
+  EXPECT_EQ(Read(), 1000000u - (300000u - 100000u));
+}
+
+TEST_F(SvsAvailableMemoryTest, CgroupV1Unlimited) {
+  Write("/proc/meminfo", "MemAvailable:    1000 kB\n");
+  Write("/proc/self/cgroup", "4:memory:/\n");
+  Write("/cgroup/memory/memory.limit_in_bytes", "9223372036854771712\n");
+  Write("/cgroup/memory/memory.usage_in_bytes", "1\n");
+  EXPECT_EQ(Read(), 1000u * 1024);
+}
+
+TEST_F(SvsAvailableMemoryTest, NothingReadable) {
+  EXPECT_EQ(Read(), std::nullopt);
+}
+
+// The estimate grows with what the converted index stores, and LeanVec's
+// includes its PCA working set (several times the FP32 vectors).
+TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
+  auto estimate = [](data_model::SVSCompressionType compression) {
+    SVSBuildConfig config;
+    config.compression = compression;
+    config.graph_max_degree = 32;
+    config.leanvec_dims = 64;
+    return SvsConversionPeakBytes(config, 128, 10000);
+  };
+  const uint64_t fp32_bytes = 10000 * 128 * sizeof(float);
+  EXPECT_LT(estimate(data_model::SVS_COMPRESSION_LVQ4),
+            estimate(data_model::SVS_COMPRESSION_LVQ8));
+  EXPECT_LT(estimate(data_model::SVS_COMPRESSION_LVQ8),
+            estimate(data_model::SVS_COMPRESSION_LVQ4X8));
+  EXPECT_EQ(estimate(data_model::SVS_COMPRESSION_SQ8),
+            estimate(data_model::SVS_COMPRESSION_LVQ8));
+  EXPECT_GT(estimate(data_model::SVS_COMPRESSION_LEANVEC4X8),
+            estimate(data_model::SVS_COMPRESSION_LVQ4X8) + 3 * fp32_bytes);
 }
 
 // SVS's error codes carry through: an ALPHA SVS rejects (only reachable with a
