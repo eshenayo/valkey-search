@@ -2595,13 +2595,14 @@ TEST_P(VectorSVSL2CosineTest, SearchRangeChecksDeadlineAfterSvs) {
 }
 
 // SVS settings as a build with an extra compression writes them: that
-// compression, its training threshold, and a field this build doesn't define
-// (field 6, which such a build uses for the reduced dimension count).
+// compression, its training threshold, and a field this build doesn't define.
+// The values (compression 64, field 1000) are undefined on every branch, so
+// LVQ/LeanVec builds, which define 2-8 and field 6, test the same case.
 void AsOtherBuildWrites(data_model::SVSVamanaAlgorithm &settings,
                         data_model::SVSCompressionType compression) {
   settings.set_compression(compression);
   settings.set_training_threshold(256);
-  settings.GetReflection()->MutableUnknownFields(&settings)->AddVarint(6, 3);
+  settings.GetReflection()->MutableUnknownFields(&settings)->AddVarint(1000, 3);
 }
 
 void ExpectSettingsKept(const data_model::SVSVamanaAlgorithm &settings,
@@ -2610,7 +2611,7 @@ void ExpectSettingsKept(const data_model::SVSVamanaAlgorithm &settings,
   EXPECT_EQ(settings.training_threshold(), 256u);
   const auto &unknown = settings.GetReflection()->GetUnknownFields(settings);
   ASSERT_EQ(unknown.field_count(), 1);
-  EXPECT_EQ(unknown.field(0).number(), 6);
+  EXPECT_EQ(unknown.field(0).number(), 1000);
   EXPECT_EQ(unknown.field(0).varint(), 3u);
 }
 
@@ -2621,7 +2622,7 @@ void ExpectSettingsKept(const data_model::SVSVamanaAlgorithm &settings,
 TEST_P(VectorSVSL2CosineTest,
        CompressionThisBuildCannotCreateLoadsWithoutStorage) {
   // Not a compression this build defines; the RDB came from another build.
-  const auto unsupported = static_cast<data_model::SVSCompressionType>(5);
+  const auto unsupported = static_cast<data_model::SVSCompressionType>(64);
   auto vectors = RandomVectors(5, kDimensions);
   std::vector<ValkeyModuleString *> records(vectors.size());
   absl::Cleanup free_records = [&records]() {
