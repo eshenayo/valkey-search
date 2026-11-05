@@ -464,6 +464,12 @@ class TestSVSLvqLeanVecSwitchNeedsDebugMode(ValkeySearchTestCaseBase):
         info = client.info("SEARCH")
         if not int(info.get("search_svs_c_api_prebuilt", 0)):
             pytest.skip("needs the prebuilt SVS C API")
+        # The prebuilt C API supports LVQ/LeanVec only on Intel CPUs; elsewhere
+        # it reports unsupported with the switch ignored, so the check below
+        # can't tell the two apart.
+        with open("/proc/cpuinfo") as cpuinfo:
+            if "GenuineIntel" not in cpuinfo.read():
+                pytest.skip("needs an Intel CPU")
         assert int(info["search_svs_lvq_leanvec_supported"]) == 1
         client.execute_command(
             "FT.CREATE", "lvq", "SCHEMA", "v", "VECTOR", "SVS_VAMANA", "8",
