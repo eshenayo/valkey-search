@@ -124,6 +124,10 @@ class IndexBase {
 
   virtual void OnSwapDB(int new_db_num) {}
 
+  // Runs on the forking thread before fork(), with all worker pools
+  // suspended.
+  virtual void OnForkPrepare() {}
+
  private:
   IndexerType indexer_type_{IndexerType::kNone};
 };

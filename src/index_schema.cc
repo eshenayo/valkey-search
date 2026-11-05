@@ -1987,6 +1987,14 @@ void IndexSchema::OnSwapDB(ValkeyModuleSwapDbInfo *swap_db_info) {
   }
 }
 
+void IndexSchema::OnForkPrepare() {
+  for (auto &[_, attribute] : attributes_) {
+    if (attribute.GetIndex()) {
+      attribute.GetIndex()->OnForkPrepare();
+    }
+  }
+}
+
 void IndexSchema::DrainMutationQueue(ValkeyModuleCtx *ctx) const {
   static const auto max_yield = std::chrono::milliseconds(100);
   auto yield_duration = std::chrono::milliseconds(1);

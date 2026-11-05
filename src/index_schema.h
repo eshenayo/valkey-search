@@ -284,6 +284,9 @@ class IndexSchema : public KeyspaceEventSubscription,
 
   virtual void OnSwapDB(ValkeyModuleSwapDbInfo *swap_db_info);
   virtual void OnLoadingEnded(ValkeyModuleCtx *ctx);
+  // Lets each attribute's index compact itself before fork, so the BGSAVE
+  // child does not copy-on-write pages the parent could have reclaimed.
+  virtual void OnForkPrepare();
 
   inline const Stats &GetStats() const { return stats_; }
   void ProcessSingleMutationAsync(ValkeyModuleCtx *ctx, bool from_backfill,

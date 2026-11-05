@@ -102,6 +102,9 @@ SchemaManager &SchemaManager::Instance() { return **schema_manager_instance; }
 void SchemaManager::InitInstance(std::unique_ptr<SchemaManager> instance) {
   *schema_manager_instance = std::move(instance);
 }
+bool SchemaManager::HasInstance() {
+  return *schema_manager_instance != nullptr;
+}
 
 SchemaManager::SchemaManager(
     ValkeyModuleCtx *ctx,
@@ -741,6 +744,15 @@ void SchemaManager::OnSwapDB(ValkeyModuleSwapDbInfo *swap_db_info) {
   }
   for (auto &schema : db_to_index_schemas_[swap_db_info->dbnum_second]) {
     schema.second->OnSwapDB(swap_db_info);
+  }
+}
+
+void SchemaManager::OnForkPrepare() {
+  absl::MutexLock lock(&db_to_index_schemas_mutex_);
+  for (auto &[db_num, inner_map] : db_to_index_schemas_) {
+    for (auto &[name, schema] : inner_map) {
+      schema->OnForkPrepare();
+    }
   }
 }
 
