@@ -2629,23 +2629,71 @@ TEST_P(VectorSVSConversionBackoffTest, ConstantSizeIndexStillRetries) {
   EXPECT_EQ(AsBase(index)->GetLabelCount(), kThreshold);
 }
 
+// Modifies are writes too: an index that only receives updates still
+// retries after a skip.
+TEST_P(VectorSVSConversionBackoffTest, UpdateOnlyIndexStillRetries) {
+  auto index = MakeIndex();
+  SetSvsAvailableMemoryForTesting(NoMemoryAvailable);
+  EXPECT_THAT(FillTo(*index, 0, kThreshold), testing::ElementsAre(16));
+  SetSvsAvailableMemoryForTesting(nullptr);
+  // New values (the fill used the first kThreshold), so each is a real change.
+  auto vectors = RandomVectors(kThreshold + 4, kDimensions);
+  for (size_t i = 0; i < 4 && VectorSVSTestPeer::CompressionPending(*index);
+       ++i) {
+    VMSDK_EXPECT_OK((*index).ModifyRecord(
+        IndexToKey(i), VectorData(*index, i, vectors[kThreshold + i])));
+  }
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(*index));
+}
+
 uint64_t g_available_bytes = 0;
 std::optional<uint64_t> AvailableBytes() { return g_available_bytes; }
+
+// The estimate for the index as it stands when it reaches the threshold:
+// rows from what SVS has allocated, as MaybeConvert computes them.
+uint64_t PeakAtThreshold(VectorSVS<float> &index, size_t live) {
+  svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+  CHECK(svs_index_get_memory_breakdown(VectorSVSTestPeer::Handle(index),
+                                       &breakdown, nullptr));
+  const auto &config = VectorSVSTestPeer::BuildConfig(index);
+  return SvsConversionPeakBytes(
+      config, kDimensions,
+      SvsConversionRows(config, kDimensions, live, breakdown.data_bytes));
+}
 
 // An attempt runs when the estimate fits exactly, and is skipped one byte
 // short of it.
 TEST_P(VectorSVSConversionBackoffTest, MemoryCheckBoundary) {
   for (const uint64_t short_by : {uint64_t{1}, uint64_t{0}}) {
     auto index = MakeIndex();
-    g_available_bytes =
-        SvsConversionPeakBytes(VectorSVSTestPeer::BuildConfig(*index),
-                               kDimensions, kThreshold) -
-        short_by;
+    FillTo(*index, 0, kThreshold - 1);
+    g_available_bytes = PeakAtThreshold(*index, kThreshold) - short_by;
     SetSvsAvailableMemoryForTesting(AvailableBytes);
-    FillTo(*index, 0, kThreshold);
+    FillTo(*index, kThreshold - 1, kThreshold);
     EXPECT_EQ(VectorSVSTestPeer::CompressionPending(*index), short_by != 0)
         << "short by " << short_by;
   }
+}
+
+// Deleted rows stay in SVS until a compaction and are copied too, so memory
+// that fits the live rows alone isn't enough.
+TEST_P(VectorSVSConversionBackoffTest, DeletedRowsCountTowardTheEstimate) {
+  auto index = MakeIndex();
+  FillTo(*index, 0, kThreshold - 1);
+  for (size_t i = 0; i < 5; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index).RemoveRecord(IndexToKey(i), DeletionType::kRecord));
+  }
+  g_available_bytes = SvsConversionPeakBytes(
+      VectorSVSTestPeer::BuildConfig(*index), kDimensions, kThreshold);
+  SetSvsAvailableMemoryForTesting(AvailableBytes);
+  auto vectors = RandomVectors(kThreshold + 6, kDimensions);
+  for (size_t i = kThreshold - 1; i < kThreshold + 5; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(*index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  EXPECT_EQ(AsBase(index)->GetLabelCount(), kThreshold);
+  EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(*index));
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -2741,9 +2789,24 @@ TEST_F(SvsAvailableMemoryTest, CgroupV1UnlimitedLeafUnderLimitedParent) {
   Write("/cgroup/memory/kubepods/pod/c/memory.limit_in_bytes",
         "9223372036854771712\n");
   Write("/cgroup/memory/kubepods/pod/c/memory.usage_in_bytes", "300000\n");
-  Write("/cgroup/memory/kubepods/pod/c/memory.stat",
-        "hierarchical_memory_limit 1000000\ntotal_inactive_file 100000\n");
-  EXPECT_EQ(Read(), 1000000u - (300000u - 100000u));
+  Write("/cgroup/memory/kubepods/pod/memory.limit_in_bytes", "1000000\n");
+  Write("/cgroup/memory/kubepods/pod/memory.usage_in_bytes", "400000\n");
+  Write("/cgroup/memory/kubepods/pod/memory.stat",
+        "total_inactive_file 100000\n");
+  EXPECT_EQ(Read(), 1000000u - (400000u - 100000u));
+}
+
+// A parent's limit is against its own usage, which includes its other
+// children, not only this group's.
+TEST_F(SvsAvailableMemoryTest, CgroupV1ParentLimitCountsSiblings) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/cgroup", "4:memory:/parent/leaf\n");
+  Write("/cgroup/memory/parent/leaf/memory.limit_in_bytes",
+        "9223372036854771712\n");
+  Write("/cgroup/memory/parent/leaf/memory.usage_in_bytes", "200000\n");
+  Write("/cgroup/memory/parent/memory.limit_in_bytes", "1000000\n");
+  Write("/cgroup/memory/parent/memory.usage_in_bytes", "900000\n");
+  EXPECT_EQ(Read(), 100000u);
 }
 
 TEST_F(SvsAvailableMemoryTest, CgroupV1Unlimited) {

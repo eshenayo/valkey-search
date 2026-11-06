@@ -85,6 +85,13 @@ void InitSvsLogging();
 uint64_t SvsConversionPeakBytes(const SVSBuildConfig &config, int dimensions,
                                 size_t vectors);
 
+// Rows a conversion copies: the uncompressed source's allocated data bytes
+// over its row size, at least `live`. SVS copies deleted rows too until a
+// compaction, and doesn't reuse freed ones; whole blocks make this an upper
+// bound.
+size_t SvsConversionRows(const SVSBuildConfig &config, int dimensions,
+                         size_t live, size_t source_data_bytes);
+
 // Bytes the system, or the process's cgroup if lower, can still allocate:
 // MemAvailable, and each cgroup v1/v2 memory limit up the hierarchy minus its
 // non-reclaimable usage; nullopt when unknown. An estimate, not a guarantee.
