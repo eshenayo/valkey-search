@@ -126,6 +126,8 @@ valkey-search uses **CMake** for its build system. To simplify, a build script i
 
 On x86_64 Linux the build includes the `SVS_VAMANA` vector algorithm, compiled from the `third_party/svs` git submodule. `build.sh` initializes the submodule in a git checkout. GitHub's source archives don't include submodules, so build from a clone (or run `git submodule update --init third_party/svs` in one). The first configure also downloads SVS's dependencies (eve, fmt, spdlog, toml++, robin-map), so it needs network access.
 
+`./build.sh --svs-prebuilt` instead links Intel's prebuilt, proprietary SVS C API, which adds the LVQ and LeanVec compressions; they run only on Intel CPUs. The configure downloads the archive pinned by `SVS_C_API_URL` in `third_party/CMakeLists.txt` (which can also point to a local file), and the build goes to `.build-release-svs-prebuilt`.
+
 To view the available arguments, use:
 
 ```sh
