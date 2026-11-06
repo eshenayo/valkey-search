@@ -21,11 +21,16 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -51,12 +56,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "absl/algorithm/container.h"
-#include "absl/strings/ascii.h"
-#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_split.h"
-#include "absl/strings/strip.h"
 #include "src/index_schema.pb.h"
 #include "src/indexes/svs_index.pb.h"
 #include "src/indexes/svs_stream_adapter.h"
@@ -721,6 +721,15 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig& config, int dimensions,
   return bytes;
 }
 
+size_t SvsConversionRows(const SVSBuildConfig& config, int dimensions,
+                         size_t live, size_t source_data_bytes) {
+  const size_t element_bytes =
+      config.input_type == data_model::VECTOR_DATA_TYPE_FLOAT16 ? 2 : 4;
+  const size_t row_bytes =
+      std::max<size_t>(1, static_cast<size_t>(dimensions) * element_bytes);
+  return std::max(live, source_data_bytes / row_bytes);
+}
+
 namespace {
 std::optional<uint64_t> ReadUint(const std::string& path) {
   std::ifstream file(path);
@@ -790,27 +799,28 @@ std::optional<uint64_t> CgroupAvailableBytes(const std::string& proc_dir,
     } else if (absl::c_linear_search(
                    std::vector<std::string>(absl::StrSplit(parts[1], ',')),
                    "memory")) {
-      // v1 memory controller. memory.stat's hierarchical_memory_limit is the
-      // tightest limit of this group and its ancestors; an unlimited group
-      // reports a huge one.
-      const std::string base =
-          cgroup_root + "/memory" + (path == "/" ? std::string() : path);
-      std::optional<uint64_t> limit;
-      if (const uint64_t hierarchical =
-              ReadStat(base + "/memory.stat", "hierarchical_memory_limit");
-          hierarchical > 0) {
-        limit = hierarchical;
-      } else {
-        limit = ReadUint(base + "/memory.limit_in_bytes");
+      // v1 memory controller: the tightest headroom among this group and its
+      // ancestors, each its own limit against its own usage (which includes
+      // its other children). An unlimited group reports a huge limit.
+      std::string dir = path;
+      while (true) {
+        const std::string base =
+            cgroup_root + "/memory" + (dir == "/" ? std::string() : dir);
+        std::optional<uint64_t> limit =
+            ReadUint(base + "/memory.limit_in_bytes");
+        if (limit.has_value() && *limit >= (uint64_t{1} << 62)) {
+          limit = std::nullopt;
+        }
+        available = Smaller(
+            available,
+            CgroupHeadroom(
+                limit, ReadUint(base + "/memory.usage_in_bytes"),
+                ReadStat(base + "/memory.stat", "total_inactive_file")));
+        if (dir.empty() || dir == "/") break;
+        const size_t slash = dir.rfind('/');
+        dir = slash == 0 || slash == std::string::npos ? "/"
+                                                       : dir.substr(0, slash);
       }
-      if (limit.has_value() && *limit >= (uint64_t{1} << 62)) {
-        limit = std::nullopt;
-      }
-      available =
-          Smaller(available,
-                  CgroupHeadroom(
-                      limit, ReadUint(base + "/memory.usage_in_bytes"),
-                      ReadStat(base + "/memory.stat", "total_inactive_file")));
     }
   }
   return available;
@@ -1458,12 +1468,17 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
   }
   if (replaced) {
     MaybeConsolidate();
+    // A modify is a write too: it advances a backed-off conversion.
+    MaybeConvert();
     return absl::OkStatus();
   }
   // No handle yet: the modify is the first add.
   VMSDK_RETURN_IF_ERROR(InsertVector(internal_id, fp32));
-  absl::MutexLock map_lock(&label_mutex_);
-  label_to_record_[internal_id] = std::move(vector_record);
+  {
+    absl::MutexLock map_lock(&label_mutex_);
+    label_to_record_[internal_id] = std::move(vector_record);
+  }
+  MaybeConvert();
   return absl::OkStatus();
 #else
   (void)internal_id;
@@ -1571,8 +1586,14 @@ void VectorSVS<T>::MaybeConvert() {
   // allocator can't fail softly), so an attempt that won't fit is skipped.
   absl::Status status;
   svs_index_h converted = nullptr;
+  size_t rows = in_svs;
+  svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+  if (svs_index_get_memory_breakdown(svs_index_, &breakdown, nullptr)) {
+    rows = SvsConversionRows(build_config_, dimensions_, in_svs,
+                             breakdown.data_bytes);
+  }
   const uint64_t needed =
-      SvsConversionPeakBytes(build_config_, dimensions_, in_svs);
+      SvsConversionPeakBytes(build_config_, dimensions_, rows);
   const std::optional<uint64_t> available = svs_available_memory.load()();
   if (available.has_value() && needed > *available) {
     status = absl::ResourceExhaustedError(
