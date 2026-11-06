@@ -28,7 +28,8 @@ set(SVS_C_API_REQUIRED_ENTRY_POINTS
     svs_index_builder_set_threadpool_custom svs_index_convert_dynamic_ex
     svs_index_dynamic_add_points svs_index_dynamic_compact
     svs_index_dynamic_consolidate svs_index_dynamic_delete_points
-    svs_index_dynamic_get_sync_kind svs_index_free svs_index_get_memory_usage
+    svs_index_dynamic_get_sync_kind svs_index_free svs_index_get_memory_breakdown
+    svs_index_get_memory_usage
     svs_index_get_size svs_index_load_stream_dynamic svs_index_save_stream
     svs_index_search_topk svs_logger_create_custom svs_logger_free
     svs_logger_set_level svs_search_params_create_vamana svs_search_params_free

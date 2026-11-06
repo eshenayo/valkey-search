@@ -104,13 +104,14 @@ See [Numeric Field Format](../topics/search-data-formats.md#numeric-fields) for 
   - `DIM <number>` (required): Specifies the number of dimensions in a vector.
   - `TYPE [FLOAT32 | FLOAT16]` (required): Element data type. `BFLOAT16` is not supported.
   - `DISTANCE_METRIC [L2 | IP | COSINE]` (required): Specifies the distance algorithm.
-  - `INITIAL_CAP <size>` (optional): Expected number of vectors; the default is 10240. It sizes the blocks SVS allocates its data and graph in: the next power of two at or above `INITIAL_CAP` × `DIM` × the stored element size, from 64 KiB up to 16 MiB, so a small index doesn't reserve a large block. The index grows past this size as needed.
+  - `INITIAL_CAP <size>` (optional): Expected number of vectors; the default is 10240. It sizes the blocks SVS allocates its data and graph in: the next power of two at or above `INITIAL_CAP` × `DIM` × the stored element size (4 bytes for the LVQ and LeanVec compressions), from 64 KiB up to 16 MiB, so a small index doesn't reserve a large block. The index grows past this size as needed.
   - `GRAPH_MAX_DEGREE <number>` (optional): Maximum number of outgoing edges for each node in the graph. Higher values improve recall at the cost of memory and indexing time. The default is 64 and the minimum is 2.
   - `CONSTRUCTION_WINDOW_SIZE <number>` (optional): Number of candidates examined when inserting a vector. Higher values improve recall at the cost of indexing time. The default is 128. It must be at least `GRAPH_MAX_DEGREE`.
-  - `SEARCH_WINDOW_SIZE <number>` (optional): Number of candidates examined during a query. The default is 10. A query can override it with `EF_RUNTIME`. Higher values increase query times, but improve query recall.
+  - `SEARCH_WINDOW_SIZE <number>` (optional): Number of candidates examined during a query. The default is 10. A query can override it with `EF_RUNTIME`. A query examines at least `K` candidates, so a larger `K` widens the window. Higher values increase query times, but improve query recall.
   - `ALPHA <number>` (optional): Pruning parameter that decides which edges are kept when the graph is built. It must be at least 1.0 for `L2` and in (0, 1.0] for `IP` and `COSINE`; the defaults are 1.2 and 0.95. Moving it away from 1.0 keeps more long-range edges, which can improve recall at the cost of memory.
-  - `COMPRESSION [NONE | FP16 | SQ8]` (optional): How SVS stores the vectors. The default is `NONE`, which stores them in the declared `TYPE`. `FP16` stores `FLOAT32` vectors as 16-bit floats, halving their memory; scores then differ slightly from the exact ones, on the order of 1e-3 for normalized vectors. `SQ8` stores each element as an 8-bit integer, using one scale and offset for the whole index, set from the smallest and largest element of the vectors the index is built from (see `TRAINING_THRESHOLD`). Each element is then off by at most half a step, where a step is that range divided by 255, so scores differ slightly from the exact ones.
-  - `TRAINING_THRESHOLD <number>` (optional): Only for `COMPRESSION SQ8`; rejected with the other compressions. The number of vectors the index holds uncompressed before it converts to `SQ8`, so `SQ8` can set its range from all of them. The minimum is 64, the default 1024 and the maximum 1000000. The conversion keeps the graph and pauses writes and searches on the index while it runs: about 0.4 seconds for 1000000 vectors of 128 dimensions. Elements of vectors added after the conversion that fall outside the range are clamped to it, so the first vectors should be representative of the data.
+  - `COMPRESSION [NONE | FP16 | SQ8 | LVQ4 | LVQ8 | LVQ4X4 | LVQ4X8 | LEANVEC4X4 | LEANVEC4X8 | LEANVEC8X8]` (optional): How SVS stores the vectors. The default is `NONE`, which stores them in the declared `TYPE`. `FP16` stores `FLOAT32` vectors as 16-bit floats, halving their memory; scores then differ slightly from the exact ones, on the order of 1e-3 for normalized vectors. `SQ8` stores each element as an 8-bit integer, using one scale and offset for the whole index, set from the smallest and largest element of the vectors the index is built from (see `TRAINING_THRESHOLD`). Each element is then off by at most half a step, where a step is that range divided by 255, so scores differ slightly from the exact ones. The LVQ and LeanVec compressions are Intel's: they are only available in a build made with `./build.sh --svs-prebuilt`, on an Intel CPU (see the `svs_lvq_leanvec_supported` INFO field); elsewhere `FT.CREATE` returns an error. `LVQ4` and `LVQ8` store each element in 4 or 8 bits, scaled per vector. `LVQ4X4` and `LVQ4X8` add a 4- or 8-bit residual per element, which SVS uses to re-rank the candidates a search finds. `LEANVEC<P>X<S>` stores a vector reduced to `REDUCE` dimensions at P bits per element, which the graph is searched with, and the full vector at S bits per element, which re-ranks the candidates. Scores from these compressions are approximate.
+  - `REDUCE <number>` (optional): Only for the `LEANVEC` compressions; a nonzero value is rejected with the others. The number of dimensions LeanVec reduces each vector to. It must be less than `DIM`; the default, also selected by 0, is `DIM` / 2, so LeanVec requires `DIM` of at least 2. `FT.INFO` reports the value in effect as `leanvec_dims`.
+  - `TRAINING_THRESHOLD <number>` (optional): Only for `COMPRESSION SQ8` and the LVQ and LeanVec compressions; rejected with `NONE` and `FP16`. The number of vectors the index holds uncompressed before it converts to its compression, which calibrates from all of them: `SQ8` sets its range, and LeanVec also learns its dimension reduction. The minimum is 64, the default 1024 and the maximum 1000000. For LeanVec the minimum and the default are raised to `DIM` when it is larger, since a reduction learned from fewer vectors than dimensions loses recall. The conversion keeps the graph and pauses writes and searches on the index while it runs: about 0.4 seconds for 1000000 vectors of 128 dimensions with `SQ8`. Vectors added after the conversion are compressed with what it learned, so the first vectors should be representative of the data; with `SQ8`, elements outside the range are clamped to it. If the conversion fails, the index stays uncompressed and tries again after 2, 4, 8, ... more writes, at most `TRAINING_THRESHOLD`. Running out of memory during a conversion aborts the server, so a conversion whose estimated memory (from the vector count, dimensions and compression) exceeds what the host, or the server's cgroup, reports available is skipped and retried the same way. The estimate reduces that risk but doesn't remove it. `svs_conversion_failures_count` counts each failed or skipped attempt.
 
   The upper bounds of `GRAPH_MAX_DEGREE`, `CONSTRUCTION_WINDOW_SIZE` and `SEARCH_WINDOW_SIZE` are set by the configs `search.max-vector-m`, `search.max-vector-ef-construction` and `search.max-vector-ef-runtime`, which also bound `HNSW`'s `M`, `EF_CONSTRUCTION` and `EF_RUNTIME`.
 
@@ -120,6 +121,18 @@ See [Numeric Field Format](../topics/search-data-formats.md#numeric-fields) for 
   | :-------- | :----------------- | :----------------- | :---------------- |
   | `FLOAT32` | 4 bytes            | 2 bytes            | 1 byte            |
   | `FLOAT16` | 2 bytes            | 2 bytes            | 1 byte            |
+
+  The LVQ and LeanVec compressions store the same for either `TYPE`, plus a few bytes per vector of scaling constants:
+
+  | `COMPRESSION` | Bits per vector             |
+  | :------------ | :-------------------------- |
+  | `LVQ4`        | 4 × `DIM`                   |
+  | `LVQ8`        | 8 × `DIM`                   |
+  | `LVQ4X4`      | 8 × `DIM`                   |
+  | `LVQ4X8`      | 12 × `DIM`                  |
+  | `LEANVEC4X4`  | 4 × `REDUCE` + 4 × `DIM`    |
+  | `LEANVEC4X8`  | 4 × `REDUCE` + 8 × `DIM`    |
+  | `LEANVEC8X8`  | 8 × `REDUCE` + 8 × `DIM`    |
 
 See [SVS_VAMANA notes](#svs_vamana-notes) for behavior specific to this algorithm.
 
@@ -139,10 +152,12 @@ This table shows the actual computation that Search uses when computing the dist
 
 - **Version:** `SVS_VAMANA` requires 1.3.0 or later. A module older than that refuses to load an RDB file with an `SVS_VAMANA` index.
 - **Memory:** SVS allocations count toward `used_memory` and `maxmemory`. On Valkey 9.2 or later they are reported as `used_memory_module_external` in `INFO debug`, and allocations of 2 MiB or more try huge pages first. On earlier Valkey versions they are still counted, but huge pages aren't used.
-- **Building:** the index is built when the first vector is added, so an empty `SVS_VAMANA` field allocates no SVS memory. With `COMPRESSION SQ8` it starts uncompressed and converts to `SQ8` once it holds `TRAINING_THRESHOLD` vectors. An index saved before its conversion loads uncompressed and converts later.
+- **Building:** the index is built when the first vector is added, so an empty `SVS_VAMANA` field allocates no SVS memory. With `COMPRESSION SQ8`, LVQ or LeanVec it starts uncompressed and converts once it holds `TRAINING_THRESHOLD` vectors. An index saved before its conversion loads uncompressed, and converts once the keys have loaded if it holds `TRAINING_THRESHOLD` vectors by then, or on a later add.
 - **Filtered queries:** SVS applies a filter to batches of candidates after each graph traversal, rather than at every node it visits. A query with a filter can therefore return fewer than `K` results when few vectors match. For very selective filters the query planner evaluates the filter first and computes exact distances instead (see `HYBRID_POLICY` in [Search - query language](../topics/search-query.md)).
-- **Persistence:** the index is saved in the RDB file. If the file was written by a different version of the SVS library, the index is rebuilt from the keyspace when it loads.
-- **Logging:** SVS's own messages go to the Valkey log as `SVS[<field>] <message>`: SVS trace and debug messages at `debug`, info at `verbose`, and warnings and errors at `warning`, so at the default `notice` level only SVS warnings appear. An index loaded from RDB logs as `SVS[global]`, because SVS's RDB load doesn't take a per-index logger; an SQ8 index gets its tag back when it converts. Each load from RDB also logs `SVS index loaded: attribute=<field>, num_elements=<n>, compression=<kind>, load_ms=<t>` at `notice`.
+- **Vectors:** a vector with a NaN or infinite component isn't indexed (one that replaces an indexed vector removes the key from the index), and a query vector with one is rejected. With `COSINE`, a zero vector is indexed and scores 1.0 against any query.
+- **Timeouts:** a running SVS search can't be interrupted; `TIMEOUT` is checked when it returns, so a slow query can run past it. It then returns its results, or with partial results off (`ALLSHARDS`, or `search.enable-partial-results no`) the timeout error.
+- **Persistence:** the index is saved in the RDB file. If the file was written by a different version of the SVS library, or by a build that couldn't create the index's storage, the index is rebuilt from the keyspace when it loads, with a `warning` log line. Any other mismatch between the saved index and its definition fails the load. An index whose compression this build or CPU can't create (an LVQ or LeanVec index loaded without `--svs-prebuilt` or off an Intel CPU, or a compression this build doesn't know) still loads: it tracks its keys and runs searches the query planner answers exactly from a filter, fails the others with the reason, which `FT.INFO` also reports as `unavailable`, and is counted in `svs_unavailable_indexes`. Its saves keep its definition but not its vectors, so a build that can create it rebuilds it from the keyspace.
+- **Logging:** SVS's own messages go to the Valkey log as `SVS[<field>] <message>`, where `<field>` is the hash field or JSON path, not the `AS` alias: SVS trace and debug messages at `debug`, info at `verbose`, and warnings and errors at `warning`, so at the default `notice` level only SVS warnings appear. An index loaded from RDB logs as `SVS[global]`, because SVS's RDB load doesn't take a per-index logger; an SQ8, LVQ or LeanVec index gets its tag back when it converts. Each load from RDB also logs `SVS index loaded: attribute=<field>, num_elements=<n>, compression=<kind>, load_ms=<t>` at `notice`.
 
 ### Field options
 
@@ -168,6 +183,18 @@ OK
 
 ```
 FT.CREATE my_index_name SCHEMA my_hash_field_key VECTOR SVS_VAMANA 10 TYPE FLOAT32 DIM 20 DISTANCE_METRIC COSINE GRAPH_MAX_DEGREE 32 COMPRESSION FP16
+```
+
+Result:
+
+```
+OK
+```
+
+A LeanVec index (requires `--svs-prebuilt` and an Intel CPU) that reduces 768 dimensions to 192 and converts after 2000 vectors:
+
+```
+FT.CREATE my_leanvec_index SCHEMA my_hash_field_key VECTOR SVS_VAMANA 12 TYPE FLOAT32 DIM 768 DISTANCE_METRIC L2 COMPRESSION LEANVEC4X8 REDUCE 192 TRAINING_THRESHOLD 2000
 ```
 
 Result:

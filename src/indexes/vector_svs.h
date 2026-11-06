@@ -79,6 +79,31 @@ struct SVSBuildConfig {
 // Routes SVS's default logger to the Valkey log. Call once at module load.
 void InitSvsLogging();
 
+// Estimated bytes a conversion of `vectors` uncompressed vectors to
+// config.compression allocates while the source index still exists: the
+// converted data and graph, and for LeanVec its PCA working set.
+uint64_t SvsConversionPeakBytes(const SVSBuildConfig &config, int dimensions,
+                                size_t vectors);
+
+// Rows a conversion copies: the uncompressed source's allocated data bytes
+// over its row size, at least `live`. SVS copies deleted rows too until a
+// compaction, and doesn't reuse freed ones; whole blocks make this an upper
+// bound.
+size_t SvsConversionRows(const SVSBuildConfig &config, int dimensions,
+                         size_t live, size_t source_data_bytes);
+
+// Bytes the system, or the process's cgroup if lower, can still allocate:
+// MemAvailable, and each cgroup v1/v2 memory limit up the hierarchy minus its
+// non-reclaimable usage; nullopt when unknown. An estimate, not a guarantee.
+// Conversions check it; tests replace the source, and nullptr restores
+// SvsSystemAvailableBytes. SvsAvailableBytesFrom reads from the given /proc
+// and cgroup mount directories.
+std::optional<uint64_t> SvsSystemAvailableBytes();
+std::optional<uint64_t> SvsAvailableBytesFrom(const std::string &proc_dir,
+                                              const std::string &cgroup_root);
+using SvsAvailableMemoryFn = std::optional<uint64_t> (*)();
+void SetSvsAvailableMemoryForTesting(SvsAvailableMemoryFn fn);
+
 template <typename T>
 class VectorSVS : public VectorType<T> {
  protected:
@@ -216,6 +241,11 @@ class VectorSVS : public VectorType<T> {
   // awaiting MaybeConvert. Written under the writer side of resize_mutex_;
   // atomic so adds can check it without the lock.
   std::atomic<bool> compression_pending_{false};
+  // Conversion back-off: consecutive failed or skipped conversions, and how
+  // many more writes pass before the next attempt. Counted in writes, not
+  // index size, so an index that stops growing still retries.
+  uint32_t conversion_failures_ ABSL_GUARDED_BY(resize_mutex_){0};
+  std::atomic<int64_t> writes_before_retry_{0};
   // Set by LoadFromRDB when the saved SVS payload was skipped; consumed by
   // OnTrackedKeysLoaded on the main thread before the index is published.
   bool rebuild_from_keyspace_{false};

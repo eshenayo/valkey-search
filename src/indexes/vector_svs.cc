@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -20,11 +21,16 @@
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -662,6 +668,196 @@ bool BuildConfigMatches(const SVSBuildConfig& expected,
 
 #endif  // __linux__ && __x86_64__
 
+uint64_t SvsConversionPeakBytes(const SVSBuildConfig& config, int dimensions,
+                                size_t vectors) {
+  const uint64_t dims = static_cast<uint64_t>(dimensions);
+  // Bits per component of the primary and second level (residual for LVQ,
+  // full-dimension secondary for LeanVec).
+  uint64_t primary_bits = 32, second_bits = 0;
+  switch (config.compression) {
+    case data_model::SVS_COMPRESSION_SQ8:
+      primary_bits = 8;
+      break;
+    case data_model::SVS_COMPRESSION_LVQ4:
+      primary_bits = 4;
+      break;
+    case data_model::SVS_COMPRESSION_LVQ8:
+      primary_bits = 8;
+      break;
+    case data_model::SVS_COMPRESSION_LVQ4X4:
+    case data_model::SVS_COMPRESSION_LEANVEC4X4:
+      primary_bits = 4;
+      second_bits = 4;
+      break;
+    case data_model::SVS_COMPRESSION_LVQ4X8:
+    case data_model::SVS_COMPRESSION_LEANVEC4X8:
+      primary_bits = 4;
+      second_bits = 8;
+      break;
+    case data_model::SVS_COMPRESSION_LEANVEC8X8:
+      primary_bits = 8;
+      second_bits = 8;
+      break;
+    default:
+      break;
+  }
+  const bool leanvec = IsSvsLeanVecCompression(config.compression);
+  const uint64_t primary_dims = leanvec ? config.leanvec_dims : dims;
+  // Per vector: the converted components, a few scale and offset constants,
+  // its graph neighbor list (one id per edge plus a count), and its id-map
+  // and status entries.
+  const uint64_t per_vector =
+      (primary_dims * primary_bits + dims * second_bits + 7) / 8 + 16 +
+      (uint64_t{config.graph_max_degree} + 1) * 4 + 40;
+  // Each dataset (data, graph, and LeanVec's second level) is allocated in
+  // blocks; allow one more block of each.
+  uint64_t bytes =
+      vectors * per_vector + (leanvec ? 3 : 2) * config.blocksize_bytes;
+  if (leanvec) {
+    // PCA working set. Measured at about 3.3x the FP32 vectors (100k x 768);
+    // 4x leaves a margin.
+    bytes += 4 * vectors * dims * sizeof(float);
+  }
+  return bytes;
+}
+
+size_t SvsConversionRows(const SVSBuildConfig& config, int dimensions,
+                         size_t live, size_t source_data_bytes) {
+  const size_t element_bytes =
+      config.input_type == data_model::VECTOR_DATA_TYPE_FLOAT16 ? 2 : 4;
+  const size_t row_bytes =
+      std::max<size_t>(1, static_cast<size_t>(dimensions) * element_bytes);
+  return std::max(live, source_data_bytes / row_bytes);
+}
+
+namespace {
+std::optional<uint64_t> ReadUint(const std::string& path) {
+  std::ifstream file(path);
+  std::string value;
+  uint64_t parsed = 0;
+  if (!(file >> value) || !absl::SimpleAtoi(value, &parsed)) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
+// A counter from a cgroup memory.stat file; 0 when absent.
+uint64_t ReadStat(const std::string& path, absl::string_view key) {
+  std::ifstream file(path);
+  std::string name;
+  uint64_t value = 0;
+  while (file >> name >> value) {
+    if (name == key) return value;
+  }
+  return 0;
+}
+
+// What a cgroup can still allocate: its limit minus its usage, where page
+// cache it could reclaim (inactive file pages) counts as free.
+std::optional<uint64_t> CgroupHeadroom(std::optional<uint64_t> limit,
+                                       std::optional<uint64_t> usage,
+                                       uint64_t reclaimable) {
+  if (!limit.has_value() || !usage.has_value()) return std::nullopt;
+  const uint64_t used = *usage > reclaimable ? *usage - reclaimable : 0;
+  return *limit > used ? *limit - used : 0;
+}
+
+std::optional<uint64_t> Smaller(std::optional<uint64_t> a,
+                                std::optional<uint64_t> b) {
+  if (!a.has_value()) return b;
+  if (!b.has_value()) return a;
+  return std::min(*a, *b);
+}
+
+std::optional<uint64_t> CgroupAvailableBytes(const std::string& proc_dir,
+                                             const std::string& cgroup_root) {
+  std::ifstream self(proc_dir + "/self/cgroup");
+  std::string line;
+  std::optional<uint64_t> available;
+  while (std::getline(self, line)) {
+    // "hierarchy-id:controllers:path"; cgroup v2 is "0::path".
+    const std::vector<std::string> parts =
+        absl::StrSplit(line, absl::MaxSplits(':', 2));
+    if (parts.size() != 3) continue;
+    const std::string& path = parts[2];
+    if (parts[0] == "0" && parts[1].empty()) {
+      // v2: the tightest limit among this cgroup and its ancestors.
+      std::string dir = path;
+      while (true) {
+        const std::string base =
+            cgroup_root + (dir == "/" ? std::string() : dir);
+        available = Smaller(
+            available,
+            CgroupHeadroom(ReadUint(base + "/memory.max"),
+                           ReadUint(base + "/memory.current"),
+                           ReadStat(base + "/memory.stat", "inactive_file")));
+        if (dir.empty() || dir == "/") break;
+        const size_t slash = dir.rfind('/');
+        dir = slash == 0 || slash == std::string::npos ? "/"
+                                                       : dir.substr(0, slash);
+      }
+    } else if (absl::c_linear_search(
+                   std::vector<std::string>(absl::StrSplit(parts[1], ',')),
+                   "memory")) {
+      // v1 memory controller: the tightest headroom among this group and its
+      // ancestors, each its own limit against its own usage (which includes
+      // its other children). An unlimited group reports a huge limit.
+      std::string dir = path;
+      while (true) {
+        const std::string base =
+            cgroup_root + "/memory" + (dir == "/" ? std::string() : dir);
+        std::optional<uint64_t> limit =
+            ReadUint(base + "/memory.limit_in_bytes");
+        if (limit.has_value() && *limit >= (uint64_t{1} << 62)) {
+          limit = std::nullopt;
+        }
+        available = Smaller(
+            available,
+            CgroupHeadroom(
+                limit, ReadUint(base + "/memory.usage_in_bytes"),
+                ReadStat(base + "/memory.stat", "total_inactive_file")));
+        if (dir.empty() || dir == "/") break;
+        const size_t slash = dir.rfind('/');
+        dir = slash == 0 || slash == std::string::npos ? "/"
+                                                       : dir.substr(0, slash);
+      }
+    }
+  }
+  return available;
+}
+}  // namespace
+
+std::optional<uint64_t> SvsAvailableBytesFrom(const std::string& proc_dir,
+                                              const std::string& cgroup_root) {
+  std::optional<uint64_t> available;
+  std::ifstream meminfo(proc_dir + "/meminfo");
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    uint64_t kib = 0;
+    if (line.rfind("MemAvailable:", 0) == 0 &&
+        absl::SimpleAtoi(
+            absl::StripSuffix(absl::StripAsciiWhitespace(line.substr(13)),
+                              " kB"),
+            &kib)) {
+      available = kib * 1024;
+      break;
+    }
+  }
+  return Smaller(available, CgroupAvailableBytes(proc_dir, cgroup_root));
+}
+
+std::optional<uint64_t> SvsSystemAvailableBytes() {
+  return SvsAvailableBytesFrom("/proc", "/sys/fs/cgroup");
+}
+
+namespace {
+std::atomic<SvsAvailableMemoryFn> svs_available_memory{SvsSystemAvailableBytes};
+}  // namespace
+
+void SetSvsAvailableMemoryForTesting(SvsAvailableMemoryFn fn) {
+  svs_available_memory.store(fn != nullptr ? fn : SvsSystemAvailableBytes);
+}
+
 void InitSvsLogging() {
 #if defined(__linux__) && defined(__x86_64__)
   // Covers SVS work without a per-index logger, such as stream loads.
@@ -1272,12 +1468,17 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
   }
   if (replaced) {
     MaybeConsolidate();
+    // A modify is a write too: it advances a backed-off conversion.
+    MaybeConvert();
     return absl::OkStatus();
   }
   // No handle yet: the modify is the first add.
   VMSDK_RETURN_IF_ERROR(InsertVector(internal_id, fp32));
-  absl::MutexLock map_lock(&label_mutex_);
-  label_to_record_[internal_id] = std::move(vector_record);
+  {
+    absl::MutexLock map_lock(&label_mutex_);
+    label_to_record_[internal_id] = std::move(vector_record);
+  }
+  MaybeConvert();
   return absl::OkStatus();
 #else
   (void)internal_id;
@@ -1358,12 +1559,15 @@ SVSBuildConfig VectorSVS<T>::StorageConfig() const {
 
 template <typename T>
 void VectorSVS<T>::MaybeConvert() {
-  // The label map also holds adds still in flight, so it only says a
-  // conversion may be due; SVS's own count decides, under the lock.
-  if (!compression_pending_.load(std::memory_order_acquire) ||
-      GetLabelCount() < build_config_.training_threshold) {
+  if (!compression_pending_.load(std::memory_order_acquire)) return;
+  // After a failure, each write (this call) counts down to the next attempt.
+  if (writes_before_retry_.load(std::memory_order_relaxed) > 0 &&
+      writes_before_retry_.fetch_sub(1, std::memory_order_relaxed) > 1) {
     return;
   }
+  // The label map also holds adds still in flight, so it only says a
+  // conversion may be due; SVS's own count decides, under the lock.
+  if (GetLabelCount() < build_config_.training_threshold) return;
   // Conversion copies the index, so it excludes writers; searches are already
   // excluded by the mutation phase.
   absl::WriterMutexLock lock(&resize_mutex_);
@@ -1374,26 +1578,58 @@ void VectorSVS<T>::MaybeConvert() {
   ScopedSvsError err;
   size_t in_svs = 0;
   if (!svs_index_get_size(svs_index_, &in_svs, err.get()) ||
-      in_svs < build_config_.training_threshold) {
+      in_svs < build_config_.training_threshold ||
+      writes_before_retry_.load(std::memory_order_relaxed) > 0) {
     return;
   }
-  auto builder =
-      AssembleIndexBuilder(build_config_, this->distance_metric_, dimensions_,
-                           this->attribute_identifier_.c_str(), err.get());
+  // Running out of memory during the conversion aborts the process (the
+  // allocator can't fail softly), so an attempt that won't fit is skipped.
+  absl::Status status;
   svs_index_h converted = nullptr;
-  if (builder.ok()) {
-    svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
-    params.blocksize_bytes = build_config_.blocksize_bytes;
-    params.sync_kind = kSvsSyncKind;
-    converted = svs_index_convert_dynamic_ex(builder->get(), svs_index_,
-                                             &params, err.get());
+  size_t rows = in_svs;
+  svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+  if (svs_index_get_memory_breakdown(svs_index_, &breakdown, nullptr)) {
+    rows = SvsConversionRows(build_config_, dimensions_, in_svs,
+                             breakdown.data_bytes);
+  }
+  const uint64_t needed =
+      SvsConversionPeakBytes(build_config_, dimensions_, rows);
+  const std::optional<uint64_t> available = svs_available_memory.load()();
+  if (available.has_value() && needed > *available) {
+    status = absl::ResourceExhaustedError(
+        absl::StrCat("an estimated ", needed, " bytes are needed and ",
+                     *available, " are available"));
+  } else {
+    auto builder =
+        AssembleIndexBuilder(build_config_, this->distance_metric_, dimensions_,
+                             this->attribute_identifier_.c_str(), err.get());
+    if (builder.ok()) {
+      svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
+      params.blocksize_bytes = build_config_.blocksize_bytes;
+      params.sync_kind = kSvsSyncKind;
+      converted = svs_index_convert_dynamic_ex(builder->get(), svs_index_,
+                                               &params, err.get());
+      if (converted == nullptr) {
+        status = SvsErrorToStatus(err.get(), "index_convert_dynamic");
+      }
+    } else {
+      status = builder.status();
+    }
   }
   if (converted == nullptr) {
+    // Retry after 2, 4, 8, ... more writes, at most TRAINING_THRESHOLD, so a
+    // failure that persists doesn't repeat the conversion on every write.
     ++Metrics::GetStats().svs_conversion_failures_cnt;
+    conversion_failures_ = std::min(conversion_failures_ + 1, 30u);
+    const size_t backoff =
+        std::min<size_t>(size_t{1} << conversion_failures_,
+                         std::max<size_t>(build_config_.training_threshold, 1));
+    writes_before_retry_.store(static_cast<int64_t>(backoff),
+                               std::memory_order_relaxed);
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
-        << "SVS_VAMANA compression failed; the index stays uncompressed: "
-        << (builder.ok() ? SvsErrorToStatus(err.get(), "index_convert_dynamic")
-                         : builder.status());
+        << "SVS_VAMANA compression failed; the index stays uncompressed and "
+           "tries again after "
+        << backoff << " more writes: " << status;
     return;
   }
   svs_index_free(svs_index_);
