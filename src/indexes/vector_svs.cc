@@ -833,13 +833,14 @@ void FindCgroupMounts(const std::string& mountinfo_path,
 }
 
 // The tightest headroom among `path` and its ancestors, as `headroom` reads
-// each from its directory in the first of `mounts` that shows the cgroup (a
-// mount of a subtree shows the hierarchy from that subtree down). nullopt when
-// none does.
+// each from its directory, across the `mounts` that show the cgroup (a mount
+// of a subtree shows the hierarchy from that subtree down, so a broader mount
+// can show more ancestors). nullopt when none does.
 std::optional<uint64_t> WalkCgroup(
     const std::string& prefix, const std::vector<CgroupMount>& mounts,
     const std::string& path,
     absl::FunctionRef<std::optional<uint64_t>(const std::string&)> headroom) {
+  std::optional<uint64_t> tightest;
   for (const CgroupMount& mount : mounts) {
     std::string dir = path;
     if (mount.root != "/") {
@@ -859,9 +860,9 @@ std::optional<uint64_t> WalkCgroup(
       dir =
           slash == 0 || slash == std::string::npos ? "/" : dir.substr(0, slash);
     }
-    return available;
+    tightest = Smaller(tightest, available);
   }
-  return std::nullopt;
+  return tightest;
 }
 
 std::optional<uint64_t> CgroupAvailableBytes(const std::string& proc_dir,

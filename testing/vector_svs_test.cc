@@ -2920,6 +2920,23 @@ TEST_F(SvsAvailableMemoryTest, MountThatShowsTheCgroupIsUsed) {
   EXPECT_EQ(Read(), 600000u);
 }
 
+// A mount of the cgroup itself doesn't show its parent; a broader mount of the
+// same hierarchy does, and the parent's limit counts.
+TEST_F(SvsAvailableMemoryTest, BroaderMountShowsTighterAncestor) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/mountinfo",
+        "30 22 0:26 /parent/leaf /cgroup rw - cgroup2 cgroup rw\n"
+        "31 22 0:26 / /cgroup2 rw - cgroup2 cgroup rw\n");
+  Write("/proc/self/cgroup", "0::/parent/leaf\n");
+  Write("/cgroup/memory.max", "1000000\n");
+  Write("/cgroup/memory.current", "400000\n");
+  Write("/cgroup2/parent/leaf/memory.max", "1000000\n");
+  Write("/cgroup2/parent/leaf/memory.current", "400000\n");
+  Write("/cgroup2/parent/memory.max", "1000000\n");
+  Write("/cgroup2/parent/memory.current", "900000\n");
+  EXPECT_EQ(Read(), 100000u);
+}
+
 // Without a cgroup mount in mountinfo, the usual mount points are read.
 TEST_F(SvsAvailableMemoryTest, UsualMountPointsWithoutMountinfo) {
   Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
