@@ -212,8 +212,9 @@ class VectorSVS : public VectorType<T> {
   SVSBuildConfig StorageConfig() const;
   // Converts the index to build_config_'s compression once it holds
   // training_threshold vectors. SVS keeps the graph and calibrates the
-  // compression on every vector in the index. A failed conversion is logged,
-  // counted, and retried on the next add.
+  // compression on every vector in the index. Called after each write (add,
+  // update or delete). A failed or skipped conversion is logged, counted, and
+  // retried after 2, 4, 8, ... more writes, at most training_threshold.
   void MaybeConvert() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
   // SVS reuses deleted slots only after consolidating and compacting. Does
   // both once enough slots have been deleted, so update-heavy workloads stay

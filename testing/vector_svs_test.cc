@@ -2646,6 +2646,22 @@ TEST_P(VectorSVSConversionBackoffTest, UpdateOnlyIndexStillRetries) {
   EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(*index));
 }
 
+// Deletes are writes too: an index that only shrinks, still above the
+// threshold, retries after a skip once memory returns.
+TEST_P(VectorSVSConversionBackoffTest, DeleteOnlyIndexStillRetries) {
+  auto index = MakeIndex();
+  SetSvsAvailableMemoryForTesting(NoMemoryAvailable);
+  FillTo(*index, 0, kThreshold + 8);
+  ASSERT_TRUE(VectorSVSTestPeer::CompressionPending(*index));
+  SetSvsAvailableMemoryForTesting(nullptr);
+  for (size_t i = 0; i < 8 && VectorSVSTestPeer::CompressionPending(*index);
+       ++i) {
+    VMSDK_EXPECT_OK(
+        (*index).RemoveRecord(IndexToKey(i), DeletionType::kRecord));
+  }
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(*index));
+}
+
 uint64_t g_available_bytes = 0;
 std::optional<uint64_t> AvailableBytes() { return g_available_bytes; }
 
