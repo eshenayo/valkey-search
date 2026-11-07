@@ -2725,8 +2725,9 @@ TEST_F(VectorSVSTest, SystemAvailableMemoryIsRead) {
 }
 
 // Available memory from MemAvailable and cgroup limits, read from fake /proc
-// and cgroup trees: the tightest of MemAvailable, the cgroup v2 limits up the
-// hierarchy and the v1 limit, each net of reclaimable page cache.
+// and cgroup trees: the tightest of MemAvailable and the cgroup v2 and v1
+// limits up the hierarchy where mountinfo shows it, each net of reclaimable
+// page cache.
 class SvsAvailableMemoryTest : public testing::Test {
  protected:
   void SetUp() override {
@@ -2743,7 +2744,23 @@ class SvsAvailableMemoryTest : public testing::Test {
     std::ofstream(full) << content;
   }
   std::optional<uint64_t> Read() {
-    return SvsAvailableBytesFrom(root_ + "/proc", root_ + "/cgroup");
+    return SvsAvailableBytesFrom(root_ + "/proc", root_);
+  }
+  // /proc/self/mountinfo with the root file system and a cgroup mount of
+  // hierarchy path `root` at `mount_point` (under root_).
+  void Mount(absl::string_view root, absl::string_view mount_point,
+             absl::string_view fstype, absl::string_view options) {
+    Write("/proc/self/mountinfo",
+          absl::StrCat(
+              "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n",
+              "30 22 0:26 ", root, " ", mount_point, " rw,nosuid shared:4 - ",
+              fstype, " cgroup ", options, "\n"));
+  }
+  void MountV2(absl::string_view root = "/") {
+    Mount(root, "/cgroup", "cgroup2", "rw");
+  }
+  void MountV1Memory(absl::string_view root = "/") {
+    Mount(root, "/cgroup/memory", "cgroup", "rw,memory");
   }
   std::string root_;
 };
@@ -2757,6 +2774,7 @@ TEST_F(SvsAvailableMemoryTest, MemAvailableAlone) {
 
 TEST_F(SvsAvailableMemoryTest, CgroupV2LimitNetOfReclaimableCache) {
   Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  MountV2();
   Write("/proc/self/cgroup", "0::/a/b\n");
   Write("/cgroup/a/b/memory.max", "1000000\n");
   Write("/cgroup/a/b/memory.current", "600000\n");
@@ -2766,6 +2784,7 @@ TEST_F(SvsAvailableMemoryTest, CgroupV2LimitNetOfReclaimableCache) {
 
 TEST_F(SvsAvailableMemoryTest, CgroupV2UnlimitedLeafUnderLimitedParent) {
   Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  MountV2();
   Write("/proc/self/cgroup", "0::/a/b\n");
   Write("/cgroup/a/b/memory.max", "max\n");
   Write("/cgroup/a/b/memory.current", "1\n");
@@ -2776,6 +2795,7 @@ TEST_F(SvsAvailableMemoryTest, CgroupV2UnlimitedLeafUnderLimitedParent) {
 
 TEST_F(SvsAvailableMemoryTest, CgroupV1Limit) {
   Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  MountV1Memory();
   Write("/proc/self/cgroup", "5:cpu,cpuacct:/x\n4:memory:/docker/x\n");
   Write("/cgroup/memory/docker/x/memory.limit_in_bytes", "2000000\n");
   Write("/cgroup/memory/docker/x/memory.usage_in_bytes", "1500000\n");
@@ -2785,6 +2805,7 @@ TEST_F(SvsAvailableMemoryTest, CgroupV1Limit) {
 
 TEST_F(SvsAvailableMemoryTest, CgroupV1UnlimitedLeafUnderLimitedParent) {
   Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  MountV1Memory();
   Write("/proc/self/cgroup", "4:memory:/kubepods/pod/c\n");
   Write("/cgroup/memory/kubepods/pod/c/memory.limit_in_bytes",
         "9223372036854771712\n");
@@ -2800,6 +2821,7 @@ TEST_F(SvsAvailableMemoryTest, CgroupV1UnlimitedLeafUnderLimitedParent) {
 // children, not only this group's.
 TEST_F(SvsAvailableMemoryTest, CgroupV1ParentLimitCountsSiblings) {
   Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  MountV1Memory();
   Write("/proc/self/cgroup", "4:memory:/parent/leaf\n");
   Write("/cgroup/memory/parent/leaf/memory.limit_in_bytes",
         "9223372036854771712\n");
@@ -2811,10 +2833,100 @@ TEST_F(SvsAvailableMemoryTest, CgroupV1ParentLimitCountsSiblings) {
 
 TEST_F(SvsAvailableMemoryTest, CgroupV1Unlimited) {
   Write("/proc/meminfo", "MemAvailable:    1000 kB\n");
+  MountV1Memory();
   Write("/proc/self/cgroup", "4:memory:/\n");
   Write("/cgroup/memory/memory.limit_in_bytes", "9223372036854771712\n");
   Write("/cgroup/memory/memory.usage_in_bytes", "1\n");
   EXPECT_EQ(Read(), 1000u * 1024);
+}
+
+// A mount of a subtree (as in a container) shows the hierarchy from that
+// subtree down, so the cgroup's path is read relative to it.
+TEST_F(SvsAvailableMemoryTest, CgroupV2SubtreeMount) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  MountV2("/kubepods");
+  Write("/proc/self/cgroup", "0::/kubepods/pod/ctr\n");
+  Write("/cgroup/memory.max", "max\n");
+  Write("/cgroup/memory.current", "5000000\n");
+  Write("/cgroup/pod/ctr/memory.max", "1000000\n");
+  Write("/cgroup/pod/ctr/memory.current", "400000\n");
+  Write("/cgroup/pod/memory.max", "2000000\n");
+  Write("/cgroup/pod/memory.current", "1600000\n");
+  EXPECT_EQ(Read(), 400000u);
+}
+
+TEST_F(SvsAvailableMemoryTest, CgroupV1SubtreeMount) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  MountV1Memory("/docker/x");
+  Write("/proc/self/cgroup", "4:memory:/docker/x\n");
+  Write("/cgroup/memory/memory.limit_in_bytes", "2000000\n");
+  Write("/cgroup/memory/memory.usage_in_bytes", "500000\n");
+  EXPECT_EQ(Read(), 1500000u);
+}
+
+// The memory controller can share a v1 hierarchy, and its mount, with others.
+TEST_F(SvsAvailableMemoryTest, CgroupV1CoMountedControllers) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Mount("/", "/cgroup/cpu,memory", "cgroup", "rw,cpu,memory");
+  Write("/proc/self/cgroup", "4:cpu,memory:/x\n");
+  Write("/cgroup/cpu,memory/x/memory.limit_in_bytes", "2000000\n");
+  Write("/cgroup/cpu,memory/x/memory.usage_in_bytes", "500000\n");
+  EXPECT_EQ(Read(), 1500000u);
+}
+
+TEST_F(SvsAvailableMemoryTest, EscapedMountPoint) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Mount("/", "/cgroup\\040v2", "cgroup2", "rw");
+  Write("/proc/self/cgroup", "0::/a\n");
+  Write("/cgroup v2/a/memory.max", "1000000\n");
+  Write("/cgroup v2/a/memory.current", "400000\n");
+  EXPECT_EQ(Read(), 600000u);
+}
+
+// A cgroup outside the mounted subtree isn't visible; the mount's own files
+// belong to another group.
+TEST_F(SvsAvailableMemoryTest, CgroupOutsideTheMountIsSkipped) {
+  Write("/proc/meminfo", "MemAvailable:    1000 kB\n");
+  MountV2("/other");
+  Write("/proc/self/cgroup", "0::/a\n");
+  Write("/cgroup/memory.max", "1000\n");
+  Write("/cgroup/memory.current", "1000\n");
+  EXPECT_EQ(Read(), 1000u * 1024);
+}
+
+TEST_F(SvsAvailableMemoryTest, MountRootMatchesWholePathComponents) {
+  Write("/proc/meminfo", "MemAvailable:    1000 kB\n");
+  MountV2("/a");
+  Write("/proc/self/cgroup", "0::/ab\n");
+  Write("/cgroup/memory.max", "1000\n");
+  Write("/cgroup/memory.current", "1000\n");
+  Write("/cgroup/b/memory.max", "1000\n");
+  Write("/cgroup/b/memory.current", "1000\n");
+  EXPECT_EQ(Read(), 1000u * 1024);
+}
+
+// With several mounts of the hierarchy, the one that shows the cgroup is read.
+// Optional fields in mountinfo vary in number.
+TEST_F(SvsAvailableMemoryTest, MountThatShowsTheCgroupIsUsed) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/mountinfo",
+        "30 22 0:26 /other /cgroup rw - cgroup2 cgroup rw\n"
+        "31 22 0:26 / /cgroup2 rw shared:4 master:1 - cgroup2 cgroup rw\n");
+  Write("/proc/self/cgroup", "0::/a\n");
+  Write("/cgroup/memory.max", "1000\n");
+  Write("/cgroup/memory.current", "1000\n");
+  Write("/cgroup2/a/memory.max", "1000000\n");
+  Write("/cgroup2/a/memory.current", "400000\n");
+  EXPECT_EQ(Read(), 600000u);
+}
+
+// Without a cgroup mount in mountinfo, the usual mount points are read.
+TEST_F(SvsAvailableMemoryTest, UsualMountPointsWithoutMountinfo) {
+  Write("/proc/meminfo", "MemAvailable:    100000000 kB\n");
+  Write("/proc/self/cgroup", "0::/a\n");
+  Write("/sys/fs/cgroup/a/memory.max", "1000000\n");
+  Write("/sys/fs/cgroup/a/memory.current", "400000\n");
+  EXPECT_EQ(Read(), 600000u);
 }
 
 TEST_F(SvsAvailableMemoryTest, NothingReadable) {
@@ -2824,11 +2936,13 @@ TEST_F(SvsAvailableMemoryTest, NothingReadable) {
 // The estimate grows with what the converted index stores, and LeanVec's
 // includes its PCA working set (several times the FP32 vectors).
 TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
+  constexpr uint64_t kBlock = 1 << 20;
   auto estimate = [](data_model::SVSCompressionType compression) {
     SVSBuildConfig config;
     config.compression = compression;
     config.graph_max_degree = 32;
     config.leanvec_dims = 64;
+    config.blocksize_bytes = kBlock;
     return SvsConversionPeakBytes(config, 128, 10000);
   };
   const uint64_t fp32_bytes = 10000 * 128 * sizeof(float);
@@ -2838,6 +2952,10 @@ TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
             estimate(data_model::SVS_COMPRESSION_LVQ4X8));
   EXPECT_EQ(estimate(data_model::SVS_COMPRESSION_SQ8),
             estimate(data_model::SVS_COMPRESSION_LVQ8));
+  // Same bits per element, but the residual is a dataset of its own and
+  // gets its own block.
+  EXPECT_EQ(estimate(data_model::SVS_COMPRESSION_LVQ4X4),
+            estimate(data_model::SVS_COMPRESSION_LVQ8) + kBlock);
   EXPECT_GT(estimate(data_model::SVS_COMPRESSION_LEANVEC4X8),
             estimate(data_model::SVS_COMPRESSION_LVQ4X8) + 3 * fp32_bytes);
 }

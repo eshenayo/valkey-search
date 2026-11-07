@@ -23,10 +23,12 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/functional/function_ref.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
@@ -709,10 +711,11 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig& config, int dimensions,
   const uint64_t per_vector =
       (primary_dims * primary_bits + dims * second_bits + 7) / 8 + 16 +
       (uint64_t{config.graph_max_degree} + 1) * 4 + 40;
-  // Each dataset (data, graph, and LeanVec's second level) is allocated in
-  // blocks; allow one more block of each.
+  // Each dataset (data, graph, and the second level: LVQ's residual or
+  // LeanVec's full-dimension data) is allocated in blocks; allow one more
+  // block of each.
   uint64_t bytes =
-      vectors * per_vector + (leanvec ? 3 : 2) * config.blocksize_bytes;
+      vectors * per_vector + (second_bits > 0 ? 3 : 2) * config.blocksize_bytes;
   if (leanvec) {
     // PCA working set. Measured at about 3.3x the FP32 vectors (100k x 768);
     // 4x leaves a margin.
@@ -769,8 +772,103 @@ std::optional<uint64_t> Smaller(std::optional<uint64_t> a,
   return std::min(*a, *b);
 }
 
+// mountinfo writes a space, tab, newline or backslash in a path as \ooo.
+std::string UnescapeMountPath(absl::string_view path) {
+  auto octal = [](char c) { return c >= '0' && c <= '7'; };
+  std::string out;
+  for (size_t i = 0; i < path.size(); ++i) {
+    if (path[i] == '\\' && i + 3 < path.size() && octal(path[i + 1]) &&
+        octal(path[i + 2]) && octal(path[i + 3])) {
+      out.push_back(static_cast<char>((path[i + 1] - '0') * 64 +
+                                      (path[i + 2] - '0') * 8 +
+                                      (path[i + 3] - '0')));
+      i += 3;
+    } else {
+      out.push_back(path[i]);
+    }
+  }
+  return out;
+}
+
+// Where a cgroup hierarchy is mounted: the hierarchy path at the mount's root,
+// and the mount point.
+struct CgroupMount {
+  std::string root;
+  std::string mount_point;
+};
+
+// The cgroup v2 mounts and the v1 mounts with the memory controller (which may
+// share its hierarchy with other controllers), from mountinfo:
+// "id parent dev root mount-point options [optional...] - fstype source
+// super-options". Without any, the usual mount points.
+void FindCgroupMounts(const std::string& mountinfo_path,
+                      std::vector<CgroupMount>& v2,
+                      std::vector<CgroupMount>& v1_memory) {
+  std::ifstream mountinfo(mountinfo_path);
+  std::string line;
+  while (std::getline(mountinfo, line)) {
+    const std::vector<absl::string_view> fields =
+        absl::StrSplit(line, ' ', absl::SkipEmpty());
+    const auto separator = absl::c_find(fields, "-");
+    if (fields.size() < 5 || separator == fields.end() ||
+        fields.end() - separator < 4) {
+      continue;
+    }
+    const absl::string_view fstype = separator[1];
+    CgroupMount mount{UnescapeMountPath(fields[3]),
+                      UnescapeMountPath(fields[4])};
+    if (fstype == "cgroup2") {
+      v2.push_back(std::move(mount));
+    } else if (fstype == "cgroup" &&
+               absl::c_linear_search(std::vector<absl::string_view>(
+                                         absl::StrSplit(separator[3], ',')),
+                                     "memory")) {
+      v1_memory.push_back(std::move(mount));
+    }
+  }
+  if (v2.empty() && v1_memory.empty()) {
+    v2.push_back({"/", "/sys/fs/cgroup"});
+    v1_memory.push_back({"/", "/sys/fs/cgroup/memory"});
+  }
+}
+
+// The tightest headroom among `path` and its ancestors, as `headroom` reads
+// each from its directory in the first of `mounts` that shows the cgroup (a
+// mount of a subtree shows the hierarchy from that subtree down). nullopt when
+// none does.
+std::optional<uint64_t> WalkCgroup(
+    const std::string& prefix, const std::vector<CgroupMount>& mounts,
+    const std::string& path,
+    absl::FunctionRef<std::optional<uint64_t>(const std::string&)> headroom) {
+  for (const CgroupMount& mount : mounts) {
+    std::string dir = path;
+    if (mount.root != "/") {
+      if (path != mount.root && !absl::StartsWith(path, mount.root + "/")) {
+        continue;
+      }
+      dir = path.substr(mount.root.size());
+    }
+    std::optional<uint64_t> available;
+    while (true) {
+      available =
+          Smaller(available,
+                  headroom(prefix + mount.mount_point +
+                           (dir.empty() || dir == "/" ? std::string() : dir)));
+      if (dir.empty() || dir == "/") break;
+      const size_t slash = dir.rfind('/');
+      dir =
+          slash == 0 || slash == std::string::npos ? "/" : dir.substr(0, slash);
+    }
+    return available;
+  }
+  return std::nullopt;
+}
+
 std::optional<uint64_t> CgroupAvailableBytes(const std::string& proc_dir,
-                                             const std::string& cgroup_root) {
+                                             const std::string& prefix) {
+  std::vector<CgroupMount> v2;
+  std::vector<CgroupMount> v1_memory;
+  FindCgroupMounts(proc_dir + "/self/mountinfo", v2, v1_memory);
   std::ifstream self(proc_dir + "/self/cgroup");
   std::string line;
   std::optional<uint64_t> available;
@@ -779,48 +877,33 @@ std::optional<uint64_t> CgroupAvailableBytes(const std::string& proc_dir,
     const std::vector<std::string> parts =
         absl::StrSplit(line, absl::MaxSplits(':', 2));
     if (parts.size() != 3) continue;
-    const std::string& path = parts[2];
     if (parts[0] == "0" && parts[1].empty()) {
-      // v2: the tightest limit among this cgroup and its ancestors.
-      std::string dir = path;
-      while (true) {
-        const std::string base =
-            cgroup_root + (dir == "/" ? std::string() : dir);
-        available = Smaller(
-            available,
-            CgroupHeadroom(ReadUint(base + "/memory.max"),
-                           ReadUint(base + "/memory.current"),
-                           ReadStat(base + "/memory.stat", "inactive_file")));
-        if (dir.empty() || dir == "/") break;
-        const size_t slash = dir.rfind('/');
-        dir = slash == 0 || slash == std::string::npos ? "/"
-                                                       : dir.substr(0, slash);
-      }
+      // v2: each group's limit against its own usage.
+      available =
+          Smaller(available,
+                  WalkCgroup(prefix, v2, parts[2], [](const std::string& base) {
+                    return CgroupHeadroom(
+                        ReadUint(base + "/memory.max"),
+                        ReadUint(base + "/memory.current"),
+                        ReadStat(base + "/memory.stat", "inactive_file"));
+                  }));
     } else if (absl::c_linear_search(
                    std::vector<std::string>(absl::StrSplit(parts[1], ',')),
                    "memory")) {
-      // v1 memory controller: the tightest headroom among this group and its
-      // ancestors, each its own limit against its own usage (which includes
-      // its other children). An unlimited group reports a huge limit.
-      std::string dir = path;
-      while (true) {
-        const std::string base =
-            cgroup_root + "/memory" + (dir == "/" ? std::string() : dir);
-        std::optional<uint64_t> limit =
-            ReadUint(base + "/memory.limit_in_bytes");
-        if (limit.has_value() && *limit >= (uint64_t{1} << 62)) {
-          limit = std::nullopt;
-        }
-        available = Smaller(
-            available,
-            CgroupHeadroom(
+      // v1 memory controller: likewise, where a group's usage includes its
+      // other children. An unlimited group reports a huge limit.
+      available = Smaller(
+          available,
+          WalkCgroup(prefix, v1_memory, parts[2], [](const std::string& base) {
+            std::optional<uint64_t> limit =
+                ReadUint(base + "/memory.limit_in_bytes");
+            if (limit.has_value() && *limit >= (uint64_t{1} << 62)) {
+              limit = std::nullopt;
+            }
+            return CgroupHeadroom(
                 limit, ReadUint(base + "/memory.usage_in_bytes"),
-                ReadStat(base + "/memory.stat", "total_inactive_file")));
-        if (dir.empty() || dir == "/") break;
-        const size_t slash = dir.rfind('/');
-        dir = slash == 0 || slash == std::string::npos ? "/"
-                                                       : dir.substr(0, slash);
-      }
+                ReadStat(base + "/memory.stat", "total_inactive_file"));
+          }));
     }
   }
   return available;
@@ -828,7 +911,7 @@ std::optional<uint64_t> CgroupAvailableBytes(const std::string& proc_dir,
 }  // namespace
 
 std::optional<uint64_t> SvsAvailableBytesFrom(const std::string& proc_dir,
-                                              const std::string& cgroup_root) {
+                                              const std::string& prefix) {
   std::optional<uint64_t> available;
   std::ifstream meminfo(proc_dir + "/meminfo");
   std::string line;
@@ -843,11 +926,11 @@ std::optional<uint64_t> SvsAvailableBytesFrom(const std::string& proc_dir,
       break;
     }
   }
-  return Smaller(available, CgroupAvailableBytes(proc_dir, cgroup_root));
+  return Smaller(available, CgroupAvailableBytes(proc_dir, prefix));
 }
 
 std::optional<uint64_t> SvsSystemAvailableBytes() {
-  return SvsAvailableBytesFrom("/proc", "/sys/fs/cgroup");
+  return SvsAvailableBytesFrom("/proc", "");
 }
 
 namespace {
