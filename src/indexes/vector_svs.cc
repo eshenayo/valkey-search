@@ -1487,6 +1487,8 @@ absl::Status VectorSVS<T>::RemoveRecordImpl(uint64_t internal_id) {
     label_to_record_.erase(internal_id);
   }
   MaybeConsolidate();
+  // A delete is a write too: it advances a backed-off conversion.
+  if (svs_status.ok()) MaybeConvert();
   return svs_status;
 #else
   (void)internal_id;
