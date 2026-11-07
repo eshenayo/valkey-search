@@ -96,11 +96,11 @@ size_t SvsConversionRows(const SVSBuildConfig &config, int dimensions,
 // MemAvailable, and each cgroup v1/v2 memory limit up the hierarchy minus its
 // non-reclaimable usage; nullopt when unknown. An estimate, not a guarantee.
 // Conversions check it; tests replace the source, and nullptr restores
-// SvsSystemAvailableBytes. SvsAvailableBytesFrom reads from the given /proc
-// and cgroup mount directories.
+// SvsSystemAvailableBytes. SvsAvailableBytesFrom reads the given /proc, and
+// the cgroup mounts its mountinfo lists under `prefix`.
 std::optional<uint64_t> SvsSystemAvailableBytes();
 std::optional<uint64_t> SvsAvailableBytesFrom(const std::string &proc_dir,
-                                              const std::string &cgroup_root);
+                                              const std::string &prefix);
 using SvsAvailableMemoryFn = std::optional<uint64_t> (*)();
 void SetSvsAvailableMemoryForTesting(SvsAvailableMemoryFn fn);
 
