@@ -460,6 +460,71 @@ TEST_F(VectorSVSThreadpoolTest, ConcurrentAddsAndRemovesStayConsistent) {
   }
 }
 
+// Every writer deletes one of its keys and inserts a new one, round after
+// round, so inserts take deleted slots while other writers add to the
+// deleted set. A slot handed out twice would lose a key.
+TEST_F(VectorSVSThreadpoolTest, ConcurrentDeleteInsertChurnReusesEachSlotOnce) {
+  constexpr int kRounds = 20;
+  static_assert(kRounds <= kPerWriter);
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  ASSERT_TRUE(index.ok());
+  const int added_base = kConcurrentVectors;
+  auto vectors = DeterministicallyGenerateVectors(
+      kConcurrentVectors + kWriters * kRounds, kDimensions, 10.0);
+  for (int i = 0; i < kConcurrentVectors; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  std::vector<PreparedRecord> records;
+  for (int i = added_base; i < added_base + kWriters * kRounds; ++i) {
+    records.push_back(PrepareRecord(**index, i, vectors[i]));
+  }
+  auto statuses = RunWriters(kWriters, [&](int w) -> absl::Status {
+    for (int r = 0; r < kRounds; ++r) {
+      const int removed_id = w * kPerWriter + r;
+      auto removed =
+          (*index)->RemoveRecord(IndexToKey(removed_id), DeletionType::kRecord);
+      if (!removed.ok()) return removed.status();
+      auto &record = records[w * kRounds + r];
+      auto added = (*index)->AddRecord(record.key, std::move(record.data));
+      if (!added.ok()) return added.status();
+    }
+    return absl::OkStatus();
+  });
+  for (const auto &status : statuses) VMSDK_EXPECT_OK(status);
+
+  std::vector<int> live_ids;
+  for (int w = 0; w < kWriters; ++w) {
+    for (int i = w * kPerWriter + kRounds; i < (w + 1) * kPerWriter; ++i) {
+      live_ids.push_back(i);
+    }
+  }
+  for (int i = added_base; i < added_base + kWriters * kRounds; ++i) {
+    live_ids.push_back(i);
+  }
+  EXPECT_EQ(AsBase(*index)->GetLabelCount(), live_ids.size());
+  size_t in_svs = 0;
+  ASSERT_TRUE(svs_index_get_size(VectorSVSTestPeer::Handle(**index), &in_svs,
+                                 nullptr));
+  EXPECT_EQ(in_svs, live_ids.size());
+  ExpectEachIsItsOwnNearest(**index, live_ids, vectors, live_ids.size());
+  for (int w = 0; w < kWriters; ++w) {
+    for (int r = 0; r < kRounds; ++r) {
+      const int removed_id = w * kPerWriter + r;
+      auto result =
+          (*index)->Search(VectorToStr(vectors[removed_id]), 1, CancelNever(),
+                           nullptr, /*ef_runtime=*/live_ids.size());
+      ASSERT_TRUE(result.ok()) << result.status();
+      ASSERT_EQ(result->size(), 1u);
+      EXPECT_NE((*result)[0].external_id, IndexToKey(removed_id))
+          << "id " << removed_id;
+    }
+  }
+}
+
 TEST_F(VectorSVSThreadpoolTest,
        EightWritersModifyConcurrentlyAndEveryIdIsFound) {
   auto index = VectorSVS<float>::Create(

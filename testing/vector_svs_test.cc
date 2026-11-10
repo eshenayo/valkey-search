@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -26,6 +27,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "absl/algorithm/container.h"
@@ -83,6 +85,11 @@ class VectorSVSTestPeer {
       ABSL_NO_THREAD_SAFETY_ANALYSIS {
     absl::ReaderMutexLock lock(&index.label_mutex_);
     return index.deleted_ids_.size();
+  }
+  static void PushDeletedId(VectorSVS<float> &index, uint64_t id)
+      ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    absl::MutexLock lock(&index.label_mutex_);
+    index.deleted_ids_.push_back(id);
   }
   static bool CompressionPending(const VectorSVS<float> &index) {
     return index.compression_pending_.load();
@@ -1280,6 +1287,54 @@ TEST_F(VectorSVSTest, RestoredIndexModifiesByDeleteAndAdd) {
   ValkeyModule_FreeString(nullptr, records[0]);
 }
 
+// A restored index's deletes drop their ids in SVS (its stream load is not
+// FINE_GRAIN), so its inserts add new slots and the deleted ids stay counted
+// for consolidation.
+TEST_F(VectorSVSTest, RestoredIndexInsertsDontReuseSlots) {
+  FakeSafeRDB rdb;
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto built = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(built);
+  auto vectors = DeterministicallyGenerateVectors(3, kDimensions, 2.0);
+  std::vector<ValkeyModuleString *> records(2);
+  for (size_t i = 0; i < 2; ++i) {
+    records[i] = ValkeyModule_CreateString(
+        nullptr, (const char *)vectors[i].data(), kDimensions * sizeof(float));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**built, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  VMSDK_EXPECT_OK((*built)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*built)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto restored = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(restored);
+  VMSDK_EXPECT_OK(
+      (*restored)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                   SupplementalContentChunkIter(&rdb)));
+  ASSERT_TRUE(VectorSVSTestPeer::MutationsExclusive(**restored));
+
+  VMSDK_EXPECT_OK(
+      (*restored)->RemoveRecord(IndexToKey(0), indexes::DeletionType::kRecord));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**restored), 1u);
+  PreparedRecord record = PrepareRecord(**restored, 2, vectors[2]);
+  VMSDK_EXPECT_OK((*restored)->AddRecord(record.key, std::move(record.data)));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**restored), 1u);
+  EXPECT_EQ(AsBase(*restored)->GetLabelCount(), 2u);
+  for (size_t i : {1, 2}) {
+    auto result =
+        (*restored)->Search(VectorToStr(vectors[i]), 1, CancelNever());
+    VMSDK_EXPECT_OK(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ((*result)[0].external_id, IndexToKey(i));
+  }
+  for (auto *r : records) ValkeyModule_FreeString(nullptr, r);
+}
+
 // A modify whose update SVS rejects is counted and leaves the index
 // consistent: the base class drops the key from the map and SVS. The failure
 // is forced by removing the id from SVS behind the module's back.
@@ -1341,6 +1396,67 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   VMSDK_EXPECT_OK(result);
   ASSERT_EQ(result->size(), 1u);
   EXPECT_EQ((*result)[0].external_id, IndexToKey(0));
+}
+
+bool SvsHasId(const VectorSVS<float> &index, uint64_t id) {
+  bool has = false;
+  EXPECT_TRUE(svs_index_dynamic_has_id(VectorSVSTestPeer::Handle(index), id,
+                                       &has, nullptr));
+  return has;
+}
+
+// An id SVS no longer holds (here one it never held) fails the update; the
+// insert drops it, counts the failure and adds a new slot instead.
+TEST_F(VectorSVSTest, InsertFallsBackWhenSvsRejectsTheDeletedId) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(2, kDimensions, 2.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  VectorSVSTestPeer::PushDeletedId(**index, 9999);
+  const uint64_t before = Metrics::GetStats().svs_add_exceptions_cnt;
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(1),
+                                                 VectorToStr(vectors[1])));
+  EXPECT_EQ(Metrics::GetStats().svs_add_exceptions_cnt, before + 1);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+  EXPECT_TRUE(SvsHasId(**index, 1));
+  EXPECT_FALSE(SvsHasId(**index, 9999));
+}
+
+// If SVS revives a deleted slot but won't relabel it, the slot is deleted
+// again and its id goes back to the set: nothing is lost or handed out twice.
+// The rename is forced to fail by adding an id SVS already holds.
+TEST_F(VectorSVSTest, FailedRelabelReturnsTheSlotToTheSet) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(3, kDimensions, 2.0);
+  for (size_t i = 0; i < 2; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  VMSDK_EXPECT_OK(
+      (*index)->RemoveRecord(IndexToKey(0), indexes::DeletionType::kRecord));
+  ASSERT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 1u);
+  const uint64_t before = Metrics::GetStats().svs_add_exceptions_cnt;
+  // Id 1 is live: the relabel fails, then add_points rejects the duplicate.
+  EXPECT_FALSE(VectorSVSTestPeer::AddPoint(**index, 1, vectors[2].data()).ok());
+  EXPECT_EQ(Metrics::GetStats().svs_add_exceptions_cnt, before + 2);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 1u);
+  EXPECT_FALSE(SvsHasId(**index, 0));
+  size_t in_svs = 0;
+  ASSERT_TRUE(svs_index_get_size(VectorSVSTestPeer::Handle(**index), &in_svs,
+                                 nullptr));
+  EXPECT_EQ(in_svs, 1u);
+  // The slot is still reusable.
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(2),
+                                                 VectorToStr(vectors[2])));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
 }
 
 // Each delete adds its id to the deleted set; a save consolidates the index in
@@ -1537,6 +1653,128 @@ std::vector<std::vector<float>> RandomVectors(size_t count, int dimensions) {
   return vectors;
 }
 
+class VectorSVSReuseTest
+    : public VectorSVSTest,
+      public testing::WithParamInterface<
+          std::tuple<data_model::DistanceMetric, data_model::SVSCompressionType>> {
+};
+
+// Inserts write into deleted slots: each round deletes kDeletes keys and
+// inserts as many new ones, and the inserts take every deleted slot, so the
+// index never grows. Deleted keys and the reused slots' old ids are never
+// found again. An SQ8 index converts during the first fill, so reuse also
+// runs on the converted index. Only L2 / NONE runs long enough for the memory
+// check (2,000 inserts); the other cases keep the sanitizer suites in time.
+TEST_P(VectorSVSReuseTest, InsertsReuseDeletedSlots) {
+  const auto [metric, compression] = GetParam();
+  constexpr size_t kKeys = 100;
+  constexpr size_t kDeletes = 40;
+  const bool check_memory = metric == data_model::DISTANCE_METRIC_L2 &&
+                            compression == data_model::SVS_COMPRESSION_NONE;
+  const size_t kRounds = check_memory ? 50 : 5;  // 50: many storage blocks
+  auto proto = compression == data_model::SVS_COMPRESSION_SQ8
+                   ? Sq8Proto(kDimensions, metric, kKeys / 2)
+                   : CreateSVSVectorIndexProto(kDimensions, metric, compression);
+  proto.set_initial_cap(16);  // smallest SVS blocks, so growth would show
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = RandomVectors(kKeys + kDeletes * kRounds, kDimensions);
+  std::deque<size_t> live;
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+    live.push_back(i);
+  }
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
+  const size_t memory_after_fill = SvsMemoryUsage(**index);
+  std::vector<size_t> removed;
+  size_t next = kKeys;
+  for (size_t round = 0; round < kRounds; ++round) {
+    for (size_t d = 0; d < kDeletes; ++d) {
+      // A key's internal id is its number: keys are added in order.
+      const size_t id = live.front();
+      live.pop_front();
+      VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(id),
+                                             indexes::DeletionType::kRecord));
+      removed.push_back(id);
+    }
+    EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kDeletes);
+    for (size_t a = 0; a < kDeletes; ++a, ++next) {
+      VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
+          **index, IndexToKey(next), VectorToStr(vectors[next])));
+      live.push_back(next);
+    }
+    ASSERT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u)
+        << "round " << round << ": an insert didn't reuse a deleted slot";
+  }
+  // Reuse adds no slots; a new slot per insert would add 2,000 here. SVS's
+  // update bookkeeping and reverse-edge lists grow a little
+  // (intel/ScalableVectorSearch#469).
+  if (check_memory) {
+    EXPECT_LT(SvsMemoryUsage(**index) - memory_after_fill, 64 * 1024u)
+        << "SVS grew under churn at a constant live count";
+  }
+  size_t in_svs = 0;
+  ASSERT_TRUE(svs_index_get_size(VectorSVSTestPeer::Handle(**index), &in_svs,
+                                 nullptr));
+  EXPECT_EQ(in_svs, kKeys);
+  for (size_t id : removed) {
+    EXPECT_FALSE(SvsHasId(**index, id)) << "id " << id;
+  }
+  // The exact best live match for `query` (the vector itself under L2 and
+  // COSINE; under IP a longer vector can score higher).
+  auto best_live = [&, metric = metric](const std::vector<float> &query) {
+    auto score = [&](const std::vector<float> &v) {
+      double dot = 0, l2 = 0, qq = 0, vv = 0;
+      for (int d = 0; d < kDimensions; ++d) {
+        dot += query[d] * v[d];
+        l2 += (query[d] - v[d]) * (query[d] - v[d]);
+        qq += query[d] * query[d];
+        vv += v[d] * v[d];
+      }
+      if (metric == data_model::DISTANCE_METRIC_L2) return -l2;
+      if (metric == data_model::DISTANCE_METRIC_IP) return dot;
+      return dot / std::sqrt(qq * vv);
+    };
+    return *std::max_element(live.begin(), live.end(), [&](size_t a, size_t b) {
+      return score(vectors[a]) < score(vectors[b]);
+    });
+  };
+  for (size_t id : live) {
+    EXPECT_TRUE(SvsHasId(**index, id)) << "id " << id;
+    auto result = (*index)->Search(VectorToStr(vectors[id]), 1, CancelNever(),
+                                   nullptr, /*ef_runtime=*/kKeys);
+    VMSDK_EXPECT_OK(result);
+    ASSERT_EQ(result->size(), 1u);
+    if (compression != data_model::SVS_COMPRESSION_SQ8) {
+      EXPECT_EQ((*result)[0].external_id, IndexToKey(best_live(vectors[id])))
+          << "id " << id;
+    }
+  }
+  for (size_t id : removed) {
+    auto result = (*index)->Search(VectorToStr(vectors[id]), 1, CancelNever(),
+                                   nullptr, /*ef_runtime=*/kKeys);
+    VMSDK_EXPECT_OK(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_NE((*result)[0].external_id, IndexToKey(id)) << "id " << id;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MetricsAndCompressions, VectorSVSReuseTest,
+    testing::Combine(testing::Values(data_model::DISTANCE_METRIC_L2,
+                                     data_model::DISTANCE_METRIC_IP,
+                                     data_model::DISTANCE_METRIC_COSINE),
+                     testing::Values(data_model::SVS_COMPRESSION_NONE,
+                                     data_model::SVS_COMPRESSION_FP16,
+                                     data_model::SVS_COMPRESSION_SQ8)),
+    [](const auto &info) {
+      return absl::StrCat(
+          data_model::DistanceMetric_Name(std::get<0>(info.param)), "_",
+          data_model::SVSCompressionType_Name(std::get<1>(info.param)));
+    });
+
 AttributeData VectorData(VectorBase &index, int i,
                          const std::vector<float> &vector) {
   return std::move(PrepareRecord(index, i, vector).data);
@@ -1701,6 +1939,65 @@ TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
   for (auto *record : records) {
     ValkeyModule_FreeString(nullptr, record);
   }
+}
+
+// A restored SQ8 index still pending conversion is not FINE_GRAIN, so its
+// deletes drop their ids in SVS. Converting makes it FINE_GRAIN; the ids
+// deleted before then can't be reused and leave the set, and later deletes
+// are reused.
+TEST_P(VectorSVSSq8MetricTest, ConvertingARestoredIndexDropsUnreusableIds) {
+  constexpr uint32_t kThreshold = 10;
+  constexpr size_t kStaged = 5;
+  auto proto = Sq8Proto(kDimensions, GetParam(), kThreshold);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = RandomVectors(kThreshold + 3, kDimensions);
+  std::vector<ValkeyModuleString *> records(kStaged);
+  for (size_t i = 0; i < kStaged; ++i) {
+    records[i] = ValkeyModule_CreateString(
+        nullptr, (const char *)vectors[i].data(), kDimensions * sizeof(float));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*index)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(loaded);
+  VMSDK_EXPECT_OK(
+      (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                 SupplementalContentChunkIter(&rdb)));
+  ASSERT_TRUE(VectorSVSTestPeer::MutationsExclusive(**loaded));
+
+  VMSDK_EXPECT_OK(
+      (*loaded)->RemoveRecord(IndexToKey(0), indexes::DeletionType::kRecord));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**loaded), 1u);
+  // Reach the threshold: 4 staged keys live, plus 6 more.
+  for (size_t i = kStaged; i < kThreshold + 1; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**loaded, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  ASSERT_FALSE(VectorSVSTestPeer::CompressionPending(**loaded));
+  EXPECT_FALSE(VectorSVSTestPeer::MutationsExclusive(**loaded));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**loaded), 0u);
+
+  VMSDK_EXPECT_OK(
+      (*loaded)->RemoveRecord(IndexToKey(1), indexes::DeletionType::kRecord));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**loaded), 1u);
+  const size_t next = kThreshold + 1;
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**loaded, IndexToKey(next),
+                                                 VectorToStr(vectors[next])));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**loaded), 0u);
+  auto result =
+      (*loaded)->Search(VectorToStr(vectors[next]), 1, CancelNever());
+  VMSDK_EXPECT_OK(result);
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_EQ((*result)[0].external_id, IndexToKey(next));
+  for (auto *r : records) ValkeyModule_FreeString(nullptr, r);
 }
 
 INSTANTIATE_TEST_SUITE_P(

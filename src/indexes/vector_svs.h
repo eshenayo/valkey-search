@@ -180,6 +180,12 @@ class VectorSVS : public VectorType<T> {
       ABSL_LOCKS_EXCLUDED(resize_mutex_);
   absl::Status AddPoint(uint64_t internal_id, const float *fp32)
       ABSL_SHARED_LOCKS_REQUIRED(resize_mutex_);
+  // Writes the vector into a deleted slot and relabels it to `internal_id`.
+  // False when there is no deleted slot or SVS rejects the reuse; the caller
+  // then adds a new slot.
+  bool ReuseDeletedSlot(uint64_t internal_id, const float *fp32)
+      ABSL_SHARED_LOCKS_REQUIRED(resize_mutex_)
+          ABSL_LOCKS_EXCLUDED(label_mutex_);
   // The configuration of the storage svs_index_ uses now: build_config_, or
   // its uncompressed form while compression_pending_.
   SVSBuildConfig StorageConfig() const;
@@ -232,7 +238,8 @@ class VectorSVS : public VectorType<T> {
       ABSL_GUARDED_BY(label_mutex_);
   // Ids deleted in SVS whose slots consolidation hasn't reclaimed yet. Its
   // size triggers consolidation; consolidation and saves (which consolidate)
-  // clear it.
+  // clear it. On a FINE_GRAIN index SVS keeps a deleted id until
+  // consolidation, so inserts take ids from here to reuse their slots.
   mutable std::vector<uint64_t> deleted_ids_ ABSL_GUARDED_BY(label_mutex_);
 
   friend class VectorSVSTestPeer;

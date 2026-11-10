@@ -1188,9 +1188,12 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
 
   bool replaced = false;
   {
-    const bool exclusive = mutations_exclusive_.load(std::memory_order_acquire);
-    SvsMutationLock lock(&resize_mutex_, exclusive);
-    if (svs_index_ != nullptr && !exclusive) {
+    SvsMutationLock lock(&resize_mutex_,
+                         mutations_exclusive_.load(std::memory_order_acquire));
+    // Re-read under the lock: a conversion may have made the index FINE_GRAIN
+    // while this writer waited for the exclusive side.
+    if (svs_index_ != nullptr &&
+        !mutations_exclusive_.load(std::memory_order_acquire)) {
       ScopedSvsError err;
       if (!svs_index_dynamic_update_points(svs_index_, fp32, &internal_id,
                                            /*num_points=*/1, err.get())) {
@@ -1372,12 +1375,22 @@ void VectorSVS<T>::MaybeConvert() {
   svs_index_ = converted;
   ++Metrics::GetStats().svs_conversions_cnt;
   compression_pending_.store(false, std::memory_order_release);
+  if (mutations_exclusive_.load(std::memory_order_relaxed)) {
+    // A non-FINE_GRAIN index dropped each id as it was deleted, so none of
+    // these slots can be reused; consolidation or a save reclaims them.
+    absl::MutexLock map_lock(&label_mutex_);
+    deleted_ids_.clear();
+  }
   // The converted index is built with kSvsSyncKind, even after an RDB load.
   mutations_exclusive_.store(false, std::memory_order_release);
 }
 
 template <typename T>
 absl::Status VectorSVS<T>::AddPoint(uint64_t internal_id, const float* fp32) {
+  if (!mutations_exclusive_.load(std::memory_order_acquire) &&
+      ReuseDeletedSlot(internal_id, fp32)) {
+    return absl::OkStatus();
+  }
   ScopedSvsError err;
   size_t added = 0;
   if (!svs_index_dynamic_add_points(svs_index_, fp32, &internal_id,
@@ -1386,6 +1399,47 @@ absl::Status VectorSVS<T>::AddPoint(uint64_t internal_id, const float* fp32) {
     return SvsErrorToStatus(err.get(), "index_dynamic_add_points");
   }
   return absl::OkStatus();
+}
+
+template <typename T>
+bool VectorSVS<T>::ReuseDeletedSlot(uint64_t internal_id, const float* fp32) {
+  size_t slot_id = 0;
+  {
+    absl::MutexLock map_lock(&label_mutex_);
+    if (deleted_ids_.empty()) return false;
+    slot_id = deleted_ids_.back();
+    deleted_ids_.pop_back();
+  }
+  // SVS renames only a live id, so revive the slot under its old id first.
+  // The id is live but unmapped only until the rename; searches can't see
+  // that gap (mutation phase).
+  ScopedSvsError err;
+  if (!svs_index_dynamic_update_points(svs_index_, fp32, &slot_id,
+                                       /*num_points=*/1, err.get())) {
+    // The slot is in an unknown state; drop its id rather than reuse it.
+    ++Metrics::GetStats().svs_add_exceptions_cnt;
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
+        << "SVS_VAMANA slot reuse failed: "
+        << SvsErrorToStatus(err.get(), "index_dynamic_update_points");
+    return false;
+  }
+  if (svs_index_dynamic_replace_id(svs_index_, slot_id, internal_id,
+                                   err.get())) {
+    return true;
+  }
+  ++Metrics::GetStats().svs_add_exceptions_cnt;
+  VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
+      << "SVS_VAMANA slot reuse failed: "
+      << SvsErrorToStatus(err.get(), "index_dynamic_replace_id");
+  // The slot is live under its old id; delete it again so it is reusable.
+  size_t deleted = 0;
+  if (svs_index_dynamic_delete_points(svs_index_, &slot_id, /*num_ids=*/1,
+                                      &deleted, err.get()) &&
+      deleted > 0) {
+    absl::MutexLock map_lock(&label_mutex_);
+    deleted_ids_.push_back(slot_id);
+  }
+  return false;
 }
 #endif  // __linux__ && __x86_64__
 
