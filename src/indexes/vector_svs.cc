@@ -1128,19 +1128,18 @@ absl::Status VectorSVS<T>::RemoveRecordImpl(uint64_t internal_id) {
     }
   }
   absl::Status svs_status = absl::OkStatus();
+  size_t deleted = 0;
   {
     SvsMutationLock lock(&resize_mutex_,
                          mutations_exclusive_.load(std::memory_order_acquire));
     if (svs_index_ != nullptr) {
       ScopedSvsError err;
-      size_t deleted = 0;
       if (!svs_index_dynamic_delete_points(svs_index_, &internal_id,
                                            /*num_vectors=*/1, &deleted,
                                            err.get())) {
         ++Metrics::GetStats().svs_remove_exceptions_cnt;
         svs_status = SvsErrorToStatus(err.get(), "index_dynamic_delete_points");
       }
-      deleted_since_consolidate_.fetch_add(deleted, std::memory_order_relaxed);
     }
   }
   // Test hook: SVS no longer holds the id, the map still does. No lock is
@@ -1155,6 +1154,7 @@ absl::Status VectorSVS<T>::RemoveRecordImpl(uint64_t internal_id) {
   {
     absl::MutexLock map_lock(&label_mutex_);
     label_to_record_.erase(internal_id);
+    if (deleted > 0) deleted_ids_.push_back(internal_id);
   }
   MaybeConsolidate();
   return svs_status;
@@ -1199,7 +1199,10 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
         return SvsErrorToStatus(err.get(),
                                 "modify: index_dynamic_delete_points");
       }
-      deleted_since_consolidate_.fetch_add(deleted, std::memory_order_relaxed);
+      if (deleted > 0) {
+        absl::MutexLock map_lock(&label_mutex_);
+        deleted_ids_.push_back(internal_id);
+      }
       size_t added = 0;
       if (!svs_index_dynamic_add_points(svs_index_, fp32, &internal_id,
                                         /*num_vectors=*/1, &added, err.get())) {
@@ -1263,10 +1266,11 @@ absl::Status VectorSVS<T>::InsertVector(uint64_t internal_id,
 
 template <typename T>
 void VectorSVS<T>::MaybeConsolidate() {
-  const size_t live = GetLabelCount();
-  auto due = [this, live]() {
-    return deleted_since_consolidate_.load(std::memory_order_relaxed) >=
-           std::max(kConsolidateMinDeleted, live / kConsolidateLiveDivisor);
+  auto due = [this]() {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    return deleted_ids_.size() >=
+           std::max(kConsolidateMinDeleted,
+                    label_to_record_.size() / kConsolidateLiveDivisor);
   };
   if (!due()) return;
   // Consolidation rewrites graph edges, so it excludes the other writers;
@@ -1280,6 +1284,11 @@ void VectorSVS<T>::MaybeConsolidate() {
         << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
     return;
   }
+  // Consolidation reclaimed every deleted slot and dropped their ids.
+  {
+    absl::MutexLock map_lock(&label_mutex_);
+    deleted_ids_.clear();
+  }
   // The C API's add_points only fills slots past the last compaction, so the
   // slots consolidate freed are reused only after compacting. SVS can't
   // compact an index with no live entries.
@@ -1290,9 +1299,7 @@ void VectorSVS<T>::MaybeConsolidate() {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA compact failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_compact");
-    return;
   }
-  deleted_since_consolidate_.store(0, std::memory_order_relaxed);
 }
 
 template <typename T>
@@ -1502,7 +1509,8 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
     return SvsErrorToStatus(err.get(), "index_save_stream");
   }
   // The save consolidated and compacted the index.
-  deleted_since_consolidate_.store(0, std::memory_order_relaxed);
+  absl::MutexLock map_lock(&label_mutex_);
+  deleted_ids_.clear();
   return absl::OkStatus();
 #else
   (void)chunked_out;
