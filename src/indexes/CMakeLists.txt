@@ -144,6 +144,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
         ${SVS_C_API_DIR}/src/svs_c.cpp
         ${SVS_C_API_DIR}/src/dispatcher_vamana.cpp
         ${SVS_C_API_DIR}/src/dispatcher_dynamic_vamana.cpp
+        ${SVS_C_API_DIR}/src/dispatcher_concurrent_vamana.cpp
         ${SVS_C_API_DIR}/src/index_builder.cpp
         ${SVS_C_API_DIR}/src/index_vamana.cpp
         ${SVS_C_API_DIR}/src/leanvec_training_data.cpp
@@ -154,6 +155,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
         ${CMAKE_BINARY_DIR}/third_party/svs-c-api-build/include)
     target_include_directories(svs_c_api_static PRIVATE ${SVS_C_API_DIR}/src)
     target_compile_options(svs_c_api_static PRIVATE -fvisibility=hidden)
+    # SVS's concurrent index uses std::atomic_thread_fence (seqlock), which
+    # GCC flags under -fsanitize=thread; keep it a warning, not an error.
+    target_compile_options(svs_c_api_static
+                           PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-error=tsan>)
     get_target_property(_svs_c_api_opts svs_c_api_static COMPILE_OPTIONS)
     list(REMOVE_ITEM _svs_c_api_opts -fopenmp)
     set_target_properties(svs_c_api_static PROPERTIES

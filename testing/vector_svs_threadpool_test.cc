@@ -278,11 +278,9 @@ TEST_F(VectorSVSThreadpoolTest, BootstrapBuildsWithFineGrainSyncKind) {
 
 // -- (f) concurrent writers ---------------------------------------------------
 //
-// At the pinned SVS revision SVS_SYNC_KIND_FINE_GRAIN is an alias of GLOBAL:
-// SVS serializes writers on one lock inside the index. These tests therefore
-// exercise the module's label map, slot reservation and first-build paths
-// under concurrency, not parallel SVS mutation; they become that acceptance
-// when upstream implements FINE_GRAIN.
+// SVS_SYNC_KIND_FINE_GRAIN backs the handle with SVS's concurrent index, so
+// these tests exercise parallel SVS mutation together with the module's label
+// map, slot reservation and first-build paths.
 
 // Records are built on the test thread (VectorRegistry is not thread-safe).
 struct PreparedRecord {
