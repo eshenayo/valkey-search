@@ -226,13 +226,16 @@ class VectorSVS : public VectorType<T> {
   // this build may not know all their fields (e.g. ones only another build
   // defines), and its saves must pass them on unchanged.
   data_model::SVSVamanaAlgorithm unavailable_settings_;
-  // Slots deleted in SVS since the last consolidation (or save, which also
-  // consolidates).
-  mutable std::atomic<size_t> deleted_since_consolidate_{0};
   SVSBuildConfig build_config_;
   mutable absl::Mutex label_mutex_ ABSL_ACQUIRED_AFTER(resize_mutex_);
   mutable absl::node_hash_map<uint64_t, VectorRecord> label_to_record_
       ABSL_GUARDED_BY(label_mutex_);
+  // Ids deleted in SVS whose slots consolidation hasn't reclaimed yet, one
+  // entry per deleted slot. Its size triggers consolidation; consolidation
+  // and foreground saves (which consolidate) clear it. A delete racing a
+  // consolidation can leave an extra entry, so it may over-count, never
+  // under-count.
+  mutable std::vector<uint64_t> deleted_ids_ ABSL_GUARDED_BY(label_mutex_);
 
   friend class VectorSVSTestPeer;
 };

@@ -79,8 +79,10 @@ class VectorSVSTestPeer {
   static absl::Mutex &ResizeMutex(VectorSVS<float> &index) {
     return index.resize_mutex_;
   }
-  static size_t DeletedSinceConsolidate(const VectorSVS<float> &index) {
-    return index.deleted_since_consolidate_.load();
+  static size_t DeletedIdCount(const VectorSVS<float> &index)
+      ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    absl::ReaderMutexLock lock(&index.label_mutex_);
+    return index.deleted_ids_.size();
   }
   static bool CompressionPending(const VectorSVS<float> &index) {
     return index.compression_pending_.load();
@@ -1210,8 +1212,8 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
       auto result =
           (*index)->ModifyRecord(IndexToKey(i), AttributeData(std::move(vec)));
       VMSDK_EXPECT_OK(result);
-      max_deleted = std::max(
-          max_deleted, VectorSVSTestPeer::DeletedSinceConsolidate(**index));
+      max_deleted =
+          std::max(max_deleted, VectorSVSTestPeer::DeletedIdCount(**index));
     }
   }
   EXPECT_LT(max_deleted, 1024u) << "deleted slots were never consolidated";
@@ -1242,7 +1244,7 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
     VMSDK_EXPECT_OK(
         (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
   }
-  EXPECT_LT(VectorSVSTestPeer::DeletedSinceConsolidate(**index), 1024u);
+  EXPECT_LT(VectorSVSTestPeer::DeletedIdCount(**index), 1024u);
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), 0u);
 
   VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
@@ -1251,6 +1253,76 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   VMSDK_EXPECT_OK(result);
   ASSERT_EQ(result->size(), 1u);
   EXPECT_EQ((*result)[0].external_id, IndexToKey(0));
+}
+
+// A restored index isn't FINE_GRAIN, so it consolidates inline under the
+// exclusive lock; that also empties the deleted-id list.
+TEST_F(VectorSVSTest, RestoredIndexConsolidatesInline) {
+  const size_t kKeys = 1100;  // past the 1024-slot trigger
+  FakeSafeRDB rdb;
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto built = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(built);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 5.0);
+  std::vector<ValkeyModuleString *> records(kKeys);
+  for (size_t i = 0; i < kKeys; ++i) {
+    records[i] = ValkeyModule_CreateString(
+        nullptr, (const char *)vectors[i].data(), kDimensions * sizeof(float));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**built, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  VMSDK_EXPECT_OK((*built)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*built)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto restored = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(restored);
+  VMSDK_EXPECT_OK(
+      (*restored)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                   SupplementalContentChunkIter(&rdb)));
+  ASSERT_TRUE(VectorSVSTestPeer::MutationsExclusive(**restored));
+
+  size_t max_deleted = 0;
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK((*restored)->RemoveRecord(IndexToKey(i),
+                                              indexes::DeletionType::kRecord));
+    max_deleted =
+        std::max(max_deleted, VectorSVSTestPeer::DeletedIdCount(**restored));
+  }
+  EXPECT_EQ(max_deleted, 1023u) << "the trigger fires at 1024 deletes";
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**restored), kKeys - 1024);
+  for (auto *r : records) ValkeyModule_FreeString(nullptr, r);
+}
+
+// Each delete adds its id to the deleted set; a save consolidates the index in
+// SVS, so it empties the set.
+TEST_F(VectorSVSTest, DeletedIdsAreTrackedUntilSave) {
+  const size_t kKeys = 10;
+  const size_t kDeletes = 4;
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 5.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+  for (size_t i = 0; i < kDeletes; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+    EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), i + 1);
+  }
+
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
 }
 
 // -- Per-field footprint
@@ -1264,6 +1336,45 @@ size_t SvsDataBytes(const VectorSVS<float> &index) {
       << svs_error_get_message(err);
   svs_error_free(err);
   return breakdown.data_bytes;
+}
+
+// A loaded index holds no deleted slots: SVS's save consolidates and
+// compacts, so the deleted-id list correctly starts empty after a load. Fewer
+// deletes than the consolidation trigger leave the saved index's slots
+// allocated; the loaded one has room for the live vectors only. If SVS ever
+// saves deleted slots as-is, the list must be persisted or rebuilt at load,
+// and this test fails.
+TEST_F(VectorSVSTest, LoadedIndexHoldsNoDeletedSlots) {
+  constexpr int kDim = 128;  // 512-byte vectors: 128 per 64 KiB block
+  const size_t kKeys = 2000;
+  const size_t kDeletes = 1000;  // below the 1024 consolidation trigger
+  auto proto = CreateSVSVectorIndexProto(kDim, data_model::DISTANCE_METRIC_L2,
+                                         data_model::SVS_COMPRESSION_NONE);
+  proto.set_initial_cap(16);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDim, 5.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kDeletes; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  ASSERT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kDeletes);
+  const size_t saved_bytes = SvsDataBytes(**index);
+
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(loaded);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**loaded), 0u);
+  EXPECT_LT(SvsDataBytes(**loaded), saved_bytes * 3 / 4)
+      << "the loaded index kept the deleted slots";
 }
 
 // INITIAL_CAP sizes SVS's allocation block, so a small index no longer
