@@ -1168,8 +1168,9 @@ template <typename T>
 absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
                                             VectorRecord&& vector_record) {
 #if defined(__linux__) && defined(__x86_64__)
-  // No replace primitive in the C API and add_points rejects a duplicate id,
-  // so modify is delete then add; the gap is invisible to search (phase gate).
+  // A FINE_GRAIN index replaces the vector in place, keeping its slot. Other
+  // sync kinds have no update, so modify is delete then add there; the gap is
+  // invisible to search (phase gate).
   const T* raw = reinterpret_cast<const T*>(vector_record.GetRawVector());
   if (!unavailable_.empty()) {
     // No storage: only track the record, without preparing SVS input.
@@ -1187,8 +1188,22 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
 
   bool replaced = false;
   {
-    SvsMutationLock lock(&resize_mutex_,
-                         mutations_exclusive_.load(std::memory_order_acquire));
+    const bool exclusive = mutations_exclusive_.load(std::memory_order_acquire);
+    SvsMutationLock lock(&resize_mutex_, exclusive);
+    if (svs_index_ != nullptr && !exclusive) {
+      ScopedSvsError err;
+      if (!svs_index_dynamic_update_points(svs_index_, fp32, &internal_id,
+                                           /*num_points=*/1, err.get())) {
+        // The map keeps the old record; the base class's
+        // RemoveRecordDueToError then deletes the id from SVS and the map.
+        ++Metrics::GetStats().svs_modify_exceptions_cnt;
+        return SvsErrorToStatus(err.get(),
+                                "modify: index_dynamic_update_points");
+      }
+      absl::MutexLock map_lock(&label_mutex_);
+      label_to_record_[internal_id] = std::move(vector_record);
+      return absl::OkStatus();
+    }
     if (svs_index_ != nullptr) {
       ScopedSvsError err;
       size_t deleted = 0;

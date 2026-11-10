@@ -1184,10 +1184,18 @@ TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
 // -- Reclaiming deleted slots
 // --------------------------------------------------
 
-// Every modify deletes a slot in SVS. Without consolidation those slots are
-// never reused; with it, the deleted count stays below the trigger, and the
-// index keeps answering with each key's latest vector.
-TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
+size_t SvsMemoryUsage(const VectorSVS<float> &index) {
+  size_t bytes = 0;
+  EXPECT_TRUE(svs_index_get_memory_usage(VectorSVSTestPeer::Handle(index),
+                                         &bytes, nullptr));
+  return bytes;
+}
+
+// A modify replaces the vector in its slot: modifies leave no deleted slot,
+// the index doesn't grow with them (SVS allocates a few bytes of update
+// bookkeeping once; a slot per modify would be ~100 bytes each), and it keeps
+// answering with each key's latest vector.
+TEST_F(VectorSVSTest, ModifyChurnReplacesVectorsInPlace) {
   const size_t kKeys = 50;
   const size_t kRounds = 100;  // 5000 modifies, past the 1024-slot trigger
   auto index = VectorSVS<float>::Create(
@@ -1201,6 +1209,7 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
                                                    VectorToStr(vectors[i])));
   }
 
+  size_t memory_after_first_round = 0;
   size_t max_deleted = 0;
   for (size_t round = 1; round <= kRounds; ++round) {
     for (size_t i = 0; i < kKeys; ++i) {
@@ -1215,8 +1224,12 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
       max_deleted = std::max(
           max_deleted, VectorSVSTestPeer::DeletedIdCount(**index));
     }
+    if (round == 1) memory_after_first_round = SvsMemoryUsage(**index);
   }
-  EXPECT_LT(max_deleted, 1024u) << "deleted slots were never consolidated";
+  EXPECT_EQ(max_deleted, 0u) << "a modify deleted a slot";
+  EXPECT_LT(SvsMemoryUsage(**index) - memory_after_first_round,
+            kKeys * (kRounds - 1))
+      << "SVS memory grew with the number of modifies";
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), kKeys);
   for (size_t i = 0; i < kKeys; ++i) {
     auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever());
@@ -1224,6 +1237,81 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ((*result)[0].external_id, IndexToKey(i));
   }
+}
+
+// A restored index has no update (its stream load is not FINE_GRAIN), so a
+// modify there deletes and re-adds; the deleted slot is tracked.
+TEST_F(VectorSVSTest, RestoredIndexModifiesByDeleteAndAdd) {
+  FakeSafeRDB rdb;
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto built = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(built);
+  auto vectors = DeterministicallyGenerateVectors(2, kDimensions, 2.0);
+  std::vector<ValkeyModuleString *> records(1);
+  records[0] = ValkeyModule_CreateString(
+      nullptr, (const char *)vectors[0].data(), kDimensions * sizeof(float));
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**built, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  VMSDK_EXPECT_OK((*built)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*built)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto restored = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(restored);
+  VMSDK_EXPECT_OK(
+      (*restored)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                   SupplementalContentChunkIter(&rdb)));
+  ASSERT_TRUE(VectorSVSTestPeer::MutationsExclusive(**restored));
+
+  PreparedRecord record = PrepareRecord(**restored, 0, vectors[1]);
+  VMSDK_EXPECT_OK(
+      (*restored)->ModifyRecord(record.key, std::move(record.data)));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**restored), 1u);
+  auto result =
+      (*restored)->Search(VectorToStr(vectors[1]), 1, CancelNever());
+  VMSDK_EXPECT_OK(result);
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_EQ((*result)[0].external_id, IndexToKey(0));
+  EXPECT_NEAR((*result)[0].distance, 0.0f, 1e-5f);
+  ValkeyModule_FreeString(nullptr, records[0]);
+}
+
+// A modify whose update SVS rejects is counted and leaves the index
+// consistent: the base class drops the key from the map and SVS. The failure
+// is forced by removing the id from SVS behind the module's back.
+TEST_F(VectorSVSTest, FailedInPlaceModifyIsCountedAndRolledBack) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(3, kDimensions, 2.0);
+  for (size_t i = 0; i < 2; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  svs_index_h handle = VectorSVSTestPeer::Handle(**index);
+  svs_error_h err = svs_error_create();
+  const size_t id = 0;  // IndexToKey(0)'s internal id
+  size_t deleted = 0;
+  ASSERT_TRUE(svs_index_dynamic_delete_points(handle, &id, 1, &deleted, err));
+  ASSERT_TRUE(svs_index_dynamic_consolidate(handle, err));
+  svs_error_free(err);
+
+  const uint64_t before = Metrics::GetStats().svs_modify_exceptions_cnt;
+  PreparedRecord record = PrepareRecord(**index, 0, vectors[2]);
+  EXPECT_FALSE((*index)->ModifyRecord(record.key, std::move(record.data)).ok());
+  EXPECT_EQ(Metrics::GetStats().svs_modify_exceptions_cnt, before + 1);
+  EXPECT_EQ(AsBase(*index)->GetLabelCount(), 1u);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+  auto result = (*index)->Search(VectorToStr(vectors[2]), 2, CancelNever());
+  VMSDK_EXPECT_OK(result);
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_EQ((*result)[0].external_id, IndexToKey(1));
 }
 
 // Deleting every entry triggers consolidation with nothing left to compact

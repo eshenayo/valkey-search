@@ -229,13 +229,15 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         assert _v_index(client, "svs_idx")["size"] == 3
 
     def test_modify_preserves_size(self):
-        """HSET on an existing key replaces the vector under one lock
-        (delete + add); the label count stays constant."""
+        """HSET on an existing key replaces the vector in its slot; the
+        label count stays constant and no slot is left deleted."""
         client: Valkey = self.server.get_new_client()
         self._create_default_index(client)
         self._populate(client, 5)
         client.hset("doc:3", mapping={"v": _fp32([99.0, 99.0, 99.0, 99.0])})
-        assert _v_index(client, "svs_idx")["size"] == 5
+        info = _v_index(client, "svs_idx")
+        assert info["size"] == 5
+        assert info["algorithm"]["deleted_slots"] == 0
 
     def test_ft_info_reports_deleted_slots(self):
         """FT.INFO deleted_slots counts deleted vectors whose slots SVS
@@ -505,8 +507,8 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
     @pytest.mark.parametrize("metric", ["IP", "COSINE"])
     def test_updates_keep_scores_matching_flat(self, metric):
         """Updates normalize (COSINE) and re-score like adds: overwrite a doc
-        with a scaled, rotated vector, then churn past the consolidation
-        trigger, and SVS scores keep matching FLAT."""
+        with a scaled, rotated vector, then churn 1,100 in-place updates, and
+        SVS scores keep matching FLAT."""
         client: Valkey = self.server.get_new_client()
         _create_metric_index(client, "svs_m", "SVS_VAMANA", metric)
         _create_metric_index(client, "flat_m", "FLAT", metric)
@@ -535,7 +537,8 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
                else [0.99, 0.14, 0.0, 0.0])
         assert_matches_flat()
 
-        # 1,100 updates: past the 1,024 deleted-slot consolidation trigger.
+        # 1,100 updates, more than the 1,024 deletes that trigger
+        # consolidation if updates ever left deleted slots behind again.
         rng = random.Random(5)
         for _ in range(1100):
             doc = rng.randint(1, 5)
