@@ -13,6 +13,10 @@ RED='\e[31;1m'
 
 BUILD_CONFIG="release"
 san_suffix=""
+# build.sh appends -svs-prebuilt to the directory it builds the module and
+# unit tests in, after the sanitizer suffix; integration/run.sh's directory
+# (server, test framework) doesn't have it.
+prebuilt_suffix=""
 INTEGRATION_OUTPUT=""
 UNITTEST_OUTPUT=""
 ## Search for --asan/--tsan/--debug
@@ -39,6 +43,11 @@ do
         shift || true
         san_suffix="-tsan"
         echo "Building with TSAN enabled"
+        ;;
+    --svs-prebuilt)
+        BUILD_SH_ARGS+=("$arg")
+        shift || true
+        prebuilt_suffix="-svs-prebuilt"
         ;;
     --integration-output=*)
         INTEGRATION_OUTPUT="${arg#*=}"
@@ -116,6 +125,7 @@ function save_integration_output() {
     echo "Saving integration test output to ${INTEGRATION_OUTPUT}"
     mkdir -p -- "${INTEGRATION_OUTPUT}" || return 1
     local artifacts_dir="${ROOT_DIR}/.build-${BUILD_CONFIG}${BUILD_DIR_SUFFIX:-}${san_suffix}"
+    local module_dir="${artifacts_dir}${prebuilt_suffix}"
     local third_party_dir="${ROOT_DIR}/.build-release${san_suffix}"
     local status=0
     echo "Saving build artifacts from ${artifacts_dir}"
@@ -135,10 +145,10 @@ function save_integration_output() {
         LOG_ERROR "Missing artifact: valkey-server"
         status=1
     fi
-    if [ -f "${artifacts_dir}/libsearch.so" ]; then
-        cp -- "${artifacts_dir}/libsearch.so" "${INTEGRATION_OUTPUT}" || status=1
+    if [ -f "${module_dir}/libsearch.so" ]; then
+        cp -- "${module_dir}/libsearch.so" "${INTEGRATION_OUTPUT}" || status=1
     else
-        LOG_ERROR "Missing module artifact: ${artifacts_dir}/libsearch.so"
+        LOG_ERROR "Missing module artifact: ${module_dir}/libsearch.so"
         status=1
     fi
     local result_dir="${artifacts_dir}/integration/.valkey-test-framework"
@@ -169,7 +179,7 @@ function save_integration_output() {
 function save_unittest_output() {
     echo "Saving unit test output to ${UNITTEST_OUTPUT}"
     mkdir -p -- "${UNITTEST_OUTPUT}" || return 1
-    local result_dir="${ROOT_DIR}/.build-${BUILD_CONFIG}${BUILD_DIR_SUFFIX:-}${san_suffix}"
+    local result_dir="${ROOT_DIR}/.build-${BUILD_CONFIG}${BUILD_DIR_SUFFIX:-}${san_suffix}${prebuilt_suffix}"
     local status=0
     echo "Results Directory is ${result_dir}"
     if [ -d "${result_dir}/tests" ]; then
