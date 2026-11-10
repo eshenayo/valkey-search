@@ -151,8 +151,8 @@ static_assert(std::has_single_bit(kSvsBlockSizeBytes) &&
                   std::has_single_bit(kSvsMinBlockSizeBytes),
               "SVS block sizes must be powers of two");
 
-// In the pinned SVS revision FINE_GRAIN is an alias of GLOBAL; once upstream
-// implements it, writers on one index run in parallel with no module change.
+// FINE_GRAIN backs the handle with SVS's concurrent index, so writers on one
+// index run in parallel.
 constexpr svs_sync_kind_t kSvsSyncKind = SVS_SYNC_KIND_FINE_GRAIN;
 
 // Reader or writer side of resize_mutex_ for a mutation, chosen at run time
@@ -626,7 +626,7 @@ bool BuildConfigMatches(const SVSBuildConfig& expected,
 
 void InitSvsLogging() {
 #if defined(__linux__) && defined(__x86_64__)
-  // Covers SVS work without a per-index logger, such as stream loads.
+  // Covers SVS work without a per-index logger.
   if (svs_logger_h l = MakeSvsLogger("global")) {
     svs_set_default_logger(l, nullptr);
     svs_logger_free(l);
