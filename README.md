@@ -128,6 +128,8 @@ On x86_64 Linux the build includes the `SVS_VAMANA` vector algorithm, compiled f
 
 `./build.sh --svs-prebuilt` instead links Intel's prebuilt, proprietary SVS C API, which adds the LVQ and LeanVec compressions; they run only on Intel CPUs. The configure downloads the archive pinned by `SVS_C_API_URL` in `third_party/CMakeLists.txt` (which can also point to a local file), and the build goes to `.build-release-svs-prebuilt`.
 
+PRs into `intel-svs-vamana-submodule-leanvec-lvq` run the `SVS` workflow: a default and a `--svs-prebuilt` lane, each with every unit test and the SVS integration tests. The LVQ and LeanVec tests run only when GitHub assigns an Intel runner; the `svs-prebuilt/intel` status shows whether they passed. When it's pending, run `ci/svs_intel_evidence.sh <PR> --post` on an Intel machine, from a checkout of the PR's head commit: it runs the same lane in the presubmit container, then sets the status and comments the results on the PR.
+
 To view the available arguments, use:
 
 ```sh

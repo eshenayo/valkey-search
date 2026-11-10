@@ -1,0 +1,119 @@
+name: SVS
+
+# The SVS lanes for PRs into the LVQ/LeanVec branch, which the default
+# workflows don't run on. The prebuilt lane's LVQ/LeanVec tests run only on an
+# Intel CPU; the svs-prebuilt/intel commit status records whether they passed,
+# from this runner when it is Intel, or else from ci/svs_intel_evidence.sh run
+# on an Intel machine.
+
+on:
+  pull_request:
+    branches:
+      - intel-svs-vamana-submodule-leanvec-lvq
+    # Docs-only PRs don't run the lanes, so they get no svs-prebuilt/intel
+    # status.
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: svs-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  lane:
+    name: svs-${{ matrix.lane }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [default, prebuilt]
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        # The lane runs the PR's code; it needs no token.
+        persist-credentials: false
+
+    - name: Set up Docker
+      uses: docker/setup-buildx-action@v2
+
+    - name: Build Docker Image
+      run: docker build -t presubmit-image -f .devcontainer/Dockerfile .
+
+    - name: Run Lane
+      id: lane
+      continue-on-error: true
+      run: |
+        mkdir -p test-results
+        docker run --privileged --rm \
+          -v "$(pwd):/workspace" \
+          --user "ubuntu:ubuntu" \
+          presubmit-image \
+          sudo -E ci/svs_lane.sh ${{ matrix.lane == 'prebuilt' && '--svs-prebuilt' || '' }} \
+            --results=/workspace/test-results/svs-${{ matrix.lane }}
+
+    - name: Summarize
+      if: always()
+      run: |
+        sudo chmod -R 755 test-results
+        summary=test-results/svs-${{ matrix.lane }}/summary.env
+        { echo '```'; cat "$summary" 2>/dev/null || echo "no summary: the lane didn't finish"; echo '```'; } \
+          >> "$GITHUB_STEP_SUMMARY"
+
+    # Pending until an Intel run passes: this runner's, or a local one's
+    # (ci/svs_intel_evidence.sh). PRs from forks get a read-only token.
+    - name: Record Intel Coverage
+      if: >-
+        always() && matrix.lane == 'prebuilt' && github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      env:
+        GH_TOKEN: ${{ github.token }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR: ${{ github.event.pull_request.number }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        context=svs-prebuilt/intel
+        # The lane tests the PR's merge commit; the status goes on its head.
+        CPU_VENDOR=$(awk -F': ' '/^vendor_id/ {print $2; exit}' /proc/cpuinfo)
+        CPU_MODEL=$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)
+        STATUS=1 LVQ_RAN=no LVQ_UNIT=none LVQ_INTEGRATION=none
+        source test-results/svs-prebuilt/summary.env 2>/dev/null || true
+        if [[ ${CPU_VENDOR} == GenuineIntel ]]; then
+          if [[ ${STATUS} == 0 && ${LVQ_RAN} == yes ]]; then state=success; else state=failure; fi
+          description="CI on ${CPU_MODEL}: LVQ/LeanVec unit ${LVQ_UNIT}; integration ${LVQ_INTEGRATION}"
+        else
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${context}\")][0].state // empty")
+          if [[ ${existing} == success ]]; then
+            echo "${context} is already success for ${HEAD_SHA}"
+            exit 0
+          fi
+          state=pending
+          description="Runner isn't Intel: run ci/svs_intel_evidence.sh ${PR} --post on an Intel machine"
+        fi
+        gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+          -f state="${state}" -f context="${context}" \
+          -f description="${description:0:140}" -f target_url="${RUN_URL}" >/dev/null
+        echo "${context}: ${state} (${description})"
+
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: svs-${{ matrix.lane }}-results
+        path: |
+          test-results/svs-${{ matrix.lane }}/*.log
+          test-results/svs-${{ matrix.lane }}/summary.env
+          test-results/svs-${{ matrix.lane }}/integration/valkey-test-framework
+
+    - name: Check Lane Result
+      if: steps.lane.outcome == 'failure'
+      run: exit 1
