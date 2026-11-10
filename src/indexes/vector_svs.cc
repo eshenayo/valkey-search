@@ -1393,7 +1393,7 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   ValkeyModule_ReplyWithSimpleString(ctx, "algorithm");
   const bool trained = build_config_.training_threshold > 0;
   const bool unavailable = !unavailable_.empty();
-  ValkeyModule_ReplyWithArray(ctx, (trained ? 18 : 14) + (unavailable ? 2 : 0));
+  ValkeyModule_ReplyWithArray(ctx, (trained ? 20 : 16) + (unavailable ? 2 : 0));
   ValkeyModule_ReplyWithSimpleString(ctx, "name");
   ValkeyModule_ReplyWithSimpleString(
       ctx, std::string(
@@ -1441,6 +1441,13 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
 #endif
   ValkeyModule_ReplyWithSimpleString(ctx, "memory_bytes");
   ValkeyModule_ReplyWithLongLong(ctx, static_cast<long long>(memory_bytes));
+  size_t deleted_slots = 0;
+  {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    deleted_slots = deleted_ids_.size();
+  }
+  ValkeyModule_ReplyWithSimpleString(ctx, "deleted_slots");
+  ValkeyModule_ReplyWithLongLong(ctx, static_cast<long long>(deleted_slots));
   return 4;
 }
 
