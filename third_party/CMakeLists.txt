@@ -12,10 +12,10 @@ option(SVS_C_API_PREBUILT
        "Link the prebuilt SVS C API (LVQ/LeanVec) instead of compiling third_party/svs" OFF)
 # TODO: switch to a versioned release once one ships svs-c-api-no-omp.
 set(SVS_C_API_URL
-    "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-c-api-no-omp-2026-10-21-125.tar.gz"
+    "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-c-api-no-omp-2026-11-10-pr468.tar.gz"
     CACHE STRING "Prebuilt SVS C API tarball: a release URL or a local path")
 set(SVS_C_API_URL_HASH
-    "SHA256=447a2f4e82ec5a258ac0c13e93526d3ab80213689f0886bbe6f66297f74eff90"
+    "SHA256=a2d3e448c3c3d18ab81ba80ed4cc8d37eee4874b57a3b5d29fc6f2ccbbec7bc1"
     CACHE STRING "Hash of SVS_C_API_URL; empty skips verification")
 # Every SVS C API function the module calls; keep in sync with src/indexes.
 set(SVS_C_API_REQUIRED_ENTRY_POINTS
