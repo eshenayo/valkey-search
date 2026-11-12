@@ -117,7 +117,20 @@ jobs:
         # The lane tests the PR's merge commit; the status goes on its head.
         STATUS=1 LVQ_RAN=no LVQ_UNIT=none LVQ_INTEGRATION=none
         CPU_MODEL=$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)
-        source test-results/svs-prebuilt/summary.env 2>/dev/null || true
+        # The lane's output: parsed for these keys only, never sourced.
+        read_summary() {  # read_summary <file> <key>...: assigns only the named keys
+          local file=$1 line key want
+          shift
+          while IFS= read -r line; do
+            key=${line%%=*}
+            for want in "$@"; do
+              [[ ${key} == "${want}" ]] && printf -v "${key}" '%s' "${line#*=}"
+            done
+          done <"${file}"
+          return 0
+        }
+        summary=test-results/svs-prebuilt/summary.env
+        [[ -f ${summary} ]] && read_summary "${summary}" STATUS LVQ_RAN LVQ_UNIT LVQ_INTEGRATION
         if [[ ${STATUS} == 0 && ${LVQ_RAN} == yes ]]; then state=success; else state=failure; fi
         description="CI on ${CPU_MODEL}: LVQ/LeanVec unit ${LVQ_UNIT}; integration ${LVQ_INTEGRATION}"
         gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \

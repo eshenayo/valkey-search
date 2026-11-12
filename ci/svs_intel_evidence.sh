@@ -83,8 +83,23 @@ docker run --privileged --rm --user 0:0 \
            find /workspace -xdev -user 0 -exec chown -h $(id -u):$(id -g) {} +; \
            exit \$status" || LANE_EXIT=$?
 
-# shellcheck disable=SC1091
-source "${RESULTS}/summary.env" || die "the lane didn't finish; see ${RESULTS}/*.log"
+# The summary is the container's output: parsed, never sourced, so it can
+# neither run code here nor replace HEAD_SHA or LANE_EXIT.
+read_summary() {  # read_summary <file> <key>...: assigns only the named keys
+  local file=$1 line key want
+  shift
+  while IFS= read -r line; do
+    key=${line%%=*}
+    for want in "$@"; do
+      [[ ${key} == "${want}" ]] && printf -v "${key}" '%s' "${line#*=}"
+    done
+  done <"${file}"
+  return 0
+}
+[[ -f ${RESULTS}/summary.env ]] || die "the lane didn't finish; see ${RESULTS}/*.log"
+LANE_SHA="" LVQ_RAN=no
+read_summary "${RESULTS}/summary.env" LANE_SHA CPU_MODEL UNIT_RESULT INTEGRATION_RESULT \
+  LVQ_RAN LVQ_UNIT LVQ_INTEGRATION PREBUILT VALKEY_VERSION REASON
 [[ ${LANE_SHA} == "${HEAD_SHA}" ]] || die "the lane ran on ${LANE_SHA}, not ${HEAD_SHA}"
 if [[ ${LANE_EXIT} == 0 && ${LVQ_RAN} == yes ]]; then
   STATE=success
