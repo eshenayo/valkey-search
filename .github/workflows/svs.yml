@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: svs-${{ github.head_ref || github.ref }}
+  group: svs-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:

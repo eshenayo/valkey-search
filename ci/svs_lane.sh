@@ -83,7 +83,8 @@ if [[ ${LANE} == prebuilt ]]; then
     >"${RESULTS}/lvq_unit.log" 2>&1
   LVQ_UNIT_EXIT=$?
   LVQ_UNIT_PASSED=$(count '^\[       OK \]' <"${RESULTS}/lvq_unit.log")
-  LVQ_UNIT_SKIPPED=$(count '^\[  SKIPPED \] Kinds/' <"${RESULTS}/lvq_unit.log")
+  # Each skipped test, not gtest's closing list of them.
+  LVQ_UNIT_SKIPPED=$(count '^\[  SKIPPED \] Kinds/.* \([0-9]+ ms\)$' <"${RESULTS}/lvq_unit.log")
   PYTEST_LOG=${RESULTS}/integration/valkey-test-framework/pytest_output.log
   if [[ -f ${PYTEST_LOG} ]]; then
     # One line per test; parallel runs print the outcome before the name.
@@ -106,6 +107,10 @@ fi
 if ((INTEGRATION_EXIT != 0)); then
   STATUS=1
   REASON+="integration tests failed; "
+fi
+if ((LVQ_UNIT_EXIT != 0)); then
+  STATUS=1
+  REASON+="the LVQ/LeanVec unit suite exited ${LVQ_UNIT_EXIT}; "
 fi
 # The prebuilt library enables LVQ/LeanVec on Intel CPUs only; anything else
 # means the capability gate or the tests' skips are wrong.
