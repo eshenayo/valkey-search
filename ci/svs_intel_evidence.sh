@@ -66,7 +66,7 @@ docker run --privileged --rm --user 0:0 \
   -e BUILD_DIR_SUFFIX=-evidence \
   presubmit-image \
   bash -c "ci/svs_lane.sh --svs-prebuilt --results=/workspace/${RESULTS}; status=\$?; \
-           chown -R $(id -u):$(id -g) /workspace/${RESULTS} /workspace/.ccache /workspace/.build-release-evidence*; \
+           find /workspace -xdev -user 0 -exec chown -h $(id -u):$(id -g) {} +; \
            exit \$status" || LANE_EXIT=$?
 rm -f compile_commands.json
 [[ -z ${COMPILE_DB_LINK} ]] || ln -s "${COMPILE_DB_LINK}" compile_commands.json
