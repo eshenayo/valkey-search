@@ -1339,6 +1339,7 @@ void VectorSVS<T>::ConsolidateConcurrently() {
     absl::ReaderMutexLock map_lock(&label_mutex_);
     before = deleted_ids_.size();
   }
+  absl::MutexLock busy(&consolidation_mutex_);
   ScopedSvsError err;
   const absl::Time start = absl::Now();
   if (!svs_index_dynamic_consolidate(svs_index_, err.get())) {
@@ -1373,6 +1374,23 @@ void VectorSVS<T>::ConsolidateConcurrently() {
       << ", consolidate_ms=" << absl::ToInt64Milliseconds(consolidated - start)
       << ", compact_ms="
       << absl::ToInt64Milliseconds(absl::Now() - consolidated);
+}
+
+template <typename T>
+size_t VectorSVS<T>::MemoryBytesForInfo() const {
+  // FT.INFO runs on the main thread, so it never waits: an exclusive holder
+  // of resize_mutex_ (a conversion, a restored index's consolidation, a save)
+  // or a background consolidation leaves the last value in place.
+  if (!resize_mutex_.ReaderTryLock()) return memory_bytes_.load();
+  if (svs_index_ != nullptr && consolidation_mutex_.TryLock()) {
+    size_t bytes = 0;
+    if (svs_index_get_memory_usage(svs_index_, &bytes, nullptr)) {
+      memory_bytes_.store(bytes);
+    }
+    consolidation_mutex_.Unlock();
+  }
+  resize_mutex_.ReaderUnlock();
+  return memory_bytes_.load();
 }
 
 template <typename T>
@@ -1505,12 +1523,7 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   // first add.
   size_t memory_bytes = 0;
 #if defined(__linux__) && defined(__x86_64__)
-  {
-    absl::ReaderMutexLock lock(&resize_mutex_);
-    if (svs_index_ != nullptr) {
-      svs_index_get_memory_usage(svs_index_, &memory_bytes, nullptr);
-    }
-  }
+  memory_bytes = MemoryBytesForInfo();
 #endif
   ValkeyModule_ReplyWithSimpleString(ctx, "memory_bytes");
   ValkeyModule_ReplyWithLongLong(ctx, static_cast<long long>(memory_bytes));
