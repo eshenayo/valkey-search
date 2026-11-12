@@ -37,11 +37,13 @@
 #include "src/query/search.h"
 #include "src/rdb_serialization.h"
 #include "src/utils/cancel.h"
+#include "src/valkey_search.h"
 #include "src/valkey_search_options.h"
 #include "third_party/hnswlib/hnswlib.h"
 #include "vmsdk/src/debug.h"
 #include "vmsdk/src/log.h"
 #include "vmsdk/src/status/status_macros.h"
+#include "vmsdk/src/thread_pool.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
 #if defined(__linux__) && defined(__x86_64__)
@@ -1273,6 +1275,25 @@ void VectorSVS<T>::MaybeConsolidate() {
                     label_to_record_.size() / kConsolidateLiveDivisor);
   };
   if (!due()) return;
+  if (!mutations_exclusive_.load(std::memory_order_acquire)) {
+    // One consolidation at a time; the flag is cleared when it finishes.
+    bool idle = false;
+    if (!consolidating_.compare_exchange_strong(idle, true)) return;
+    auto task = [weak = this->weak_from_this()] {
+      if (auto self = weak.lock()) self->ConsolidateConcurrently();
+    };
+    // The writer pool stays suspended while a fork child saves, so the
+    // consolidation can't dirty pages the child is copying. Without a pool
+    // (unit tests) it runs here.
+    vmsdk::ThreadPool* pool = ValkeySearch::Instance().GetWriterThreadPool();
+    if (pool == nullptr) {
+      task();
+    } else if (!pool->Schedule(std::move(task),
+                               vmsdk::ThreadPool::Priority::kLow)) {
+      consolidating_.store(false);
+    }
+    return;
+  }
   // Consolidation rewrites graph edges, so it excludes the other writers;
   // searches are already excluded by the mutation phase.
   absl::WriterMutexLock lock(&resize_mutex_);
@@ -1300,6 +1321,56 @@ void VectorSVS<T>::MaybeConsolidate() {
         << "SVS_VAMANA compact failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_compact");
   }
+}
+
+template <typename T>
+void VectorSVS<T>::ConsolidateConcurrently() {
+  absl::Cleanup done = [this] { consolidating_.store(false); };
+  // SVS consolidates a FINE_GRAIN index alongside writers and searches.
+  absl::ReaderMutexLock lock(&resize_mutex_);
+  if (svs_index_ == nullptr ||
+      mutations_exclusive_.load(std::memory_order_acquire)) {
+    return;
+  }
+  size_t before = 0;
+  {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    before = deleted_ids_.size();
+  }
+  ScopedSvsError err;
+  const absl::Time start = absl::Now();
+  if (!svs_index_dynamic_consolidate(svs_index_, err.get())) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
+        << "SVS_VAMANA consolidate failed: "
+        << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
+    return;
+  }
+  const absl::Time consolidated = absl::Now();
+  // Ids deleted before the consolidation started are reclaimed; later ones
+  // (pushed after them) wait for the next.
+  {
+    absl::MutexLock map_lock(&label_mutex_);
+    deleted_ids_.erase(
+        deleted_ids_.begin(),
+        deleted_ids_.begin() + std::min(before, deleted_ids_.size()));
+  }
+  // The C API's add_points doesn't refill the slots consolidation freed, so
+  // compact to reclaim them; SVS runs compaction exclusively. SVS can't
+  // compact an index with no live entries.
+  size_t live_in_svs = 0;
+  if (svs_index_get_size(svs_index_, &live_in_svs, err.get()) &&
+      live_in_svs > 0 &&
+      !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
+        << "SVS_VAMANA compact failed: "
+        << SvsErrorToStatus(err.get(), "index_dynamic_compact");
+  }
+  VMSDK_LOG(VERBOSE, nullptr)
+      << "SVS index consolidated: attribute=" << this->attribute_identifier_
+      << ", deleted=" << before
+      << ", consolidate_ms=" << absl::ToInt64Milliseconds(consolidated - start)
+      << ", compact_ms="
+      << absl::ToInt64Milliseconds(absl::Now() - consolidated);
 }
 
 template <typename T>

@@ -78,7 +78,8 @@ struct SVSBuildConfig {
 void InitSvsLogging();
 
 template <typename T>
-class VectorSVS : public VectorType<T> {
+class VectorSVS : public VectorType<T>,
+                  public std::enable_shared_from_this<VectorSVS<T>> {
  protected:
   // VectorType<T> is a dependent base, so inherited names are not found by
   // unqualified lookup. Re-declare the ones used below.
@@ -188,10 +189,14 @@ class VectorSVS : public VectorType<T> {
   // compression on every vector in the index. A failed conversion is logged,
   // counted, and retried on the next add.
   void MaybeConvert() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
-  // SVS reuses deleted slots only after consolidating and compacting. Does
-  // both once enough slots have been deleted, so update-heavy workloads stay
-  // bounded.
+  // Reclaims deleted slots once enough have been deleted, so update-heavy
+  // workloads stay bounded. A FINE_GRAIN index consolidates and compacts in a
+  // low-priority writer-pool task rather than in the deleting client's
+  // request; SVS consolidates alongside writers and searches but compacts
+  // exclusively. Any other index does both inline, exclusively.
   void MaybeConsolidate() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
+  void ConsolidateConcurrently()
+      ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
 #endif
 
   // Concurrency: the index is built with SVS_SYNC_KIND_FINE_GRAIN and guards
@@ -214,6 +219,8 @@ class VectorSVS : public VectorType<T> {
   // awaiting MaybeConvert. Written under the writer side of resize_mutex_;
   // atomic so adds can check it without the lock.
   std::atomic<bool> compression_pending_{false};
+  // True while a FINE_GRAIN consolidation runs, so only one runs at a time.
+  std::atomic<bool> consolidating_{false};
   // Set by LoadFromRDB when the saved SVS payload was skipped; consumed by
   // OnTrackedKeysLoaded on the main thread before the index is published.
   bool rebuild_from_keyspace_{false};
