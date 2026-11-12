@@ -79,6 +79,17 @@ class VectorSVSTestPeer {
   static absl::Mutex &ResizeMutex(VectorSVS<float> &index) {
     return index.resize_mutex_;
   }
+  static void ConsolidateConcurrently(VectorSVS<float> &index) {
+    index.ConsolidateConcurrently();
+  }
+  // Waits for a background consolidation the writer pool is running.
+  static void WaitForConsolidation(const VectorSVS<float> &index) {
+    const absl::Time deadline = absl::Now() + absl::Seconds(30);
+    while (index.consolidating_.load() && absl::Now() < deadline) {
+      absl::SleepFor(absl::Milliseconds(1));
+    }
+    EXPECT_FALSE(index.consolidating_.load()) << "consolidation still running";
+  }
   static size_t DeletedIdCount(const VectorSVS<float> &index)
       ABSL_NO_THREAD_SAFETY_ANALYSIS {
     absl::ReaderMutexLock lock(&index.label_mutex_);
@@ -1116,6 +1127,48 @@ void HoldSharedWhile(absl::Mutex &mu, const std::function<void()> &body)
   mu.ReaderUnlock();
 }
 
+// A FINE_GRAIN index consolidates under the shared lock, alongside writers
+// and searches, and reclaims the deleted slots.
+TEST_F(VectorSVSTest, ConsolidationRunsUnderTheSharedLock) {
+  const size_t kKeys = 20;
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kKeys / 2; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  ASSERT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kKeys / 2);
+
+  absl::Notification done;
+  std::thread consolidator([&] {
+    VectorSVSTestPeer::ConsolidateConcurrently(**index);
+    done.Notify();
+  });
+  bool finished_while_held = false;
+  HoldSharedWhile(VectorSVSTestPeer::ResizeMutex(**index), [&] {
+    finished_while_held =
+        done.WaitForNotificationWithTimeout(absl::Seconds(10));
+  });
+  consolidator.join();
+  EXPECT_TRUE(finished_while_held)
+      << "consolidation waited for the exclusive lock";
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+  for (size_t i = kKeys / 2; i < kKeys; ++i) {
+    auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever());
+    VMSDK_EXPECT_OK(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ((*result)[0].external_id, IndexToKey(i));
+  }
+}
+
 TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
   FakeSafeRDB rdb;
   auto proto =
@@ -1185,8 +1238,9 @@ TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
 // --------------------------------------------------
 
 // Every modify deletes a slot in SVS. Without consolidation those slots are
-// never reused; with it, the deleted count stays below the trigger, and the
-// index keeps answering with each key's latest vector.
+// never reused; with it, the deleted count stays near the trigger (deletes
+// continue while the background pass runs), and the index keeps answering
+// with each key's latest vector.
 TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
   const size_t kKeys = 50;
   const size_t kRounds = 100;  // 5000 modifies, past the 1024-slot trigger
@@ -1216,7 +1270,8 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
           std::max(max_deleted, VectorSVSTestPeer::DeletedIdCount(**index));
     }
   }
-  EXPECT_LT(max_deleted, 1024u) << "deleted slots were never consolidated";
+  EXPECT_LT(max_deleted, 2 * 1024u) << "deleted slots were never consolidated";
+  VectorSVSTestPeer::WaitForConsolidation(**index);
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), kKeys);
   for (size_t i = 0; i < kKeys; ++i) {
     auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever());
@@ -1244,6 +1299,7 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
     VMSDK_EXPECT_OK(
         (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
   }
+  VectorSVSTestPeer::WaitForConsolidation(**index);
   EXPECT_LT(VectorSVSTestPeer::DeletedIdCount(**index), 1024u);
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), 0u);
 
