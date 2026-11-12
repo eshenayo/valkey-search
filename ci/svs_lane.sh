@@ -8,8 +8,8 @@
 #
 # Usage: ci/svs_lane.sh [--svs-prebuilt] [--results=DIR]
 #
-# Writes DIR/summary.env (sourceable) and the logs. Exits 0 when the lane
-# passes.
+# Writes DIR/summary.env, one KEY=value per line, and the logs. Readers parse
+# it rather than source it. Exits 0 when the lane passes.
 
 set -uo pipefail
 
@@ -44,8 +44,12 @@ fi
 export VALKEY_VERSION=${VALKEY_VERSION:-9.2.0-rc2}
 # Every SVS integration test file, and test_info.py for the SVS INFO fields.
 INTEGRATION_FILTER="svs or lvq or leanvec or test_info"
-# A reused directory would hold the last run's logs; start clean.
-[[ ${RESULTS} != / && ${RESULTS} != "${ROOT_DIR}" ]] || { echo "bad --results" >&2; exit 2; }
+# A reused directory would hold the last run's logs; start clean. Only a
+# directory under test-results/ is ever removed.
+if [[ ${RESULTS} != "${ROOT_DIR}"/test-results/?* ]]; then
+  echo "--results must be under ${ROOT_DIR}/test-results/" >&2
+  exit 2
+fi
 rm -rf "${RESULTS}"
 mkdir -p "${RESULTS}"
 
@@ -79,7 +83,10 @@ LVQ_INTEGRATION_SKIPPED=0
 LVQ_RAN=no
 LVQ_UNIT_EXIT=0
 if [[ ${LANE} == prebuilt ]]; then
-  "${BUILD_DIR}/tests/vector_svs_test" --gtest_filter='Kinds/VectorSVSLvqLeanVecTest.*' \
+  # Bounded like ctest's run of the same binary (build.sh's TEST_TIMEOUT); a
+  # timeout exits 124.
+  timeout --kill-after=10 "${TEST_TIMEOUT:-60}" \
+    "${BUILD_DIR}/tests/vector_svs_test" --gtest_filter='Kinds/VectorSVSLvqLeanVecTest.*' \
     >"${RESULTS}/lvq_unit.log" 2>&1
   LVQ_UNIT_EXIT=$?
   LVQ_UNIT_PASSED=$(count '^\[       OK \]' <"${RESULTS}/lvq_unit.log")
@@ -124,18 +131,23 @@ if [[ ${LANE} == prebuilt ]]; then
   fi
 fi
 
+emit() { printf '%s=%s\n' "$1" "${2//$'\n'/ }"; }
 {
-  printf 'LANE=%q\n' "${LANE}"
-  printf 'LANE_SHA=%q\n' "$(git rev-parse HEAD 2>/dev/null)"
-  printf 'CPU_VENDOR=%q\nCPU_MODEL=%q\n' "${CPU_VENDOR}" "${CPU_MODEL}"
-  printf 'UNIT_EXIT=%q\nUNIT_RESULT=%q\n' "${UNIT_EXIT}" "${UNIT_RESULT}"
-  printf 'INTEGRATION_EXIT=%q\nINTEGRATION_RESULT=%q\n' "${INTEGRATION_EXIT}" "${INTEGRATION_RESULT}"
-  printf 'LVQ_RAN=%q\n' "${LVQ_RAN}"
-  printf 'LVQ_UNIT=%q\n' "${LVQ_UNIT_PASSED} passed, ${LVQ_UNIT_SKIPPED} skipped"
-  printf 'LVQ_INTEGRATION=%q\n' "${LVQ_INTEGRATION_PASSED} passed, ${LVQ_INTEGRATION_SKIPPED} skipped"
-  printf 'PREBUILT=%q\n' "$(grep -oE 'svs-c-api[^"/]*\.tar\.gz' third_party/CMakeLists.txt | head -1)"
-  printf 'VALKEY_VERSION=%q\n' "${VALKEY_VERSION}"
-  printf 'STATUS=%q\nREASON=%q\n' "${STATUS}" "${REASON%; }"
+  emit LANE "${LANE}"
+  emit LANE_SHA "$(git rev-parse HEAD 2>/dev/null)"
+  emit CPU_VENDOR "${CPU_VENDOR}"
+  emit CPU_MODEL "${CPU_MODEL}"
+  emit UNIT_EXIT "${UNIT_EXIT}"
+  emit UNIT_RESULT "${UNIT_RESULT}"
+  emit INTEGRATION_EXIT "${INTEGRATION_EXIT}"
+  emit INTEGRATION_RESULT "${INTEGRATION_RESULT}"
+  emit LVQ_RAN "${LVQ_RAN}"
+  emit LVQ_UNIT "${LVQ_UNIT_PASSED} passed, ${LVQ_UNIT_SKIPPED} skipped"
+  emit LVQ_INTEGRATION "${LVQ_INTEGRATION_PASSED} passed, ${LVQ_INTEGRATION_SKIPPED} skipped"
+  emit PREBUILT "$(grep -oE 'svs-c-api[^"/]*\.tar\.gz' third_party/CMakeLists.txt | head -1)"
+  emit VALKEY_VERSION "${VALKEY_VERSION}"
+  emit STATUS "${STATUS}"
+  emit REASON "${REASON%; }"
 } >"${RESULTS}/summary.env"
 cat "${RESULTS}/summary.env"
 exit ${STATUS}
