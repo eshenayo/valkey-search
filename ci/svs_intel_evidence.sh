@@ -41,7 +41,10 @@ read -r HEAD_SHA PR_BASE < <(gh pr view "${PR}" -R "${REPO}" --json headRefOid,b
 [[ ${PR_BASE} == "${BASE}" ]] || die "PR #${PR} targets ${PR_BASE}, not ${BASE}"
 [[ $(git rev-parse HEAD) == "${HEAD_SHA}" ]] ||
   die "check out PR #${PR}'s head commit ${HEAD_SHA} first (gh pr checkout ${PR})"
-[[ -z $(git status --porcelain --untracked-files=no) ]] || die "the checkout has uncommitted changes"
+# Untracked files count too (the run would collect an untracked test); only
+# this script's results and cache may exist.
+[[ -z $(git status --porcelain --untracked-files=all | grep -vE '^\?\? (test-results|\.ccache)/') ]] ||
+  die "the checkout has uncommitted or untracked files"
 git submodule update --init --recursive
 
 docker build -q \
@@ -55,8 +58,19 @@ RESULTS=test-results/svs-intel-evidence
 # Created here, so the container (root) doesn't own it.
 mkdir -p test-results
 # build.sh points the checkout's compile_commands.json at its build tree;
-# put the host's link back afterwards.
-COMPILE_DB_LINK=$(readlink compile_commands.json 2>/dev/null || true)
+# restore whatever was there (a link, a file or nothing) on any exit.
+COMPILE_DB_BACKUP=$(mktemp -d)
+if [[ -e compile_commands.json || -L compile_commands.json ]]; then
+  cp -P compile_commands.json "${COMPILE_DB_BACKUP}/"
+fi
+restore_compile_db() {
+  rm -f compile_commands.json
+  if [[ -e ${COMPILE_DB_BACKUP}/compile_commands.json || -L ${COMPILE_DB_BACKUP}/compile_commands.json ]]; then
+    cp -P "${COMPILE_DB_BACKUP}/compile_commands.json" .
+  fi
+  rm -rf "${COMPILE_DB_BACKUP}"
+}
+trap restore_compile_db EXIT
 LANE_EXIT=0
 docker run --privileged --rm --user 0:0 \
   -v "${ROOT_DIR}:/workspace" -v "${GIT_COMMON_DIR}:${GIT_COMMON_DIR}" -w /workspace \
@@ -68,8 +82,6 @@ docker run --privileged --rm --user 0:0 \
   bash -c "ci/svs_lane.sh --svs-prebuilt --results=/workspace/${RESULTS}; status=\$?; \
            find /workspace -xdev -user 0 -exec chown -h $(id -u):$(id -g) {} +; \
            exit \$status" || LANE_EXIT=$?
-rm -f compile_commands.json
-[[ -z ${COMPILE_DB_LINK} ]] || ln -s "${COMPILE_DB_LINK}" compile_commands.json
 
 # shellcheck disable=SC1091
 source "${RESULTS}/summary.env" || die "the lane didn't finish; see ${RESULTS}/*.log"

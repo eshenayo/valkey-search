@@ -48,6 +48,37 @@ jobs:
     - name: Build Docker Image
       run: docker build -t presubmit-image -f .devcontainer/Dockerfile .
 
+    # Pending until an Intel run passes: this runner's, if it is Intel, or a
+    # local one (ci/svs_intel_evidence.sh). Set before the lane, and on a
+    # non-Intel runner never again, so local evidence posted later stays. PRs
+    # from forks get a read-only token.
+    - name: Mark Intel Coverage Pending
+      if: >-
+        matrix.lane == 'prebuilt' && github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      env:
+        GH_TOKEN: ${{ github.token }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR: ${{ github.event.pull_request.number }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        context=svs-prebuilt/intel
+        existing=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+          --jq "[.statuses[] | select(.context == \"${context}\")][0].state // empty")
+        if [[ -n ${existing} ]]; then
+          echo "${context} is already ${existing} for ${HEAD_SHA}"
+          exit 0
+        fi
+        if grep -q '^vendor_id.*GenuineIntel' /proc/cpuinfo; then
+          description="Running the LVQ/LeanVec tests on this Intel runner"
+        else
+          description="Runner isn't Intel: run ci/svs_intel_evidence.sh ${PR} --post on an Intel machine"
+        fi
+        gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+          -f state=pending -f context="${context}" \
+          -f description="${description:0:140}" -f target_url="${RUN_URL}" >/dev/null
+        echo "${context}: pending (${description})"
+
     - name: Run Lane
       id: lane
       continue-on-error: true
@@ -68,8 +99,7 @@ jobs:
         { echo '```'; cat "$summary" 2>/dev/null || echo "no summary: the lane didn't finish"; echo '```'; } \
           >> "$GITHUB_STEP_SUMMARY"
 
-    # Pending until an Intel run passes: this runner's, or a local one's
-    # (ci/svs_intel_evidence.sh). PRs from forks get a read-only token.
+    # On an Intel runner, the LVQ/LeanVec result.
     - name: Record Intel Coverage
       if: >-
         always() && matrix.lane == 'prebuilt' && github.event_name == 'pull_request' &&
@@ -77,28 +107,19 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        PR: ${{ github.event.pull_request.number }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         context=svs-prebuilt/intel
-        # The lane tests the PR's merge commit; the status goes on its head.
-        CPU_VENDOR=$(awk -F': ' '/^vendor_id/ {print $2; exit}' /proc/cpuinfo)
-        CPU_MODEL=$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)
-        STATUS=1 LVQ_RAN=no LVQ_UNIT=none LVQ_INTEGRATION=none
-        source test-results/svs-prebuilt/summary.env 2>/dev/null || true
-        if [[ ${CPU_VENDOR} == GenuineIntel ]]; then
-          if [[ ${STATUS} == 0 && ${LVQ_RAN} == yes ]]; then state=success; else state=failure; fi
-          description="CI on ${CPU_MODEL}: LVQ/LeanVec unit ${LVQ_UNIT}; integration ${LVQ_INTEGRATION}"
-        else
-          existing=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --jq "[.statuses[] | select(.context == \"${context}\")][0].state // empty")
-          if [[ ${existing} == success ]]; then
-            echo "${context} is already success for ${HEAD_SHA}"
-            exit 0
-          fi
-          state=pending
-          description="Runner isn't Intel: run ci/svs_intel_evidence.sh ${PR} --post on an Intel machine"
+        if ! grep -q '^vendor_id.*GenuineIntel' /proc/cpuinfo; then
+          echo "Runner isn't Intel; ${context} awaits ci/svs_intel_evidence.sh"
+          exit 0
         fi
+        # The lane tests the PR's merge commit; the status goes on its head.
+        STATUS=1 LVQ_RAN=no LVQ_UNIT=none LVQ_INTEGRATION=none
+        CPU_MODEL=$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)
+        source test-results/svs-prebuilt/summary.env 2>/dev/null || true
+        if [[ ${STATUS} == 0 && ${LVQ_RAN} == yes ]]; then state=success; else state=failure; fi
+        description="CI on ${CPU_MODEL}: LVQ/LeanVec unit ${LVQ_UNIT}; integration ${LVQ_INTEGRATION}"
         gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
           -f state="${state}" -f context="${context}" \
           -f description="${description:0:140}" -f target_url="${RUN_URL}" >/dev/null
