@@ -196,7 +196,11 @@ class VectorSVS : public VectorType<T>,
   // exclusively. Any other index does both inline, exclusively.
   void MaybeConsolidate() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
   void ConsolidateConcurrently()
-      ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
+      ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_, consolidation_mutex_);
+  // FT.INFO's memory_bytes. SVS reports memory under its exclusive lock and
+  // FT.INFO runs on the main thread, so while a consolidation, compaction or
+  // conversion runs this returns the last value instead of waiting.
+  size_t MemoryBytesForInfo() const ABSL_NO_THREAD_SAFETY_ANALYSIS;
 #endif
 
   // Concurrency: the index is built with SVS_SYNC_KIND_FINE_GRAIN and guards
@@ -221,6 +225,12 @@ class VectorSVS : public VectorType<T>,
   std::atomic<bool> compression_pending_{false};
   // True while a FINE_GRAIN consolidation runs, so only one runs at a time.
   std::atomic<bool> consolidating_{false};
+  // Held while SVS consolidates and compacts a FINE_GRAIN index in the
+  // background (acquired after resize_mutex_).
+  mutable absl::Mutex consolidation_mutex_ ABSL_ACQUIRED_AFTER(resize_mutex_);
+  mutable std::atomic<size_t> memory_bytes_{0};
+  // Consolidations, compactions and conversions in progress.
+  std::atomic<int> long_operations_{0};
   // Set by LoadFromRDB when the saved SVS payload was skipped; consumed by
   // OnTrackedKeysLoaded on the main thread before the index is published.
   bool rebuild_from_keyspace_{false};

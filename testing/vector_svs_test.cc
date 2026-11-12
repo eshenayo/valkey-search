@@ -90,6 +90,15 @@ class VectorSVSTestPeer {
     }
     EXPECT_FALSE(index.consolidating_.load()) << "consolidation still running";
   }
+  static size_t MemoryBytesForInfo(const VectorSVS<float> &index) {
+    return index.MemoryBytesForInfo();
+  }
+  static absl::Mutex &ConsolidationMutex(VectorSVS<float> &index) {
+    return index.consolidation_mutex_;
+  }
+  static std::atomic<int> &LongOperations(VectorSVS<float> &index) {
+    return index.long_operations_;
+  }
   static size_t DeletedIdCount(const VectorSVS<float> &index)
       ABSL_NO_THREAD_SAFETY_ANALYSIS {
     absl::ReaderMutexLock lock(&index.label_mutex_);
@@ -1167,6 +1176,60 @@ TEST_F(VectorSVSTest, ConsolidationRunsUnderTheSharedLock) {
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ((*result)[0].external_id, IndexToKey(i));
   }
+}
+
+// Runs `body` while another thread holds `mu` (exclusively, or shared when
+// `shared`).
+void WhileHeldElsewhere(absl::Mutex &mu, bool shared,
+                        const std::function<void()> &body)
+    ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  absl::Notification held, release;
+  std::thread holder([&]() ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    shared ? mu.ReaderLock() : mu.Lock();
+    held.Notify();
+    release.WaitForNotification();
+    shared ? mu.ReaderUnlock() : mu.Unlock();
+  });
+  held.WaitForNotification();
+  body();
+  release.Notify();
+  holder.join();
+}
+
+// FT.INFO's memory_bytes never waits behind a consolidation or conversion
+// (which holds resize_mutex_ exclusively on a restored index): it reports the
+// last value, then catches up once the index is free.
+TEST_F(VectorSVSTest, InfoMemoryBytesDoesNotWaitForConsolidation) {
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  proto.set_initial_cap(16);  // small blocks, so adds grow memory
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index), 0u);
+  const size_t kKeys = 2000;
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  const size_t small = VectorSVSTestPeer::MemoryBytesForInfo(**index);
+  ASSERT_GT(small, 0u);
+  for (size_t i = 1; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  WhileHeldElsewhere(VectorSVSTestPeer::ConsolidationMutex(**index),
+                     /*shared=*/false, [&] {
+                       EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index),
+                                 small);
+                     });
+  ++VectorSVSTestPeer::LongOperations(**index);
+  WhileHeldElsewhere(
+      VectorSVSTestPeer::ResizeMutex(**index), /*shared=*/false, [&] {
+        EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index), small);
+      });
+  --VectorSVSTestPeer::LongOperations(**index);
+  EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**index), small);
 }
 
 TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {

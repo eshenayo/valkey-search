@@ -1296,6 +1296,8 @@ void VectorSVS<T>::MaybeConsolidate() {
   }
   // Consolidation rewrites graph edges, so it excludes the other writers;
   // searches are already excluded by the mutation phase.
+  ++long_operations_;
+  absl::Cleanup long_operation_done = [this] { --long_operations_; };
   absl::WriterMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr || !due()) return;
   ScopedSvsError err;
@@ -1326,6 +1328,8 @@ void VectorSVS<T>::MaybeConsolidate() {
 template <typename T>
 void VectorSVS<T>::ConsolidateConcurrently() {
   absl::Cleanup done = [this] { consolidating_.store(false); };
+  ++long_operations_;
+  absl::Cleanup long_operation_done = [this] { --long_operations_; };
   // SVS consolidates a FINE_GRAIN index alongside writers and searches.
   absl::ReaderMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr ||
@@ -1337,6 +1341,7 @@ void VectorSVS<T>::ConsolidateConcurrently() {
     absl::ReaderMutexLock map_lock(&label_mutex_);
     before = deleted_ids_.size();
   }
+  absl::MutexLock busy(&consolidation_mutex_);
   ScopedSvsError err;
   const absl::Time start = absl::Now();
   if (!svs_index_dynamic_consolidate(svs_index_, err.get())) {
@@ -1374,6 +1379,22 @@ void VectorSVS<T>::ConsolidateConcurrently() {
 }
 
 template <typename T>
+size_t VectorSVS<T>::MemoryBytesForInfo() const {
+  if (long_operations_.load() > 0) return memory_bytes_.load();
+  absl::ReaderMutexLock lock(&resize_mutex_);
+  // A consolidation that starts after the check above waits for this query
+  // rather than the other way round.
+  if (svs_index_ != nullptr && consolidation_mutex_.TryLock()) {
+    size_t bytes = 0;
+    if (svs_index_get_memory_usage(svs_index_, &bytes, nullptr)) {
+      memory_bytes_.store(bytes);
+    }
+    consolidation_mutex_.Unlock();
+  }
+  return memory_bytes_.load();
+}
+
+template <typename T>
 SVSBuildConfig VectorSVS<T>::StorageConfig() const {
   if (!compression_pending_.load(std::memory_order_acquire)) {
     return build_config_;
@@ -1394,6 +1415,8 @@ void VectorSVS<T>::MaybeConvert() {
   }
   // Conversion copies the index, so it excludes writers; searches are already
   // excluded by the mutation phase.
+  ++long_operations_;
+  absl::Cleanup long_operation_done = [this] { --long_operations_; };
   absl::WriterMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr ||
       !compression_pending_.load(std::memory_order_relaxed)) {
@@ -1503,12 +1526,7 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   // first add.
   size_t memory_bytes = 0;
 #if defined(__linux__) && defined(__x86_64__)
-  {
-    absl::ReaderMutexLock lock(&resize_mutex_);
-    if (svs_index_ != nullptr) {
-      svs_index_get_memory_usage(svs_index_, &memory_bytes, nullptr);
-    }
-  }
+  memory_bytes = MemoryBytesForInfo();
 #endif
   ValkeyModule_ReplyWithSimpleString(ctx, "memory_bytes");
   ValkeyModule_ReplyWithLongLong(ctx, static_cast<long long>(memory_bytes));
