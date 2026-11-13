@@ -131,7 +131,8 @@ def latency_summary(latencies_ms: List[float]) -> Dict[str, float]:
         return {}
     a = np.array(latencies_ms)
     return {"avg": float(a.mean()), "p50": float(np.percentile(a, 50)),
-            "p99": float(np.percentile(a, 99)), "max": float(a.max())}
+            "p99": float(np.percentile(a, 99)),
+            "p999": float(np.percentile(a, 99.9)), "max": float(a.max())}
 
 
 def knn(client, query: bytes, k: int, ef: Optional[int]) -> List[int]:
@@ -282,7 +283,8 @@ def run_writes(pool, writers: int, ops) -> Dict:
     elapsed = time.perf_counter() - start
     return {"ops": len(ops), "elapsed_sec": elapsed,
             "ops_per_sec": len(ops) / elapsed,
-            "latency_ms": latency_summary(latencies)}
+            "latency_ms": latency_summary(latencies),
+            "latencies_ms": latencies}
 
 
 def timed(fn) -> float:
@@ -364,6 +366,11 @@ def run_benchmark(args, seed: int) -> Dict:
         # 3. Churn while readers search.
         per_round = int(num_vectors * args.churn_fraction)
         rounds, writes = [], []
+        # Every churn write's latency, by phase, pooled over all rounds. A
+        # pause stalls about one write per writer client, which can be over
+        # 1% of a small round, so a round's p99 can show a pause that the
+        # whole-run p99 doesn't.
+        phase_latencies = {"delete": [], "insert": [], "update": []}
         stop = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(1) as ex:
             readers = ex.submit(run_searches, pool, args, queries, None, stop)
@@ -401,6 +408,9 @@ def run_benchmark(args, seed: int) -> Dict:
                     "deleted_slots_after_update":
                         after_update.get("deleted_slots"),
                     "memory_bytes": after_update["memory_bytes"]})
+                for phase, op in zip(phase_latencies,
+                                     (deletes, inserts, updates)):
+                    phase_latencies[phase] += op.pop("latencies_ms")
                 writes.append((deletes, inserts, updates))
                 print(f"churn round {r + 1}: memory_bytes="
                       f"{after_update['memory_bytes']} deleted_slots="
@@ -422,6 +432,8 @@ def run_benchmark(args, seed: int) -> Dict:
 
         results["churn"] = {
             "rounds": rounds,
+            "latency_ms": {phase: latency_summary(v)
+                           for phase, v in phase_latencies.items()},
             "worst_write_ms": max(
                 op["latency_ms"]["max"] for ops in writes for op in ops),
             "write_ops_per_sec": total_ops / churn_elapsed,
@@ -531,8 +543,12 @@ SUMMARY = [
     "search_at_rest.latency_ms.p99",
     "search_at_rest.recall",
     "churn.write_ops_per_sec",
-    "churn.insert_latency_ms_p99_max",
-    "churn.update_latency_ms_p99_max",
+    "churn.latency_ms.delete.p99",
+    "churn.latency_ms.delete.p999",
+    "churn.latency_ms.insert.p99",
+    "churn.latency_ms.insert.p999",
+    "churn.latency_ms.update.p99",
+    "churn.latency_ms.update.p999",
     "churn.worst_write_ms",
     "churn.search_during_churn.qps",
     "churn.search_during_churn.latency_ms.p99",
