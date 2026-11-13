@@ -237,6 +237,22 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         client.hset("doc:3", mapping={"v": _fp32([99.0, 99.0, 99.0, 99.0])})
         assert _v_index(client, "svs_idx")["size"] == 5
 
+    def test_ft_info_reports_deleted_slots(self):
+        """FT.INFO deleted_slots counts deleted vectors whose slots SVS
+        still holds; a SAVE consolidates them away."""
+        client: Valkey = self.server.get_new_client()
+        self._create_default_index(client)
+
+        def deleted_slots():
+            return _v_index(client, "svs_idx")["algorithm"]["deleted_slots"]
+
+        assert deleted_slots() == 0
+        self._populate(client, 5)
+        client.delete("doc:2", "doc:5")
+        assert deleted_slots() == 2
+        client.execute_command("SAVE")
+        assert deleted_slots() == 0
+
     def test_knn_returns_correct_neighbors_and_distances(self):
         """L2 distances are exact for a small deterministic axis-aligned set."""
         client: Valkey = self.server.get_new_client()

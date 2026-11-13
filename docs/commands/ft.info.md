@@ -119,7 +119,8 @@ For `SVS_VAMANA`, `capacity` is the field's `INITIAL_CAP` (10240 unless `FT.CREA
 - `unavailable` (string) Why this build can't create the field's storage. Only present for such a field, which tracks its keys and fails the searches that need its storage (see the SVS_VAMANA notes in [FT.CREATE](ft.create.md#svs_vamana-notes)).
 - `training_threshold` (integer) The number of vectors the index holds uncompressed before it converts to `SQ8`. Only present for `SVS_COMPRESSION_SQ8`.
 - `compression_pending` (integer) `1` while the index is still uncompressed, `0` once it has converted. Only present for `SVS_COMPRESSION_SQ8`.
-- `memory_bytes` (integer) Bytes SVS holds for this field's graph, vector data and metadata. `0` before the first vector is added. SVS allocates in blocks sized by `INITIAL_CAP`, so the value grows in steps.
+- `memory_bytes` (integer) Bytes SVS holds for this field's graph, vector data and metadata. `0` before the first vector is added. SVS allocates in blocks sized by `INITIAL_CAP`, so the value grows in steps. While the index is being consolidated or converted, it shows the value from before, so `FT.INFO` doesn't wait for that work.
+- `deleted_slots` (integer) Deleted vectors whose slots SVS still holds. Consolidation, which runs once they reach a quarter of the live vectors (at least 1024), and `SAVE` reclaim them; `BGSAVE` reclaims them only in the saved copy.
 
 ### Response when the PRIMARY option is specified.
 

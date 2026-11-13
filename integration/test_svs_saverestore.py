@@ -143,11 +143,12 @@ def _collect_knn(client: Valkey, index: str, num_vectors: int, anchor=None, dim:
     return results
 
 
-def _bgsave_and_restart(test, backfill_timeout: int = 30):
+def _bgsave_and_restart(test, backfill_timeout: int = 30, before_restart=None):
     """BGSAVE, wait for it to finish, then hard-restart the server against
     the resulting RDB. Unlike DEBUG RELOAD this forks, which is the only way
     to exercise the AtForkPrepare-suspended save path the design doc calls
-    out as the actual gate."""
+    out as the actual gate. `before_restart`, if given, runs once the save
+    is done, against the server that saved."""
     # valkey-py's default BGSAVE callback maps every reply to True.
     test.client.set_response_callback("BGSAVE", lambda r, **kw: r)
     reply = test.client.execute_command("BGSAVE")
@@ -157,6 +158,8 @@ def _bgsave_and_restart(test, backfill_timeout: int = 30):
     # too, so without this assert the restart would read the stale RDB.
     assert reply == "Background saving started", reply
     test.server.wait_for_save_done(test.client)
+    if before_restart is not None:
+        before_restart()
     test.server.restart(remove_rdb=False)
     assert test.client.ping()
     waiters.wait_for_true(
@@ -472,6 +475,47 @@ class TestSvsSaveRestoreSq8(ValkeySearchTestCaseDebugMode):
         assert info["algorithm"]["compression_pending"] == 0
         self._assert_knn_preserved(pre,
                                    _collect_knn(client, index, self.THRESHOLD))
+
+
+class TestSvsSaveRestoreDeletedSlots(ValkeySearchTestCaseDebugMode):
+    """Deleted slots don't survive a reload: SVS's save consolidates them,
+    so the loaded index reports none and searches never return a deleted key.
+    BGSAVE consolidates in the forked child only, so the saving server keeps
+    its deleted slots."""
+
+    NUM_VECTORS = 10
+    DELETED = ["doc:1", "doc:2", "doc:3"]
+
+    @pytest.mark.parametrize("how", ["debug_reload", "bgsave_restart"])
+    def test_reload_drops_deleted_slots(self, how):
+        client: Valkey = self.client
+        index = self.index_name = f"svs_deleted_{how}"
+        _create_svs_index(client, index)
+        _populate(client, self.NUM_VECTORS)
+        waiters.wait_for_equal(
+            lambda: _v_index(client, index)["size"], self.NUM_VECTORS,
+            timeout=30)
+        client.delete(*self.DELETED)
+
+        def deleted_slots():
+            return _v_index(client, index)["algorithm"]["deleted_slots"]
+
+        def saver_keeps_deleted_slots():
+            assert deleted_slots() == len(self.DELETED)
+
+        saver_keeps_deleted_slots()
+        if how == "debug_reload":
+            client.execute_command("DEBUG", "RELOAD")
+        else:
+            _bgsave_and_restart(self, before_restart=saver_keeps_deleted_slots)
+        live = self.NUM_VECTORS - len(self.DELETED)
+        waiters.wait_for_equal(
+            lambda: _v_index(client, index)["size"], live, timeout=30)
+        assert deleted_slots() == 0
+        keys = _score_map(_knn(client, index, [1.0] + [0.0] * (DIM - 1),
+                               self.NUM_VECTORS)).keys()
+        assert len(keys) == live
+        assert not {k.decode() for k in keys} & set(self.DELETED)
 
 
 class TestSvsSaveRestoreScale(ValkeySearchTestCaseDebugMode):
