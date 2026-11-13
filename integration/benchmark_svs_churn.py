@@ -5,7 +5,15 @@ SVS_VAMANA churn benchmark for Valkey Search.
 Measures one module build under a delete-and-insert workload at a constant
 live count, so two builds (for example before and after a change) can be
 compared on the same server binary and hardware. Run it once per module and
-compare the JSON outputs.
+compare the JSON outputs: each run repeats the whole benchmark (--repeats,
+fresh server and seed each time) and reports every run plus the median, min
+and max, since QPS in particular varies a lot between identical runs.
+
+Datasets: uniform random vectors (--dataset uniform, a hard case for graph
+indexes; the default EF_RUNTIME 400 gives recall@10 of about 0.98 on 50K x
+128-d), or the Cohere wiki embedding subset that test_recall_cohere.py
+downloads (--dataset cohere, 10K x 768-d with its 100 queries; 80% of the
+vectors start live and churn draws inserts and updates from the rest).
 
 Phases:
   1. Ingest: pipelined HSETs, then the time until the index has caught up.
@@ -135,28 +143,65 @@ def knn(client, query: bytes, k: int, ef: Optional[int]) -> List[int]:
 
 
 class Dataset:
-    """Live vectors by key number, and exact neighbours over them."""
+    """Live vectors by key number, and exact neighbours over them. Vectors
+    are random, or drawn from a fixed pool (each pool vector is live at most
+    once, so exact neighbours stay well defined)."""
 
-    def __init__(self, dim: int, metric: str, seed: int):
+    def __init__(self, dim: int, metric: str, seed: int, pool=None,
+                 query_set=None):
         self.dim = dim
         self.metric = metric
         self.rng = np.random.default_rng(seed)
         self.live: Dict[int, np.ndarray] = {}
         self.next_id = 0
+        self.pool = pool
+        self.query_set = query_set
+        self.pool_index: Dict[int, int] = {}  # key -> pool row
+        if pool is not None:
+            self.free = list(self.rng.permutation(len(pool)))
+
+    def _take(self, n: int):
+        if self.pool is None:
+            return [None] * n, self.rng.random((n, self.dim), dtype=np.float32)
+        rows, self.free = self.free[:n], self.free[n:]
+        assert len(rows) == n, "vector pool exhausted"
+        return rows, self.pool[rows]
+
+    def _give_back(self, key: int):
+        if self.pool is not None:
+            self.free.append(self.pool_index.pop(key))
 
     def new_vectors(self, n: int) -> List[int]:
         ids = list(range(self.next_id, self.next_id + n))
-        vectors = self.rng.random((n, self.dim), dtype=np.float32)
-        for i, v in zip(ids, vectors):
+        rows, vectors = self._take(n)
+        for i, row, v in zip(ids, rows, vectors):
             self.live[i] = v
+            if row is not None:
+                self.pool_index[i] = row
         self.next_id += n
         return ids
+
+    def delete(self, keys: List[int]):
+        for i in keys:
+            del self.live[i]
+            self._give_back(i)
+
+    def update(self, keys: List[int]):
+        """Gives each key a new vector."""
+        rows, vectors = self._take(len(keys))
+        for i, row, v in zip(keys, rows, vectors):
+            self._give_back(i)
+            self.live[i] = v
+            if row is not None:
+                self.pool_index[i] = row
 
     def sample_live(self, n: int) -> List[int]:
         keys = np.fromiter(self.live.keys(), dtype=np.int64)
         return self.rng.choice(keys, size=n, replace=False).tolist()
 
     def queries(self, n: int) -> np.ndarray:
+        if self.query_set is not None:
+            return self.query_set[np.arange(n) % len(self.query_set)]
         return self.rng.random((n, self.dim), dtype=np.float32)
 
     def exact_top_k(self, queries: np.ndarray, k: int) -> List[set]:
@@ -176,6 +221,8 @@ class Dataset:
 
 
 def recall(client, data: Dataset, n_queries: int, k: int, ef) -> float:
+    if data.query_set is not None:
+        n_queries = min(n_queries, len(data.query_set))
     queries = data.queries(n_queries)
     expected = data.exact_top_k(queries, k)
     hits = sum(len(set(knn(client, q.tobytes(), k, ef)) & e)
@@ -257,7 +304,15 @@ def bgsave(client) -> Dict:
             "cow_bytes": persistence.get("rdb_last_cow_size")}
 
 
-def run_benchmark(args) -> Dict:
+def load_dataset(args, seed: int) -> Dataset:
+    if args.dataset == "uniform":
+        return Dataset(args.dim, args.metric, seed)
+    npz = np.load(args.cohere_npz)
+    return Dataset(npz["base"].shape[1], args.metric, seed, pool=npz["base"],
+                   query_set=npz["query"])
+
+
+def run_benchmark(args, seed: int) -> Dict:
     port = args.port or find_free_port()
     work_dir = tempfile.mkdtemp(prefix="svs_churn_bench_")
     proc = pool = None
@@ -266,19 +321,21 @@ def run_benchmark(args) -> Dict:
                             args.server_log)
         pool = valkey.ConnectionPool(port=port, max_connections=256)
         client = valkey.Valkey(connection_pool=pool)
-        params = ["TYPE", "FLOAT32", "DIM", str(args.dim),
+        data = load_dataset(args, seed)
+        num_vectors = args.num_vectors
+        if data.pool is not None:
+            num_vectors = min(num_vectors, int(len(data.pool) * 0.8))
+        params = ["TYPE", "FLOAT32", "DIM", str(data.dim),
                   "DISTANCE_METRIC", args.metric]
         if args.compression != "NONE":
             params += ["COMPRESSION", args.compression]
         client.execute_command(
             "FT.CREATE", INDEX, "PREFIX", "1", PREFIX, "SCHEMA", "v",
             "VECTOR", "SVS_VAMANA", str(len(params)), *params)
-        data = Dataset(args.dim, args.metric, args.seed)
-        results = {"config": {**vars(args),
-                              "module_sha256": sha256_of(args.module)}}
+        results = {"seed": seed, "num_vectors": num_vectors}
 
         # 1. Ingest.
-        ids = data.new_vectors(args.num_vectors)
+        ids = data.new_vectors(num_vectors)
         ops = [("HSET", f"{PREFIX}{i}", data.live[i].tobytes()) for i in ids]
         start = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(args.writers) as ex:
@@ -287,11 +344,11 @@ def run_benchmark(args) -> Dict:
                       for w in range(args.writers)]:
                 f.result()
         sent = time.perf_counter() - start
-        caught_up = wait_settled(client, args.num_vectors, args.timeout)
+        caught_up = wait_settled(client, num_vectors, args.timeout)
         results["ingest"] = {
-            "vectors": args.num_vectors, "send_sec": sent,
+            "vectors": num_vectors, "send_sec": sent,
             "indexed_sec": sent + caught_up,
-            "vectors_per_sec": args.num_vectors / (sent + caught_up),
+            "vectors_per_sec": num_vectors / (sent + caught_up),
             "memory_bytes": algorithm(client)["memory_bytes"]}
         print(f"ingest: {results['ingest']}")
 
@@ -305,7 +362,7 @@ def run_benchmark(args) -> Dict:
         print(f"search at rest: {results['search_at_rest']}")
 
         # 3. Churn while readers search.
-        per_round = int(args.num_vectors * args.churn_fraction)
+        per_round = int(num_vectors * args.churn_fraction)
         rounds, writes = [], []
         stop = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(1) as ex:
@@ -316,8 +373,7 @@ def run_benchmark(args) -> Dict:
                 deletes = run_writes(pool, args.writers,
                                      [("DEL", f"{PREFIX}{i}", None)
                                       for i in victims])
-                for i in victims:
-                    del data.live[i]
+                data.delete(victims)
                 wait_settled(client, len(data.live), args.timeout)
                 after_delete = algorithm(client)
                 new_ids = data.new_vectors(per_round)
@@ -328,8 +384,7 @@ def run_benchmark(args) -> Dict:
                 wait_settled(client, len(data.live), args.timeout)
                 after_insert = algorithm(client)
                 updated = data.sample_live(per_round)
-                for i, v in zip(updated, data.queries(per_round)):
-                    data.live[i] = v
+                data.update(updated)
                 updates = run_writes(pool, args.writers,
                                      [("HSET", f"{PREFIX}{i}",
                                        data.live[i].tobytes())
@@ -367,6 +422,8 @@ def run_benchmark(args) -> Dict:
 
         results["churn"] = {
             "rounds": rounds,
+            "worst_write_ms": max(
+                op["latency_ms"]["max"] for ops in writes for op in ops),
             "write_ops_per_sec": total_ops / churn_elapsed,
             "delete_ops_per_sec": ops_per_sec(0),
             "insert_ops_per_sec": ops_per_sec(1),
@@ -396,11 +453,6 @@ def run_benchmark(args) -> Dict:
             algorithm(client)["memory_bytes"]
         results["persistence"] = persistence
         print(f"persistence: {persistence}")
-
-        if args.output_json:
-            with open(args.output_json, "w") as f:
-                json.dump(results, f, indent=2)
-            print(f"results written to {args.output_json}")
         return results
     finally:
         if pool is not None:
@@ -423,7 +475,14 @@ def main():
     p.add_argument("--server", required=True, help="valkey-server binary")
     p.add_argument("--module", required=True, help="libsearch.so to measure")
     p.add_argument("--port", type=int, default=0)
-    p.add_argument("--dim", type=int, default=128)
+    p.add_argument("--dataset", default="uniform",
+                   choices=["uniform", "cohere"])
+    p.add_argument("--cohere_npz",
+                   default=os.path.join(os.path.dirname(os.path.abspath(
+                       __file__)), "test-data", "cohere_subset.npz"),
+                   help="cache written by test_recall_cohere.py")
+    p.add_argument("--dim", type=int, default=128,
+                   help="vector dimension for --dataset uniform")
     p.add_argument("--num_vectors", type=int, default=100000)
     p.add_argument("--metric", default="L2", choices=["L2", "IP", "COSINE"])
     p.add_argument("--compression", default="NONE",
@@ -435,16 +494,68 @@ def main():
     p.add_argument("--writers", type=int, default=8)
     p.add_argument("--readers", type=int, default=8)
     p.add_argument("--k", type=int, default=10)
-    p.add_argument("--ef_runtime", type=int, default=None)
+    p.add_argument("--ef_runtime", type=int, default=400,
+                   help="search window; 400 gives recall@10 of about 0.98 "
+                        "on uniform 50K x 128-d")
     p.add_argument("--search_duration", type=float, default=20)
     p.add_argument("--recall_queries", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=500)
     p.add_argument("--timeout", type=float, default=900)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                   help="seed of the first run; run i uses seed + i")
+    p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--output_json", default="")
     p.add_argument("--server_log", default="",
                    help="keep the valkey-server log at this path")
-    run_benchmark(p.parse_args())
+    args = p.parse_args()
+    runs = []
+    for i in range(args.repeats):
+        print(f"=== run {i + 1} of {args.repeats}")
+        runs.append(run_benchmark(args, args.seed + i))
+    summary = {path: spread([dig(r, path) for r in runs]) for path in SUMMARY}
+    for path, s in summary.items():
+        print(f"{path}: median {s['median']:.4g} (min {s['min']:.4g}, "
+              f"max {s['max']:.4g})")
+    if args.output_json:
+        with open(args.output_json, "w") as f:
+            json.dump({"config": {**vars(args),
+                                  "module_sha256": sha256_of(args.module)},
+                       "summary": summary, "runs": runs}, f, indent=2)
+        print(f"results written to {args.output_json}")
+
+
+# Metrics summarized across runs, as paths into a run's results.
+SUMMARY = [
+    "ingest.vectors_per_sec",
+    "search_at_rest.qps",
+    "search_at_rest.latency_ms.p99",
+    "search_at_rest.recall",
+    "churn.write_ops_per_sec",
+    "churn.insert_latency_ms_p99_max",
+    "churn.update_latency_ms_p99_max",
+    "churn.worst_write_ms",
+    "churn.search_during_churn.qps",
+    "churn.search_during_churn.latency_ms.p99",
+    "churn.search_during_churn.latency_ms.max",
+    "churn.recall_after",
+    "churn.memory_bytes_growth",
+    "persistence.bgsave.elapsed_sec",
+    "persistence.bgsave.cow_bytes",
+    "persistence.save_sec",
+    "persistence.debug_reload_sec",
+]
+
+
+def dig(results: Dict, path: str):
+    for part in path.split("."):
+        results = results[part]
+    return results
+
+
+def spread(values: List[float]) -> Dict[str, float]:
+    values = sorted(v for v in values if v is not None)
+    return {"median": float(np.median(values)), "min": values[0],
+            "max": values[-1]}
 
 
 if __name__ == "__main__":
