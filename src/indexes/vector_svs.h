@@ -19,6 +19,7 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/node_hash_map.h"
+#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -39,6 +40,8 @@
 extern "C" {
 struct svs_index;
 typedef struct svs_index *svs_index_h;
+struct svs_index_builder;
+typedef struct svs_index_builder *svs_index_builder_h;
 struct svs_threadpool_interface_ops;
 struct svs_threadpool_interface;
 }
@@ -74,6 +77,10 @@ struct SVSBuildConfig {
   uint32_t training_threshold{0};
   // LeanVec only: the reduced dimension count, resolved at FT.CREATE.
   uint32_t leanvec_dims{0};
+  // LeanVec only: how many of the training vectors train the projection as
+  // queries (out-of-distribution); 0 trains it with PCA. Resolved at
+  // FT.CREATE.
+  uint32_t training_query_count{0};
 };
 
 // Routes SVS's default logger to the Valkey log. Call once at module load.
@@ -81,7 +88,8 @@ void InitSvsLogging();
 
 // Estimated bytes a conversion of `vectors` uncompressed vectors to
 // config.compression allocates while the source index still exists: the
-// converted data and graph, and for LeanVec its PCA working set.
+// converted data and graph, and for LeanVec the vectors it trains its
+// projection on and the training's working set.
 uint64_t SvsConversionPeakBytes(const SVSBuildConfig &config, int dimensions,
                                 size_t vectors);
 
@@ -91,6 +99,14 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig &config, int dimensions,
 // bound.
 size_t SvsConversionRows(const SVSBuildConfig &config, int dimensions,
                          size_t live, size_t source_data_bytes);
+
+// The vectors LeanVec trains on: the first `count` labels in insertion order
+// (labels grow with it) that `present` accepts. Bounded by the training
+// threshold, so a late conversion trains on the same vectors, at the same
+// cost, as one on time.
+std::vector<size_t> SelectSvsTrainingIds(
+    std::vector<uint64_t> labels, size_t count,
+    absl::FunctionRef<bool(uint64_t)> present);
 
 // Bytes the system, or the process's cgroup if lower, can still allocate:
 // MemAvailable, and each cgroup v1/v2 memory limit up the hierarchy minus its
@@ -216,6 +232,13 @@ class VectorSVS : public VectorType<T> {
   // update or delete). A failed or skipped conversion is logged, counted, and
   // retried after 2, 4, 8, ... more writes, at most training_threshold.
   void MaybeConvert() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
+  // LeanVec: trains the projection on SelectSvsTrainingIds' vectors, the last
+  // build_config_.training_query_count of them as queries (out-of-
+  // distribution) and the rest as data, or with PCA when the count is 0, and
+  // sets the trained storage on `builder`.
+  absl::Status TrainLeanVecProjection(svs_index_builder_h builder)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(resize_mutex_)
+          ABSL_LOCKS_EXCLUDED(label_mutex_);
   // SVS reuses deleted slots only after consolidating and compacting. Does
   // both once enough slots have been deleted, so update-heavy workloads stay
   // bounded.

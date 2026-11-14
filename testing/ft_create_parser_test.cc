@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -24,6 +25,7 @@
 #include "src/indexes/svs_capabilities.h"
 #include "src/indexes/text/languages/french.h"
 #include "src/indexes/text/languages/german.h"
+#include "vmsdk/src/log.h"
 #include "vmsdk/src/testing_infra/module.h"
 #include "vmsdk/src/testing_infra/utils.h"
 
@@ -84,8 +86,9 @@ struct FTCreateParserTestCase {
   int text_field_count{0};
   std::vector<HNSWParameters> hnsw_parameters;
   std::vector<FlatParameters> flat_parameters;
-  // For SQ8, training_threshold is the value the proto should hold (1024
-  // when TRAINING_THRESHOLD is omitted); unset means 0.
+  // For SQ8, training_threshold is the value the proto should hold
+  // (kDefaultSVSTrainingThreshold when TRAINING_THRESHOLD is omitted); unset
+  // means 0.
   std::vector<SVSVamanaParameters> svs_parameters;
   std::vector<FTCreateTagParameters> tag_parameters;
   std::vector<PerFieldTextParams> text_parameters;
@@ -1206,7 +1209,7 @@ INSTANTIATE_TEST_SUITE_P(
                  /* .search_window_size =*/kDefaultSVSSearchWindowSize,
                  /* .alpha =*/kDefaultSVSAlphaSentinel,
                  /* .compression =*/data_model::SVS_COMPRESSION_SQ8,
-                 /* .training_threshold =*/1024,
+                 /* .training_threshold =*/kDefaultSVSTrainingThreshold,
              }},
              .expected = {.index_schema_name = "idx1",
                           .on_data_type = data_model::ATTRIBUTE_DATA_TYPE_HASH,
@@ -1233,7 +1236,7 @@ INSTANTIATE_TEST_SUITE_P(
                  /* .search_window_size =*/kDefaultSVSSearchWindowSize,
                  /* .alpha =*/kDefaultSVSAlphaSentinel,
                  /* .compression =*/data_model::SVS_COMPRESSION_SQ8,
-                 /* .training_threshold =*/1024,
+                 /* .training_threshold =*/kDefaultSVSTrainingThreshold,
              }},
              .expected = {.index_schema_name = "idx1",
                           .on_data_type = data_model::ATTRIBUTE_DATA_TYPE_HASH,
@@ -2976,9 +2979,9 @@ TEST(FTCreateParserSvsTest, LeanVecChecksRunOnEveryBuild) {
   }
 }
 
-// Without TRAINING_THRESHOLD, LeanVec's default is raised to its floor, so
-// FT.CREATE keeps working for any DIM; the other trained kinds keep the plain
-// default. ToProto needs no LVQ/LeanVec-capable build.
+// Without TRAINING_THRESHOLD, LeanVec takes its own default, raised to its
+// floor, so FT.CREATE keeps working for any DIM; the other trained kinds keep
+// the plain default. ToProto needs no LVQ/LeanVec-capable build.
 TEST(FTCreateParserSvsTest, LeanVecDefaultThresholdCoversTheFloor) {
   struct Case {
     int dimensions;
@@ -2987,12 +2990,9 @@ TEST(FTCreateParserSvsTest, LeanVecDefaultThresholdCoversTheFloor) {
   };
   for (const auto compression : kLeanVecKinds) {
     for (const auto &c : std::vector<Case>{
-             {2048, std::nullopt,
-              std::max(kDefaultSVSTrainingThreshold,
-                       SVSLeanVecMinTrainingThreshold(2048))},
-             {128, std::nullopt,
-              std::max(kDefaultSVSTrainingThreshold,
-                       SVSLeanVecMinTrainingThreshold(128))},
+             {2048, std::nullopt, kDefaultSVSLeanVecTrainingThreshold},
+             {16384, std::nullopt, SVSLeanVecMinTrainingThreshold(16384)},
+             {128, std::nullopt, kDefaultSVSLeanVecTrainingThreshold},
              {2048, 4096, 4096},
          }) {
       SVSVamanaParameters params;
@@ -3014,6 +3014,153 @@ TEST(FTCreateParserSvsTest, LeanVecDefaultThresholdCoversTheFloor) {
               kDefaultSVSTrainingThreshold)
         << data_model::SVSCompressionType_Name(compression);
   }
+}
+
+// TRAINING_QUERY_COUNT resolves at FT.CREATE: absent, the default; either
+// way capped so the data part keeps half the threshold and at least DIM
+// vectors, with PCA (0) when no room is left. ToProto needs no
+// LVQ/LeanVec-capable build.
+TEST(FTCreateParserSvsTest, LeanVecTrainingQueryCountResolves) {
+  struct Case {
+    std::optional<uint32_t> training_threshold;
+    std::optional<uint32_t> training_query_count;
+    uint32_t expected;
+  };
+  for (const auto compression : kLeanVecKinds) {
+    for (const auto &c : std::vector<Case>{
+             {std::nullopt, std::nullopt, kDefaultSVSTrainingQueryCount},
+             {4000, std::nullopt, 2000},
+             {10000, 100, 100},
+             {10000, 0, 0},
+             {10000, 8000, 5000},
+             // DIM 128 caps it: 200 - 128 = 72 leaves 128 data vectors.
+             {200, 150, 72},
+             {128, std::nullopt, 0},
+         }) {
+      SVSVamanaParameters params;
+      params.dimensions = 128;
+      params.compression = compression;
+      params.training_threshold = c.training_threshold;
+      params.training_query_count = c.training_query_count;
+      EXPECT_EQ(params.ToProto()->svs_vamana_algorithm().training_query_count(),
+                c.expected)
+          << data_model::SVSCompressionType_Name(compression) << " threshold "
+          << c.training_threshold.value_or(0) << " count "
+          << c.training_query_count.value_or(0);
+    }
+  }
+  SVSVamanaParameters sq8;
+  sq8.dimensions = 128;
+  sq8.compression = data_model::SVS_COMPRESSION_SQ8;
+  EXPECT_EQ(sq8.ToProto()->svs_vamana_algorithm().training_query_count(), 0);
+}
+
+// TRAINING_QUERY_COUNT is LeanVec's, and must leave some training vectors as
+// data.
+TEST(FTCreateParserSvsTest, TrainingQueryCountRules) {
+  auto verify = [](data_model::SVSCompressionType compression,
+                   std::optional<uint32_t> training_threshold,
+                   uint32_t training_query_count) {
+    SVSVamanaParameters params;
+    params.dimensions = 128;
+    params.distance_metric = data_model::DISTANCE_METRIC_L2;
+    params.vector_data_type = data_model::VECTOR_DATA_TYPE_FLOAT32;
+    params.compression = compression;
+    params.training_threshold = training_threshold;
+    params.training_query_count = training_query_count;
+    return params.Verify();
+  };
+  for (const auto compression : kLeanVecKinds) {
+    const std::string kind = data_model::SVSCompressionType_Name(compression);
+    EXPECT_THAT(verify(compression, 4000, 4000).message(),
+                testing::HasSubstr("TRAINING_QUERY_COUNT (4000) must be less "
+                                   "than TRAINING_THRESHOLD (4000)."))
+        << kind;
+    EXPECT_THAT(verify(compression, std::nullopt, 10000).message(),
+                testing::HasSubstr(absl::StrCat(
+                    "TRAINING_QUERY_COUNT (10000) must be less than "
+                    "TRAINING_THRESHOLD (",
+                    kDefaultSVSLeanVecTrainingThreshold, ").")))
+        << kind;
+    const absl::Status allowed = verify(compression, 4000, 3999);
+    if (indexes::SvsLvqLeanVecSupported()) {
+      VMSDK_EXPECT_OK(allowed) << kind;
+    } else {
+      EXPECT_THAT(allowed.message(),
+                  testing::HasSubstr("requires an SVS build with LVQ/LeanVec"))
+          << kind;
+    }
+  }
+  for (const auto compression :
+       {data_model::SVS_COMPRESSION_LVQ8, data_model::SVS_COMPRESSION_SQ8,
+        data_model::SVS_COMPRESSION_NONE}) {
+    EXPECT_THAT(verify(compression, std::nullopt, 10).message(),
+                testing::HasSubstr(
+                    "TRAINING_QUERY_COUNT requires a LEANVEC COMPRESSION."))
+        << data_model::SVSCompressionType_Name(compression);
+  }
+}
+
+class FTCreateParserSvsLogTest : public vmsdk::ValkeyTest {};
+
+// A TRAINING_QUERY_COUNT that would leave too few data vectors is capped,
+// with a warning naming the index, the field and both values, and PCA when
+// nothing is left; a count within the cap, or the default capped by a small
+// threshold, logs nothing.
+TEST_F(FTCreateParserSvsLogTest, CappedTrainingQueryCountWarns) {
+  if (!indexes::SvsLvqLeanVecSupported()) {
+    GTEST_SKIP() << "FT.CREATE with LEANVEC needs the prebuilt SVS C API on "
+                    "an Intel CPU";
+  }
+  // Only warnings and above are logged, so the message must be one.
+  VMSDK_EXPECT_OK(vmsdk::InitLogging(nullptr, "warning"));
+  absl::Cleanup restore_level = [] {
+    VMSDK_EXPECT_OK(vmsdk::InitLogging(nullptr, "notice"));
+  };
+  auto parse = [](absl::string_view rest, uint32_t args) {
+    auto argv = vmsdk::ToValkeyStringVector(absl::StrCat(
+        "idx on HASH SCHEMA vec VECTOR SVS_VAMANA ", args,
+        " TYPE FLOAT32 DIM 128 DISTANCE_METRIC L2 COMPRESSION LEANVEC4X8 ",
+        rest));
+    return ParseFTCreateArgs(nullptr, argv.data(), argv.size());
+  };
+  EXPECT_CALL(*kMockValkeyModule, Log(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*kMockValkeyModule,
+              Log(testing::_, testing::_,
+                  testing::HasSubstr(
+                      "SVS_VAMANA index idx, field vec: TRAINING_QUERY_COUNT "
+                      "8000 would leave too few of the 10000 training vectors "
+                      "as data (at least half, and at least DIM 128); using "
+                      "5000.")))
+      .Times(1);
+  EXPECT_CALL(*kMockValkeyModule,
+              Log(testing::_, testing::_,
+                  testing::HasSubstr(
+                      "TRAINING_QUERY_COUNT 100 would leave too few of the 128 "
+                      "training vectors as data (at least half, and at least "
+                      "DIM 128); using 0, so LeanVec trains with PCA.")))
+      .Times(1);
+  VMSDK_EXPECT_OK(
+      parse("TRAINING_THRESHOLD 128 TRAINING_QUERY_COUNT 100", 12).status());
+  auto capped = parse("TRAINING_QUERY_COUNT 8000", 10);
+  ASSERT_TRUE(capped.ok()) << capped.status();
+  EXPECT_EQ(capped->attributes(0)
+                .index()
+                .vector_index()
+                .svs_vamana_algorithm()
+                .training_query_count(),
+            5000);
+  testing::Mock::VerifyAndClearExpectations(kMockValkeyModule);
+
+  EXPECT_CALL(*kMockValkeyModule, Log(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(
+      *kMockValkeyModule,
+      Log(testing::_, testing::_, testing::HasSubstr("TRAINING_QUERY_COUNT")))
+      .Times(0);
+  VMSDK_EXPECT_OK(parse("TRAINING_QUERY_COUNT 100", 10).status());
+  VMSDK_EXPECT_OK(parse("TRAINING_THRESHOLD 4000", 10).status());
 }
 
 }  // namespace
