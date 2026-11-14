@@ -28,14 +28,15 @@ set(SVS_C_API_REQUIRED_ENTRY_POINTS
     svs_index_builder_set_threadpool_custom svs_index_convert_dynamic_ex
     svs_index_dynamic_add_points svs_index_dynamic_compact
     svs_index_dynamic_consolidate svs_index_dynamic_delete_points
-    svs_index_dynamic_get_sync_kind svs_index_free svs_index_get_memory_breakdown
-    svs_index_get_memory_usage
-    svs_index_get_size svs_index_load_stream_dynamic svs_index_save_stream
-    svs_index_search_topk svs_logger_create_custom svs_logger_free
+    svs_index_dynamic_get_sync_kind svs_index_dynamic_has_id svs_index_free
+    svs_index_get_memory_breakdown svs_index_get_memory_usage
+    svs_index_get_size svs_index_load_stream_dynamic svs_index_reconstruct
+    svs_index_save_stream svs_index_search_topk svs_leanvec_training_data_build
+    svs_leanvec_training_data_free svs_logger_create_custom svs_logger_free
     svs_logger_set_level svs_search_params_create_vamana svs_search_params_free
     svs_search_results_free svs_set_default_logger svs_storage_create_leanvec
-    svs_storage_create_lvq svs_storage_create_simple svs_storage_create_sq
-    svs_storage_free)
+    svs_storage_create_leanvec_trained svs_storage_create_lvq
+    svs_storage_create_simple svs_storage_create_sq svs_storage_free)
 
 if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux"
         AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$"))

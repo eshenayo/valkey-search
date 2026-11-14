@@ -131,6 +131,12 @@ constexpr float kDefaultSVSAlphaSentinel = -1.0f;
 constexpr uint32_t kDefaultSVSTrainingThreshold = 1024;
 constexpr uint32_t kMinSVSTrainingThreshold = 64;
 constexpr uint32_t kMaxSVSTrainingThreshold = 1000000;
+// LeanVec's default: enough vectors for its default training queries and as
+// many again as data.
+constexpr uint32_t kDefaultSVSLeanVecTrainingThreshold = 10000;
+// LeanVec trains out-of-distribution on this many of its training vectors as
+// queries, at most half of them, unless TRAINING_QUERY_COUNT says otherwise.
+constexpr uint32_t kDefaultSVSTrainingQueryCount = 5000;
 // LeanVec reduces to DIM / this when REDUCE is absent or 0, as Redis does.
 constexpr uint32_t kDefaultSVSLeanVecReduceDivisor = 2;
 // LeanVec learns its projection from the vectors it holds at the training
@@ -149,14 +155,22 @@ struct SVSVamanaParameters : public FTCreateVectorParameters {
   // 0.95 for IP/COSINE) when the user does not pass ALPHA.
   float alpha{kDefaultSVSAlphaSentinel};
   data_model::SVSCompressionType compression{data_model::SVS_COMPRESSION_NONE};
-  // Unset: kDefaultSVSTrainingThreshold, raised for LeanVec to
+  // Unset: kDefaultSVSTrainingThreshold; for LeanVec
+  // kDefaultSVSLeanVecTrainingThreshold, at least
   // SVSLeanVecMinTrainingThreshold(DIM).
   std::optional<uint32_t> training_threshold;
+  // LeanVec only. Unset: kDefaultSVSTrainingQueryCount. Capped so the data
+  // part keeps half the training threshold and at least DIM vectors; 0 trains
+  // PCA. Must be less than the threshold.
+  std::optional<uint32_t> training_query_count;
   // LeanVec only; 0 selects DIM / kDefaultSVSLeanVecReduceDivisor. Must be
   // less than DIM.
   uint32_t reduce{0};
   absl::Status Verify() const;
   std::unique_ptr<data_model::VectorIndex> ToProto() const;
+  // The values ToProto stores. Only meaningful after Verify.
+  uint32_t ResolvedTrainingThreshold() const;
+  uint32_t ResolvedTrainingQueryCount() const;
 };
 
 absl::StatusOr<data_model::IndexSchema> ParseFTCreateArgs(

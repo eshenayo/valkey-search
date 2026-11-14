@@ -34,6 +34,20 @@ def leanvec_min_training_threshold(dim):
     """SVSLeanVecMinTrainingThreshold in src/commands/ft_create_parser.h."""
     return dim
 
+
+def default_training_threshold(compression, dim):
+    """SVSVamanaParameters::ResolvedTrainingThreshold without
+    TRAINING_THRESHOLD (src/commands/ft_create_parser.cc)."""
+    if compression.startswith("LEANVEC"):
+        return max(10000, leanvec_min_training_threshold(dim))
+    return 1024
+
+
+def default_training_query_count(dim, threshold):
+    """SVSVamanaParameters::ResolvedTrainingQueryCount for LeanVec without
+    TRAINING_QUERY_COUNT: the data part keeps half the threshold and DIM."""
+    return min(5000, threshold // 2, max(threshold - dim, 0))
+
 # Five documents per metric whose scores against METRIC_QUERY are
 # METRIC_EXPECTED (doc number -> 1 - similarity). IP uses unit vectors.
 # COSINE scales them, so a missing normalization shows up as a wrong score,
@@ -752,11 +766,15 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         client.execute_command(*create)
         algorithm = _v_index(client, idx)["algorithm"]
         assert algorithm["compression"] == f"SVS_COMPRESSION_{compression}"
-        assert algorithm["training_threshold"] == 1024
+        threshold = default_training_threshold(compression, DIM)
+        assert algorithm["training_threshold"] == threshold
         assert algorithm["compression_pending"] == 1
-        # Only LeanVec reduces, so only LeanVec reports leanvec_dims.
-        assert algorithm.get("leanvec_dims") == \
-            (1 if compression.startswith("LEANVEC") else None)
+        # Only LeanVec reduces and trains on queries, so only LeanVec reports
+        # leanvec_dims and training_query_count.
+        leanvec = compression.startswith("LEANVEC")
+        assert algorithm.get("leanvec_dims") == (1 if leanvec else None)
+        assert algorithm.get("training_query_count") == \
+            (default_training_query_count(DIM, threshold) if leanvec else None)
 
     @pytest.mark.parametrize("reduce", [None, "0"])
     @pytest.mark.parametrize("compression",
@@ -811,7 +829,7 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         if not int(client.info("SEARCH").get(
                 "search_svs_lvq_leanvec_supported", 0)):
             pytest.skip("needs the prebuilt SVS C API on an Intel CPU")
-        dim = 2048
+        dim = 16384
         idx = f"{compression.lower()}_wide_idx"
         client.execute_command(
             "FT.CREATE", idx,
@@ -820,7 +838,8 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
             "DISTANCE_METRIC", "L2", "COMPRESSION", compression,
         )
         assert _v_index(client, idx)["algorithm"]["training_threshold"] == \
-            max(1024, leanvec_min_training_threshold(dim))
+            default_training_threshold(compression, dim) == \
+            leanvec_min_training_threshold(dim)
 
     @pytest.mark.parametrize("compression",
                              ["LEANVEC4X4", "LEANVEC4X8", "LEANVEC8X8"])

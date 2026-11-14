@@ -1606,6 +1606,7 @@ class VectorSVSLvqLeanVecTest
     svs->set_training_threshold(kThreshold);
     if (IsSvsLeanVecCompression(compression)) {
       svs->set_leanvec_dims(kDimensions / 4);
+      svs->set_training_query_count(training_query_count_);
       // LeanVec searches on the reduced vectors and reranks the search window
       // at full dimension, so a window of k leaves recall to the reduced
       // vectors alone. The default window for LeanVec is not tuned yet.
@@ -1622,6 +1623,9 @@ class VectorSVSLvqLeanVecTest
   void ConvertsAtThresholdAndRoundTrips();
   template <typename T>
   void PendingIndexRoundTrip();
+
+  // What FT.CREATE stores by default at this threshold: half of it.
+  uint32_t training_query_count_ = kThreshold / 2;
 };
 
 // The add that reaches the threshold converts the index once, after which it
@@ -1648,6 +1652,21 @@ void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
   };
   const uint64_t done_before = stats.svs_conversions_cnt;
   const uint64_t failed_before = stats.svs_conversion_failures_cnt;
+  if (IsSvsLeanVecCompression(std::get<0>(GetParam()))) {
+    // The conversion trains on the threshold's vectors: the last
+    // training_query_count_ as queries, the rest as data.
+    EXPECT_CALL(*kMockValkeyModule, Log(testing::_, testing::_, testing::_))
+        .Times(testing::AnyNumber());
+    EXPECT_CALL(
+        *kMockValkeyModule,
+        Log(testing::_, testing::_,
+            testing::HasSubstr(absl::StrCat(
+                "LeanVec trained ",
+                training_query_count_ > 0 ? "out-of-distribution" : "with PCA",
+                " on ", kThreshold - training_query_count_,
+                " data vectors and ", training_query_count_, " queries"))))
+        .Times(1);
+  }
   for (size_t i = 0; i < kNumVectors; ++i) {
     const auto encoded = EncodeAs<T>(vectors[i]);
     records[i] =
@@ -1685,7 +1704,11 @@ void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
       });
     }
   }
-  EXPECT_GE(agreed, 0.7 * kTopK * (queries.size() - kNumVectors));
+  // Random vectors give a projection little to keep, and out-of-distribution
+  // training fits it on half of the training vectors, so LeanVec agrees a
+  // little less than PCA here (about 0.69 against 0.70 at worst). How well
+  // the projection does is measured on real embeddings, not here.
+  EXPECT_GE(agreed, 0.65 * kTopK * (queries.size() - kNumVectors));
 
   FakeSafeRDB rdb;
   VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
@@ -1695,6 +1718,17 @@ void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
       &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_3",
       SupplementalContentChunkIter(&rdb), 0);
   ASSERT_TRUE(loaded.ok()) << loaded.status();
+  // The saved definition keeps the training settings.
+  for (const auto *saved : {&*index, &*loaded}) {
+    EXPECT_EQ(AsBase(*saved)
+                  ->ToProto()
+                  ->vector_index()
+                  .svs_vamana_algorithm()
+                  .training_query_count(),
+              IsSvsLeanVecCompression(std::get<0>(GetParam()))
+                  ? training_query_count_
+                  : 0);
+  }
   VMSDK_EXPECT_OK(
       (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
                                  SupplementalContentChunkIter(&rdb)));
@@ -1769,6 +1803,55 @@ void VectorSVSLvqLeanVecTest::PendingIndexRoundTrip() {
 }
 
 TEST_P(VectorSVSLvqLeanVecTest, ConvertsAtThresholdAndRoundTrips) {
+  if (Float16()) {
+    ConvertsAtThresholdAndRoundTrips<float16>();
+  } else {
+    ConvertsAtThresholdAndRoundTrips<float>();
+  }
+}
+
+// With no training queries, LeanVec trains its projection with PCA on the
+// threshold's vectors, through the same path.
+// Deleted vectors aren't trained on: the conversion trains on the first
+// threshold's worth of vectors SVS still holds.
+TEST_P(VectorSVSLvqLeanVecTest, LeanVecTrainsOnVectorsStillHeld) {
+  if (!IsSvsLeanVecCompression(std::get<0>(GetParam())) || Float16()) {
+    GTEST_SKIP() << "LeanVec, FLOAT32";
+  }
+  constexpr size_t kDeleted = 5;
+  auto index = VectorSVS<float>::Create(Proto(), attribute_identifier,
+                                        attribute_data_type, 0);
+  ASSERT_TRUE(index.ok()) << index.status();
+  auto vectors = RandomVectors(kThreshold + kDeleted, kDimensions);
+  EXPECT_CALL(*kMockValkeyModule, Log(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*kMockValkeyModule,
+              Log(testing::_, testing::_,
+                  testing::HasSubstr(absl::StrCat(
+                      "LeanVec trained out-of-distribution on ",
+                      kThreshold - training_query_count_, " data vectors and ",
+                      training_query_count_, " queries"))))
+      .Times(1);
+  for (size_t i = 0; i + 1 < kThreshold; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kDeleted; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  for (size_t i = kThreshold - 1; i < kThreshold + kDeleted; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
+}
+
+TEST_P(VectorSVSLvqLeanVecTest, LeanVecTrainsWithPcaWithoutQueries) {
+  if (!IsSvsLeanVecCompression(std::get<0>(GetParam()))) {
+    GTEST_SKIP() << "LeanVec only";
+  }
+  training_query_count_ = 0;
   if (Float16()) {
     ConvertsAtThresholdAndRoundTrips<float16>();
   } else {
@@ -2976,6 +3059,7 @@ TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
     config.graph_max_degree = 32;
     config.leanvec_dims = 64;
     config.blocksize_bytes = kBlock;
+    config.training_threshold = 10000;
     return SvsConversionPeakBytes(config, 128, 10000);
   };
   const uint64_t fp32_bytes = 10000 * 128 * sizeof(float);
@@ -2991,6 +3075,33 @@ TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
             estimate(data_model::SVS_COMPRESSION_LVQ8) + kBlock);
   EXPECT_GT(estimate(data_model::SVS_COMPRESSION_LEANVEC4X8),
             estimate(data_model::SVS_COMPRESSION_LVQ4X8) + 3 * fp32_bytes);
+  // LeanVec trains on at most TRAINING_THRESHOLD vectors, so on an index past
+  // it the training part grows with the threshold, not the index: the
+  // read-back vectors and 4x them.
+  auto leanvec = [](uint32_t threshold) {
+    SVSBuildConfig config;
+    config.compression = data_model::SVS_COMPRESSION_LEANVEC4X8;
+    config.graph_max_degree = 32;
+    config.leanvec_dims = 64;
+    config.training_threshold = threshold;
+    return SvsConversionPeakBytes(config, 128, 100000);
+  };
+  EXPECT_EQ(leanvec(2000) - leanvec(1000), 5 * 1000 * 128 * sizeof(float));
+}
+
+// LeanVec trains on the first labels in insertion order that SVS holds, at
+// most the threshold's count.
+TEST_F(VectorSVSTest, TrainingIdsAreTheFirstHeld) {
+  const std::vector<uint64_t> labels = {9, 3, 7, 1, 5};
+  auto all = [](uint64_t) { return true; };
+  EXPECT_THAT(SelectSvsTrainingIds(labels, 3, all),
+              testing::ElementsAre(1, 3, 5));
+  EXPECT_THAT(SelectSvsTrainingIds(labels, 3,
+                                   [](uint64_t label) { return label != 3; }),
+              testing::ElementsAre(1, 5, 7));
+  EXPECT_THAT(SelectSvsTrainingIds(labels, 10, all),
+              testing::ElementsAre(1, 3, 5, 7, 9));
+  EXPECT_THAT(SelectSvsTrainingIds({}, 3, all), testing::IsEmpty());
 }
 
 // SVS's error codes carry through: an ALPHA SVS rejects (only reachable with a
