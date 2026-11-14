@@ -120,6 +120,7 @@ For `SVS_VAMANA`, `capacity` is the field's `INITIAL_CAP` (10240 unless `FT.CREA
 - `training_threshold` (integer) The number of vectors the index holds uncompressed before it converts to its compression. Only present for SQ8, LVQ and LeanVec.
 - `compression_pending` (integer) `1` while the index is still uncompressed, `0` once it has converted, and for an LVQ or LeanVec field whose storage is unavailable. Only present for SQ8, LVQ and LeanVec.
 - `leanvec_dims` (integer) The number of dimensions LeanVec reduces each vector to: `REDUCE`, or its default. Only present for LeanVec.
+- `training_query_count` (integer) How many of its training vectors LeanVec learns its reduction from as queries (`TRAINING_QUERY_COUNT`, or its default, as capped); `0` means it uses PCA. Only present for LeanVec.
 - `memory_bytes` (integer) Bytes SVS holds for this field's graph, vector data and metadata. `0` before the first vector is added. SVS allocates in blocks sized by `INITIAL_CAP`, so the value grows in steps.
 
 ### Response when the PRIMARY option is specified.

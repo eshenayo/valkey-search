@@ -176,5 +176,9 @@ message SVSVamanaAlgorithm {
   // LEANVEC* only: number of dimensions the LeanVec projection reduces to,
   // < dim. FT.CREATE stores the resolved value (REDUCE, or its default).
   uint32 leanvec_dims = 6;
+  // LEANVEC* only: how many of the training vectors (the last, by insertion
+  // order) train the projection as queries, out-of-distribution; 0 trains it
+  // in-distribution (PCA). FT.CREATE stores the resolved value.
+  uint32 training_query_count = 10;
 }
 

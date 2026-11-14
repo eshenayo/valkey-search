@@ -93,6 +93,7 @@ void FillSvsVamanaProto(const SVSBuildConfig& config,
   proto->set_compression(config.compression);
   proto->set_training_threshold(config.training_threshold);
   proto->set_leanvec_dims(config.leanvec_dims);
+  proto->set_training_query_count(config.training_query_count);
 }
 }  // namespace
 
@@ -347,6 +348,30 @@ struct StorageDeleter {
 using StoragePtr =
     std::unique_ptr<std::remove_pointer_t<svs_storage_h>, StorageDeleter>;
 
+struct TrainingDataDeleter {
+  void operator()(svs_leanvec_training_data_h h) const {
+    if (h != nullptr) svs_leanvec_training_data_free(h);
+  }
+};
+using TrainingDataPtr =
+    std::unique_ptr<std::remove_pointer_t<svs_leanvec_training_data_h>,
+                    TrainingDataDeleter>;
+
+// LEANVEC<P>X<S>: the primary (reduced) and secondary bit widths.
+std::optional<std::pair<svs_data_type_t, svs_data_type_t>> LeanVecLevels(
+    data_model::SVSCompressionType compression) {
+  switch (compression) {
+    case data_model::SVS_COMPRESSION_LEANVEC4X4:
+      return std::pair{SVS_DATA_TYPE_UINT4, SVS_DATA_TYPE_UINT4};
+    case data_model::SVS_COMPRESSION_LEANVEC4X8:
+      return std::pair{SVS_DATA_TYPE_UINT4, SVS_DATA_TYPE_UINT8};
+    case data_model::SVS_COMPRESSION_LEANVEC8X8:
+      return std::pair{SVS_DATA_TYPE_UINT8, SVS_DATA_TYPE_UINT8};
+    default:
+      return std::nullopt;
+  }
+}
+
 // Maps the compression proto value to an SVS storage configuration.
 absl::StatusOr<StoragePtr> MakeSvsStorage(const SVSBuildConfig& config) {
   // LVQ<P>X<R> and LEANVEC<P>X<S> name the primary and second-level bit
@@ -370,17 +395,13 @@ absl::StatusOr<StoragePtr> MakeSvsStorage(const SVSBuildConfig& config) {
       storage.reset(svs_storage_create_lvq(kU4, kU8, err.get()));
       break;
     case data_model::SVS_COMPRESSION_LEANVEC4X4:
-      storage.reset(
-          svs_storage_create_leanvec(config.leanvec_dims, kU4, kU4, err.get()));
-      break;
     case data_model::SVS_COMPRESSION_LEANVEC4X8:
-      storage.reset(
-          svs_storage_create_leanvec(config.leanvec_dims, kU4, kU8, err.get()));
+    case data_model::SVS_COMPRESSION_LEANVEC8X8: {
+      const auto [primary, secondary] = *LeanVecLevels(config.compression);
+      storage.reset(svs_storage_create_leanvec(config.leanvec_dims, primary,
+                                               secondary, err.get()));
       break;
-    case data_model::SVS_COMPRESSION_LEANVEC8X8:
-      storage.reset(
-          svs_storage_create_leanvec(config.leanvec_dims, kU8, kU8, err.get()));
-      break;
+    }
     default: {
       auto storage_type =
           CompressionToSvsDataType(config.compression, config.input_type);
@@ -717,9 +738,14 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig& config, int dimensions,
   uint64_t bytes =
       vectors * per_vector + (second_bits > 0 ? 3 : 2) * config.blocksize_bytes;
   if (leanvec) {
-    // PCA working set. Measured at about 3.3x the FP32 vectors (100k x 768);
-    // 4x leaves a margin.
-    bytes += 4 * vectors * dims * sizeof(float);
+    // Training reads back at most training_threshold vectors as FP32, and
+    // trains on them. PCA over the whole index measured about 3.3x its FP32
+    // vectors (100k x 768); 4x of the read-back ones leaves a margin until
+    // the out-of-distribution training is measured.
+    const uint64_t trained =
+        std::min<uint64_t>(vectors, config.training_threshold) * dims *
+        sizeof(float);
+    bytes += trained + 4 * trained;
   }
   return bytes;
 }
@@ -731,6 +757,19 @@ size_t SvsConversionRows(const SVSBuildConfig& config, int dimensions,
   const size_t row_bytes =
       std::max<size_t>(1, static_cast<size_t>(dimensions) * element_bytes);
   return std::max(live, source_data_bytes / row_bytes);
+}
+
+std::vector<size_t> SelectSvsTrainingIds(
+    std::vector<uint64_t> labels, size_t count,
+    absl::FunctionRef<bool(uint64_t)> present) {
+  std::sort(labels.begin(), labels.end());
+  std::vector<size_t> ids;
+  ids.reserve(std::min(count, labels.size()));
+  for (const uint64_t label : labels) {
+    if (ids.size() == count) break;
+    if (present(label)) ids.push_back(static_cast<size_t>(label));
+  }
+  return ids;
 }
 
 namespace {
@@ -1022,6 +1061,8 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::Create(
       svs_proto.compression(),
   };
   instance->build_config_.leanvec_dims = svs_proto.leanvec_dims();
+  instance->build_config_.training_query_count =
+      svs_proto.training_query_count();
   instance->build_config_.input_type = instance->GetVectorDataType();
   instance->build_config_.initial_cap = vector_index_proto.initial_cap();
   instance->build_config_.blocksize_bytes =
@@ -1644,6 +1685,64 @@ SVSBuildConfig VectorSVS<T>::StorageConfig() const {
 }
 
 template <typename T>
+absl::Status VectorSVS<T>::TrainLeanVecProjection(svs_index_builder_h builder) {
+  std::vector<uint64_t> labels;
+  {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    labels.reserve(label_to_record_.size());
+    for (const auto& [label, record] : label_to_record_) {
+      labels.push_back(label);
+    }
+  }
+  // The label map also holds adds still in flight; train only on vectors SVS
+  // already holds. The lambda can't be annotated, so it reads the handle
+  // through a copy made under the lock.
+  svs_index_h index = svs_index_;
+  const std::vector<size_t> ids = SelectSvsTrainingIds(
+      std::move(labels), build_config_.training_threshold,
+      [index](uint64_t id) {
+        bool present = false;
+        return svs_index_dynamic_has_id(index, id, &present, nullptr) &&
+               present;
+      });
+  const size_t n = ids.size();
+  const size_t dims = static_cast<size_t>(dimensions_);
+  // As FT.CREATE resolved it; applied again to the vectors read back.
+  const size_t queries = std::min<size_t>(
+      {build_config_.training_query_count, n / 2, n > dims ? n - dims : 0});
+  ScopedSvsError err;
+  std::vector<float> vectors(n * dims);
+  if (!svs_index_reconstruct(svs_index_, ids.data(), n, vectors.data(), dims,
+                             err.get())) {
+    return SvsErrorToStatus(err.get(), "index_reconstruct");
+  }
+  // The last vectors are the queries; with none, this computes PCA.
+  const size_t data = n - queries;
+  TrainingDataPtr training(svs_leanvec_training_data_build(
+      builder, build_config_.leanvec_dims, data, vectors.data(), queries,
+      queries > 0 ? vectors.data() + data * dims : nullptr, err.get()));
+  if (training == nullptr) {
+    return SvsErrorToStatus(err.get(), "leanvec_training_data_build");
+  }
+  std::vector<float>().swap(vectors);  // not needed past training
+  const auto [primary, secondary] = *LeanVecLevels(build_config_.compression);
+  StoragePtr storage(svs_storage_create_leanvec_trained(training.get(), primary,
+                                                        secondary, err.get()));
+  if (storage == nullptr) {
+    return SvsErrorToStatus(err.get(), "storage_create_leanvec_trained");
+  }
+  if (!svs_index_builder_set_storage(builder, storage.get(), err.get())) {
+    return SvsErrorToStatus(err.get(), "index_builder_set_storage");
+  }
+  VMSDK_LOG(NOTICE, nullptr)
+      << "SVS_VAMANA index " << this->attribute_identifier_
+      << ": LeanVec trained "
+      << (queries > 0 ? "out-of-distribution" : "with PCA") << " on " << data
+      << " data vectors and " << queries << " queries";
+  return absl::OkStatus();
+}
+
+template <typename T>
 void VectorSVS<T>::MaybeConvert() {
   if (!compression_pending_.load(std::memory_order_acquire)) return;
   // After a failure, each write (this call) counts down to the next attempt.
@@ -1689,7 +1788,12 @@ void VectorSVS<T>::MaybeConvert() {
     auto builder =
         AssembleIndexBuilder(build_config_, this->distance_metric_, dimensions_,
                              this->attribute_identifier_.c_str(), err.get());
-    if (builder.ok()) {
+    if (!builder.ok()) {
+      status = builder.status();
+    } else if (IsSvsLeanVecCompression(build_config_.compression)) {
+      status = TrainLeanVecProjection(builder->get());
+    }
+    if (builder.ok() && status.ok()) {
       svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
       params.blocksize_bytes = build_config_.blocksize_bytes;
       params.sync_kind = kSvsSyncKind;
@@ -1698,8 +1802,6 @@ void VectorSVS<T>::MaybeConvert() {
       if (converted == nullptr) {
         status = SvsErrorToStatus(err.get(), "index_convert_dynamic");
       }
-    } else {
-      status = builder.status();
     }
   }
   if (converted == nullptr) {
@@ -1760,7 +1862,7 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   const bool unavailable = !unavailable_.empty();
   const bool leanvec = IsSvsLeanVecCompression(build_config_.compression);
   ValkeyModule_ReplyWithArray(
-      ctx, 14 + (trained ? 4 : 0) + (leanvec ? 2 : 0) + (unavailable ? 2 : 0));
+      ctx, 14 + (trained ? 4 : 0) + (leanvec ? 4 : 0) + (unavailable ? 2 : 0));
   ValkeyModule_ReplyWithSimpleString(ctx, "name");
   ValkeyModule_ReplyWithSimpleString(
       ctx, std::string(
@@ -1798,6 +1900,8 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   if (leanvec) {
     ValkeyModule_ReplyWithSimpleString(ctx, "leanvec_dims");
     ValkeyModule_ReplyWithLongLong(ctx, build_config_.leanvec_dims);
+    ValkeyModule_ReplyWithSimpleString(ctx, "training_query_count");
+    ValkeyModule_ReplyWithLongLong(ctx, build_config_.training_query_count);
   }
   // Bytes SVS holds for the index's graph, data and metadata; 0 before the
   // first add.

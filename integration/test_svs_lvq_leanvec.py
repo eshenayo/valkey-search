@@ -15,7 +15,8 @@ from valkey.client import Valkey
 from valkeytestframework.util import waiters
 
 from ft_info_parser import FTInfoParser
-from test_svs_smoke import leanvec_min_training_threshold
+from test_svs_smoke import (default_training_query_count,
+                             leanvec_min_training_threshold)
 from indexes import ClusterTestUtils
 from valkey_search_test_case import (
     ValkeySearchClusterTestCaseDebugMode,
@@ -129,6 +130,15 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
             lambda: _v_index(client, "svs")["algorithm"]["compression_pending"],
             0, timeout=30)
         assert _counter(client, "svs_conversions_count") == conversions + 1
+        if compression.startswith("LEANVEC"):
+            # Out-of-distribution by default: the last of the training vectors
+            # as queries, the rest as data.
+            queries = default_training_query_count(DIM, THRESHOLD)
+            assert _v_index(client, "svs")["algorithm"][
+                "training_query_count"] == queries
+            assert self.server.verify_string_in_logfile(
+                f"LeanVec trained out-of-distribution on {THRESHOLD - queries}"
+                f" data vectors and {queries} queries")
 
         # Writes, modifies and deletes keep landing after the conversion,
         # without converting again. The deletes make SAVE consolidate and
@@ -269,6 +279,8 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
         params = ["TYPE", "FLOAT32", "DIM", str(dim), "DISTANCE_METRIC",
                   metric, "COMPRESSION", compression,
                   "TRAINING_THRESHOLD", str(threshold)]
+        if compression.startswith("LEANVEC"):
+            params += ["SEARCH_WINDOW_SIZE", str(LEANVEC_SEARCH_WINDOW)]
         client.execute_command(
             "FT.CREATE", "svs", "PREFIX", "1", "d:", "SCHEMA", "v", "VECTOR",
             "SVS_VAMANA", str(len(params)), *params)

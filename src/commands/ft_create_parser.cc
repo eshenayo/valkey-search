@@ -35,6 +35,7 @@
 #include "src/indexes/vector_base.h"
 #include "src/valkey_search_options.h"
 #include "vmsdk/src/command_parser.h"
+#include "vmsdk/src/log.h"
 #include "vmsdk/src/module_config.h"
 #include "vmsdk/src/status/status_macros.h"
 #include "vmsdk/src/type_conversions.h"
@@ -55,6 +56,7 @@ constexpr absl::string_view kConstructionWindowSizeParam{
 constexpr absl::string_view kSearchWindowSizeParam{"SEARCH_WINDOW_SIZE"};
 constexpr absl::string_view kAlphaParam{"ALPHA"};
 constexpr absl::string_view kTrainingThresholdParam{"TRAINING_THRESHOLD"};
+constexpr absl::string_view kTrainingQueryCountParam{"TRAINING_QUERY_COUNT"};
 constexpr absl::string_view kCompressionParam{"COMPRESSION"};
 constexpr absl::string_view kReduceParam{"REDUCE"};
 
@@ -438,6 +440,9 @@ vmsdk::KeyValueParser<SVSVamanaParameters> CreateSVSParser() {
                                              *kSVSCompressionByStr));
   parser.AddParamParser(kReduceParam,
                         GENERATE_VALUE_PARSER(SVSVamanaParameters, reduce));
+  parser.AddParamParser(
+      kTrainingQueryCountParam,
+      GENERATE_VALUE_PARSER(SVSVamanaParameters, training_query_count));
   return parser;
 }
 vmsdk::KeyValueParser<FlatParameters> CreateFlatParamParser() {
@@ -457,7 +462,9 @@ vmsdk::KeyValueParser<FlatParameters> CreateFlatParamParser() {
   return parser;
 }
 absl::Status ParseVector(vmsdk::ArgsIterator &itr,
-                         data_model::Index &index_proto) {
+                         data_model::Index &index_proto,
+                         absl::string_view index_name,
+                         absl::string_view attribute_identifier) {
   absl::string_view algo_str;
   VMSDK_RETURN_IF_ERROR(vmsdk::ParseParamValue(itr, algo_str));
   data_model::VectorIndex::AlgorithmCase algo{
@@ -484,6 +491,21 @@ absl::Status ParseVector(vmsdk::ArgsIterator &itr,
     SVSVamanaParameters parameters;
     VMSDK_RETURN_IF_ERROR(parser.Parse(parameters, vector_itr));
     VMSDK_RETURN_IF_ERROR(parameters.Verify());
+    if (parameters.training_query_count.has_value() &&
+        *parameters.training_query_count !=
+            parameters.ResolvedTrainingQueryCount()) {
+      VMSDK_LOG(WARNING, nullptr)
+          << "SVS_VAMANA index " << index_name << ", field "
+          << attribute_identifier << ": " << kTrainingQueryCountParam << " "
+          << *parameters.training_query_count << " would leave too few of the "
+          << parameters.ResolvedTrainingThreshold()
+          << " training vectors as data (at least half, and at least DIM "
+          << *parameters.dimensions << "); using "
+          << parameters.ResolvedTrainingQueryCount()
+          << (parameters.ResolvedTrainingQueryCount() == 0
+                  ? ", so LeanVec trains with PCA."
+                  : ".");
+    }
     index_proto.set_allocated_vector_index(parameters.ToProto().release());
   } else {
     static auto parser = CreateFlatParamParser();
@@ -688,7 +710,8 @@ absl::StatusOr<data_model::Attribute *> ParseAttributeArgs(
   auto index_proto = std::make_unique<data_model::Index>();
   switch (index_type) {
     case indexes::IndexerType::kVector:
-      VMSDK_RETURN_IF_ERROR(ParseVector(itr, *index_proto));
+      VMSDK_RETURN_IF_ERROR(ParseVector(
+          itr, *index_proto, index_schema_proto.name(), attribute_identifier));
       break;
     case indexes::IndexerType::kTag:
       VMSDK_RETURN_IF_ERROR(ParseTag(itr, *index_proto, attribute_identifier));
@@ -1033,6 +1056,21 @@ absl::Status SVSVamanaParameters::Verify() const {
         << kMinSVSTrainingThreshold << " and cannot exceed "
         << kMaxSVSTrainingThreshold << ".";
   }
+  // LeanVec trains its projection on the last of its training vectors as
+  // queries; the rest stay data, so the count is below the threshold.
+  if (training_query_count.has_value()) {
+    if (!indexes::IsSvsLeanVecCompression(compression)) {
+      return absl::InvalidArgumentError(absl::StrCat(kTrainingQueryCountParam,
+                                                     " requires a LEANVEC ",
+                                                     kCompressionParam, "."));
+    }
+    if (*training_query_count >= ResolvedTrainingThreshold()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(kTrainingQueryCountParam, " (", *training_query_count,
+                       ") must be less than ", kTrainingThresholdParam, " (",
+                       ResolvedTrainingThreshold(), ")."));
+    }
+  }
   // ALPHA sentinel (-1.0) means "use SVS's metric-specific default".
   // Any user-supplied value must be finite and in SVS's range for the
   // metric: alpha >= 1.0 for L2, 0 < alpha <= 1.0 for IP and COSINE.
@@ -1099,6 +1137,27 @@ absl::Status SVSVamanaParameters::Verify() const {
   return absl::OkStatus();
 }
 
+uint32_t SVSVamanaParameters::ResolvedTrainingThreshold() const {
+  if (!indexes::SvsCompressionUsesTrainingThreshold(compression)) return 0;
+  if (training_threshold.has_value()) return *training_threshold;
+  if (indexes::IsSvsLeanVecCompression(compression)) {
+    return std::max(kDefaultSVSLeanVecTrainingThreshold,
+                    SVSLeanVecMinTrainingThreshold(*dimensions));
+  }
+  return kDefaultSVSTrainingThreshold;
+}
+
+uint32_t SVSVamanaParameters::ResolvedTrainingQueryCount() const {
+  if (!indexes::IsSvsLeanVecCompression(compression)) return 0;
+  // The rest of the training vectors are the data the projection is fitted
+  // to: at least half of them, and at least DIM, which out-of-distribution
+  // training needs as PCA does. With no room left for queries, PCA.
+  const uint32_t threshold = ResolvedTrainingThreshold();
+  const uint32_t dims = static_cast<uint32_t>(*dimensions);
+  return std::min({training_query_count.value_or(kDefaultSVSTrainingQueryCount),
+                   threshold / 2, threshold > dims ? threshold - dims : 0});
+}
+
 std::unique_ptr<data_model::VectorIndex> SVSVamanaParameters::ToProto() const {
   auto vector_index_proto = FTCreateVectorParameters::ToProto();
   auto svs_algorithm_proto = std::make_unique<data_model::SVSVamanaAlgorithm>();
@@ -1107,15 +1166,8 @@ std::unique_ptr<data_model::VectorIndex> SVSVamanaParameters::ToProto() const {
   svs_algorithm_proto->set_search_window_size(search_window_size);
   svs_algorithm_proto->set_alpha(alpha);
   svs_algorithm_proto->set_compression(compression);
-  if (indexes::SvsCompressionUsesTrainingThreshold(compression)) {
-    uint32_t default_threshold = kDefaultSVSTrainingThreshold;
-    if (indexes::IsSvsLeanVecCompression(compression)) {
-      default_threshold = std::max(default_threshold,
-                                   SVSLeanVecMinTrainingThreshold(*dimensions));
-    }
-    svs_algorithm_proto->set_training_threshold(
-        training_threshold.value_or(default_threshold));
-  }
+  svs_algorithm_proto->set_training_threshold(ResolvedTrainingThreshold());
+  svs_algorithm_proto->set_training_query_count(ResolvedTrainingQueryCount());
   // The resolved value is stored, so FT.INFO and the RDB header show the
   // dimension count in effect and a later default doesn't change the index.
   svs_algorithm_proto->set_leanvec_dims(
