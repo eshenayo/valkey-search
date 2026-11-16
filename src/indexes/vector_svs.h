@@ -19,7 +19,6 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/node_hash_map.h"
-#include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -100,13 +99,20 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig &config, int dimensions,
 size_t SvsConversionRows(const SVSBuildConfig &config, int dimensions,
                          size_t live, size_t source_data_bytes);
 
-// The vectors LeanVec trains on: the first `count` labels in insertion order
-// (labels grow with it) that `present` accepts. Bounded by the training
-// threshold, so a late conversion trains on the same vectors, at the same
-// cost, as one on time.
-std::vector<size_t> SelectSvsTrainingIds(
-    std::vector<uint64_t> labels, size_t count,
-    absl::FunctionRef<bool(uint64_t)> present);
+// The `count` smallest labels added, in increasing order: LeanVec trains on
+// the first training-threshold labels in insertion order (labels grow with
+// it), so a late conversion trains on the same vectors as one on time. Holds
+// at most `count` labels, however many are added.
+class SmallestLabels {
+ public:
+  explicit SmallestLabels(size_t count) : count_(count) {}
+  void Add(uint64_t label);
+  std::vector<uint64_t> Sorted() &&;
+
+ private:
+  size_t count_;
+  std::priority_queue<uint64_t> largest_first_;
+};
 
 // Bytes the system, or the process's cgroup if lower, can still allocate:
 // MemAvailable, and each cgroup v1/v2 memory limit up the hierarchy minus its
@@ -232,7 +238,8 @@ class VectorSVS : public VectorType<T> {
   // update or delete). A failed or skipped conversion is logged, counted, and
   // retried after 2, 4, 8, ... more writes, at most training_threshold.
   void MaybeConvert() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
-  // LeanVec: trains the projection on SelectSvsTrainingIds' vectors, the last
+  // LeanVec: trains the projection on the SmallestLabels the index holds, the
+  // last
   // build_config_.training_query_count of them as queries (out-of-
   // distribution) and the rest as data, or with PCA when the count is 0, and
   // sets the trained storage on `builder`.
