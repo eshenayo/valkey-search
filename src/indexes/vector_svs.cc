@@ -759,17 +759,21 @@ size_t SvsConversionRows(const SVSBuildConfig& config, int dimensions,
   return std::max(live, source_data_bytes / row_bytes);
 }
 
-std::vector<size_t> SelectSvsTrainingIds(
-    std::vector<uint64_t> labels, size_t count,
-    absl::FunctionRef<bool(uint64_t)> present) {
-  std::sort(labels.begin(), labels.end());
-  std::vector<size_t> ids;
-  ids.reserve(std::min(count, labels.size()));
-  for (const uint64_t label : labels) {
-    if (ids.size() == count) break;
-    if (present(label)) ids.push_back(static_cast<size_t>(label));
+void SmallestLabels::Add(uint64_t label) {
+  if (largest_first_.size() < count_) {
+    largest_first_.push(label);
+  } else if (count_ > 0 && label < largest_first_.top()) {
+    largest_first_.pop();
+    largest_first_.push(label);
   }
-  return ids;
+}
+
+std::vector<uint64_t> SmallestLabels::Sorted() && {
+  std::vector<uint64_t> labels(largest_first_.size());
+  for (size_t i = labels.size(); i-- > 0; largest_first_.pop()) {
+    labels[i] = largest_first_.top();
+  }
+  return labels;
 }
 
 namespace {
@@ -1686,25 +1690,22 @@ SVSBuildConfig VectorSVS<T>::StorageConfig() const {
 
 template <typename T>
 absl::Status VectorSVS<T>::TrainLeanVecProjection(svs_index_builder_h builder) {
-  std::vector<uint64_t> labels;
+  SmallestLabels first(build_config_.training_threshold);
   {
     absl::ReaderMutexLock map_lock(&label_mutex_);
-    labels.reserve(label_to_record_.size());
-    for (const auto& [label, record] : label_to_record_) {
-      labels.push_back(label);
+    for (const auto& [label, record] : label_to_record_) first.Add(label);
+  }
+  // The label map also holds adds still in flight, which are new keys and so
+  // among the last labels; train only on vectors SVS already holds, one fewer
+  // for each in-flight add among the first.
+  std::vector<size_t> ids;
+  for (const uint64_t label : std::move(first).Sorted()) {
+    bool present = false;
+    if (svs_index_dynamic_has_id(svs_index_, label, &present, nullptr) &&
+        present) {
+      ids.push_back(static_cast<size_t>(label));
     }
   }
-  // The label map also holds adds still in flight; train only on vectors SVS
-  // already holds. The lambda can't be annotated, so it reads the handle
-  // through a copy made under the lock.
-  svs_index_h index = svs_index_;
-  const std::vector<size_t> ids = SelectSvsTrainingIds(
-      std::move(labels), build_config_.training_threshold,
-      [index](uint64_t id) {
-        bool present = false;
-        return svs_index_dynamic_has_id(index, id, &present, nullptr) &&
-               present;
-      });
   const size_t n = ids.size();
   const size_t dims = static_cast<size_t>(dimensions_);
   // As FT.CREATE resolved it; applied again to the vectors read back.

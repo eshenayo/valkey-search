@@ -3115,19 +3115,19 @@ TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
   EXPECT_EQ(leanvec(2000) - leanvec(1000), 5 * 1000 * 128 * sizeof(float));
 }
 
-// LeanVec trains on the first labels in insertion order that SVS holds, at
-// most the threshold's count.
-TEST_F(VectorSVSTest, TrainingIdsAreTheFirstHeld) {
-  const std::vector<uint64_t> labels = {9, 3, 7, 1, 5};
-  auto all = [](uint64_t) { return true; };
-  EXPECT_THAT(SelectSvsTrainingIds(labels, 3, all),
-              testing::ElementsAre(1, 3, 5));
-  EXPECT_THAT(SelectSvsTrainingIds(labels, 3,
-                                   [](uint64_t label) { return label != 3; }),
-              testing::ElementsAre(1, 5, 7));
-  EXPECT_THAT(SelectSvsTrainingIds(labels, 10, all),
+// LeanVec trains on the first labels in insertion order, at most the
+// threshold's count, keeping no more than that many while it looks.
+TEST_F(VectorSVSTest, SmallestLabelsKeepsTheFirst) {
+  auto smallest = [](size_t count, std::vector<uint64_t> labels) {
+    SmallestLabels first(count);
+    for (const uint64_t label : labels) first.Add(label);
+    return std::move(first).Sorted();
+  };
+  EXPECT_THAT(smallest(3, {9, 3, 7, 1, 5}), testing::ElementsAre(1, 3, 5));
+  EXPECT_THAT(smallest(10, {9, 3, 7, 1, 5}),
               testing::ElementsAre(1, 3, 5, 7, 9));
-  EXPECT_THAT(SelectSvsTrainingIds({}, 3, all), testing::IsEmpty());
+  EXPECT_THAT(smallest(3, {}), testing::IsEmpty());
+  EXPECT_THAT(smallest(0, {9, 3}), testing::IsEmpty());
 }
 
 // SVS's error codes carry through: an ALPHA SVS rejects (only reachable with a
