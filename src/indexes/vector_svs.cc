@@ -732,22 +732,28 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig& config, int dimensions,
   const uint64_t per_vector =
       (primary_dims * primary_bits + dims * second_bits + 7) / 8 + 16 +
       (uint64_t{config.graph_max_degree} + 1) * 4 + 40;
-  // Each dataset (data, graph, and the second level: LVQ's residual or
-  // LeanVec's full-dimension data) is allocated in blocks; allow one more
-  // block of each.
-  uint64_t bytes =
-      vectors * per_vector + (second_bits > 0 ? 3 : 2) * config.blocksize_bytes;
-  if (leanvec) {
-    // Training reads back at most training_threshold vectors as FP32, and
-    // trains on them. PCA over the whole index measured about 3.3x its FP32
-    // vectors (100k x 768); 4x of the read-back ones leaves a margin until
-    // the out-of-distribution training is measured.
-    const uint64_t trained =
-        std::min<uint64_t>(vectors, config.training_threshold) * dims *
-        sizeof(float);
-    bytes += trained + 4 * trained;
-  }
-  return bytes;
+  // Measured at 768-d, 10k to 1M vectors, the converted index's peak
+  // reaches 1.5x this per-vector size (the live concurrent index's own
+  // structures and the conversion's temporaries); 2x leaves a margin. Each
+  // dataset (data, graph, and the second level: LVQ's residual or LeanVec's
+  // full-dimension data) is allocated in blocks; allow one more block of
+  // each, and 64 MiB for the allocator, which dominates small conversions.
+  constexpr uint64_t kMiB = uint64_t{1} << 20;
+  const uint64_t converting =
+      2 * vectors * per_vector +
+      (second_bits > 0 ? 3 : 2) * config.blocksize_bytes + 64 * kMiB;
+  if (!leanvec) return converting;
+  // LeanVec first reads back at most training_threshold vectors as FP32 and
+  // trains on them, freeing both before it converts, so the peak is the
+  // larger phase. Training measured up to about 1.1 GiB above the read-back
+  // vectors from 100k up, and about 4x them at 10k; 1.5x them plus the
+  // smaller of 1.5 GiB and 16x them leaves a margin.
+  const uint64_t trained =
+      std::min<uint64_t>(vectors, config.training_threshold) * dims *
+      sizeof(float);
+  const uint64_t training =
+      trained + trained / 2 + std::min<uint64_t>(1536 * kMiB, 16 * trained);
+  return std::max(converting, training);
 }
 
 size_t SvsConversionRows(const SVSBuildConfig& config, int dimensions,

@@ -87,8 +87,8 @@ void InitSvsLogging();
 
 // Estimated bytes a conversion of `vectors` uncompressed vectors to
 // config.compression allocates while the source index still exists: the
-// converted data and graph, and for LeanVec the vectors it trains its
-// projection on and the training's working set.
+// converted data and graph or, for LeanVec when larger, the vectors it trains
+// its projection on and the training's working set. Calibrated at 768-d.
 uint64_t SvsConversionPeakBytes(const SVSBuildConfig &config, int dimensions,
                                 size_t vectors);
 
