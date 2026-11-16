@@ -1628,6 +1628,12 @@ class VectorSVSLvqLeanVecTest
   uint32_t training_query_count_ = kThreshold / 2;
 };
 
+class VectorSVSLeanVecTest : public VectorSVSLvqLeanVecTest {
+ protected:
+  template <typename T>
+  void TrainsOnVectorsStillHeld();
+};
+
 // The add that reaches the threshold converts the index once, after which it
 // keeps accepting writes and agrees with FLAT on most of the top 10. A saved
 // and reloaded copy answers with the same keys and scores.
@@ -1812,52 +1818,6 @@ TEST_P(VectorSVSLvqLeanVecTest, ConvertsAtThresholdAndRoundTrips) {
 
 // With no training queries, LeanVec trains its projection with PCA on the
 // threshold's vectors, through the same path.
-// Deleted vectors aren't trained on: the conversion trains on the first
-// threshold's worth of vectors SVS still holds.
-TEST_P(VectorSVSLvqLeanVecTest, LeanVecTrainsOnVectorsStillHeld) {
-  if (!IsSvsLeanVecCompression(std::get<0>(GetParam())) || Float16()) {
-    GTEST_SKIP() << "LeanVec, FLOAT32";
-  }
-  constexpr size_t kDeleted = 5;
-  auto index = VectorSVS<float>::Create(Proto(), attribute_identifier,
-                                        attribute_data_type, 0);
-  ASSERT_TRUE(index.ok()) << index.status();
-  auto vectors = RandomVectors(kThreshold + kDeleted, kDimensions);
-  EXPECT_CALL(*kMockValkeyModule, Log(testing::_, testing::_, testing::_))
-      .Times(testing::AnyNumber());
-  EXPECT_CALL(*kMockValkeyModule,
-              Log(testing::_, testing::_,
-                  testing::HasSubstr(absl::StrCat(
-                      "LeanVec trained out-of-distribution on ",
-                      kThreshold - training_query_count_, " data vectors and ",
-                      training_query_count_, " queries"))))
-      .Times(1);
-  for (size_t i = 0; i + 1 < kThreshold; ++i) {
-    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
-                                                   VectorToStr(vectors[i])));
-  }
-  for (size_t i = 0; i < kDeleted; ++i) {
-    VMSDK_EXPECT_OK(
-        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
-  }
-  for (size_t i = kThreshold - 1; i < kThreshold + kDeleted; ++i) {
-    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
-                                                   VectorToStr(vectors[i])));
-  }
-  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
-}
-
-TEST_P(VectorSVSLvqLeanVecTest, LeanVecTrainsWithPcaWithoutQueries) {
-  if (!IsSvsLeanVecCompression(std::get<0>(GetParam()))) {
-    GTEST_SKIP() << "LeanVec only";
-  }
-  training_query_count_ = 0;
-  if (Float16()) {
-    ConvertsAtThresholdAndRoundTrips<float16>();
-  } else {
-    ConvertsAtThresholdAndRoundTrips<float>();
-  }
-}
 
 TEST_P(VectorSVSLvqLeanVecTest, PendingIndexRoundTrip) {
   if (Float16()) {
@@ -1865,6 +1825,18 @@ TEST_P(VectorSVSLvqLeanVecTest, PendingIndexRoundTrip) {
   } else {
     PendingIndexRoundTrip<float>();
   }
+}
+
+std::string LvqLeanVecParamName(
+    const testing::TestParamInfo<LvqLeanVecParam> &info) {
+  return absl::StrCat(
+      absl::StripPrefix(
+          data_model::SVSCompressionType_Name(std::get<0>(info.param)),
+          "SVS_COMPRESSION_"),
+      "_", data_model::DistanceMetric_Name(std::get<1>(info.param)), "_",
+      absl::StripPrefix(
+          data_model::VectorDataType_Name(std::get<2>(info.param)),
+          "VECTOR_DATA_TYPE_"));
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -1880,16 +1852,70 @@ INSTANTIATE_TEST_SUITE_P(
                                      data_model::DISTANCE_METRIC_COSINE),
                      testing::Values(data_model::VECTOR_DATA_TYPE_FLOAT32,
                                      data_model::VECTOR_DATA_TYPE_FLOAT16)),
-    [](const testing::TestParamInfo<LvqLeanVecParam> &info) {
-      return absl::StrCat(
-          absl::StripPrefix(
-              data_model::SVSCompressionType_Name(std::get<0>(info.param)),
-              "SVS_COMPRESSION_"),
-          "_", data_model::DistanceMetric_Name(std::get<1>(info.param)), "_",
-          absl::StripPrefix(
-              data_model::VectorDataType_Name(std::get<2>(info.param)),
-              "VECTOR_DATA_TYPE_"));
-    });
+    LvqLeanVecParamName);
+
+// The LeanVec kinds only; skips here, as in VectorSVSLvqLeanVecTest, mean a
+// build or CPU without LVQ/LeanVec (ci/svs_lane.sh counts both suites).
+// Deleted vectors aren't trained on: the conversion trains on the first
+// threshold's worth of vectors SVS still holds.
+template <typename T>
+void VectorSVSLeanVecTest::TrainsOnVectorsStillHeld() {
+  constexpr size_t kDeleted = 5;
+  auto index = VectorSVS<T>::Create(Proto(), attribute_identifier,
+                                    attribute_data_type, 0);
+  ASSERT_TRUE(index.ok()) << index.status();
+  auto vectors = RandomVectors(kThreshold + kDeleted, kDimensions);
+  EXPECT_CALL(*kMockValkeyModule, Log(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*kMockValkeyModule,
+              Log(testing::_, testing::_,
+                  testing::HasSubstr(absl::StrCat(
+                      "LeanVec trained out-of-distribution on ",
+                      kThreshold - training_query_count_, " data vectors and ",
+                      training_query_count_, " queries"))))
+      .Times(1);
+  auto add = [&](size_t i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   EncodeAs<T>(vectors[i])));
+  };
+  for (size_t i = 0; i + 1 < kThreshold; ++i) add(i);
+  for (size_t i = 0; i < kDeleted; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  for (size_t i = kThreshold - 1; i < kThreshold + kDeleted; ++i) add(i);
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
+}
+
+TEST_P(VectorSVSLeanVecTest, TrainsOnVectorsStillHeld) {
+  if (Float16()) {
+    TrainsOnVectorsStillHeld<float16>();
+  } else {
+    TrainsOnVectorsStillHeld<float>();
+  }
+}
+
+// With no training queries, LeanVec trains its projection with PCA on the
+// threshold's vectors, through the same path.
+TEST_P(VectorSVSLeanVecTest, TrainsWithPcaWithoutQueries) {
+  training_query_count_ = 0;
+  if (Float16()) {
+    ConvertsAtThresholdAndRoundTrips<float16>();
+  } else {
+    ConvertsAtThresholdAndRoundTrips<float>();
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Kinds, VectorSVSLeanVecTest,
+    testing::Combine(testing::Values(data_model::SVS_COMPRESSION_LEANVEC4X4,
+                                     data_model::SVS_COMPRESSION_LEANVEC4X8,
+                                     data_model::SVS_COMPRESSION_LEANVEC8X8),
+                     testing::Values(data_model::DISTANCE_METRIC_L2,
+                                     data_model::DISTANCE_METRIC_COSINE),
+                     testing::Values(data_model::VECTOR_DATA_TYPE_FLOAT32,
+                                     data_model::VECTOR_DATA_TYPE_FLOAT16)),
+    LvqLeanVecParamName);
 
 // Without the prebuilt C API, or on a CPU it doesn't support, an RDB with an
 // LVQ/LeanVec index loads it without storage instead of failing the load: the
