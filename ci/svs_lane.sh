@@ -73,7 +73,7 @@ CPU_VENDOR=$(awk -F': ' '/^vendor_id/ {print $2; exit}' /proc/cpuinfo)
 CPU_MODEL=$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo)
 VALKEY_VERSION=$("${RESULTS}/integration/valkey-server" --version 2>/dev/null | head -1)
 
-# Whether the LVQ/LeanVec tests ran or skipped: the unit suite that needs
+# Whether the LVQ/LeanVec tests ran or skipped: the unit suites that need
 # support, and the integration file.
 count() { grep -cE "$1" || true; }
 LVQ_UNIT_PASSED=0
@@ -86,7 +86,8 @@ if [[ ${LANE} == prebuilt ]]; then
   # Bounded like ctest's run of the same binary (build.sh's TEST_TIMEOUT); a
   # timeout exits 124.
   timeout --kill-after=10 "${TEST_TIMEOUT:-60}" \
-    "${BUILD_DIR}/tests/vector_svs_test" --gtest_filter='Kinds/VectorSVSLvqLeanVecTest.*' \
+    "${BUILD_DIR}/tests/vector_svs_test" \
+    --gtest_filter='Kinds/VectorSVSLvqLeanVecTest.*:Kinds/VectorSVSLeanVecTest.*' \
     >"${RESULTS}/lvq_unit.log" 2>&1
   LVQ_UNIT_EXIT=$?
   LVQ_UNIT_PASSED=$(count '^\[       OK \]' <"${RESULTS}/lvq_unit.log")
