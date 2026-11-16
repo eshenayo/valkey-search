@@ -3099,20 +3099,35 @@ TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
   // gets its own block.
   EXPECT_EQ(estimate(data_model::SVS_COMPRESSION_LVQ4X4),
             estimate(data_model::SVS_COMPRESSION_LVQ8) + kBlock);
-  EXPECT_GT(estimate(data_model::SVS_COMPRESSION_LEANVEC4X8),
-            estimate(data_model::SVS_COMPRESSION_LVQ4X8) + 3 * fp32_bytes);
-  // LeanVec trains on at most TRAINING_THRESHOLD vectors, so on an index past
-  // it the training part grows with the threshold, not the index: the
-  // read-back vectors and 4x them.
-  auto leanvec = [](uint32_t threshold) {
+  // The converted index at twice its per-vector size (graph, ids, data),
+  // plus a block per dataset and the allocator's 64 MiB.
+  constexpr uint64_t kMiB = uint64_t{1} << 20;
+  EXPECT_EQ(estimate(data_model::SVS_COMPRESSION_SQ8),
+            2 * 10000 * (128 + 16 + 33 * 4 + 40) + 2 * kBlock + 64 * kMiB);
+  // LeanVec's peak is the larger of training and converting, not both: the
+  // training vectors are freed before the conversion. Here training is: the
+  // read-back vectors, half again, and 16x them below the 1.5 GiB cap.
+  EXPECT_EQ(estimate(data_model::SVS_COMPRESSION_LEANVEC4X8),
+            fp32_bytes + fp32_bytes / 2 + 16 * fp32_bytes);
+  auto leanvec = [](uint32_t threshold, size_t vectors) {
     SVSBuildConfig config;
     config.compression = data_model::SVS_COMPRESSION_LEANVEC4X8;
     config.graph_max_degree = 32;
     config.leanvec_dims = 64;
+    config.blocksize_bytes = kBlock;
     config.training_threshold = threshold;
-    return SvsConversionPeakBytes(config, 128, 100000);
+    return SvsConversionPeakBytes(config, 128, vectors);
   };
-  EXPECT_EQ(leanvec(2000) - leanvec(1000), 5 * 1000 * 128 * sizeof(float));
+  // Training uses at most TRAINING_THRESHOLD vectors, so on a large index
+  // converting dominates and the threshold doesn't add to it.
+  const uint64_t converting =
+      2 * uint64_t{1000000} * ((64 * 4 + 128 * 8) / 8 + 16 + 33 * 4 + 40) +
+      3 * kBlock + 64 * kMiB;
+  EXPECT_EQ(leanvec(1000, 1000000), converting);
+  EXPECT_EQ(leanvec(2000, 1000000), converting);
+  // A large training set is capped at 1.5 GiB above 1.5x its vectors.
+  const uint64_t trained = uint64_t{1000000} * 128 * sizeof(float);
+  EXPECT_EQ(leanvec(1000000, 1000000), trained + trained / 2 + 1536 * kMiB);
 }
 
 // LeanVec trains on the first labels in insertion order, at most the
