@@ -159,14 +159,14 @@ This table shows the actual computation that Search uses when computing the dist
 
 - **Version:** `SVS_VAMANA` requires 1.3.0 or later. A module older than that refuses to load an RDB file with an `SVS_VAMANA` index.
 - **Memory:** SVS allocations count toward `used_memory` and `maxmemory`. On Valkey 9.2 or later they are reported as `used_memory_module_external` in `INFO debug`, and allocations of 2 MiB or more try huge pages first. On earlier Valkey versions they are still counted, but huge pages aren't used.
-- **Conversion time:** the conversion pauses writes and searches on the index. Measured with 768-dimensional vectors on an Intel Xeon Max 9468, converting at the default threshold and at 100,000 and 1,000,000 vectors:
+- **Conversion time:** the conversion pauses writes and searches on the index. Measured with 768-dimensional vectors on an Intel Xeon Max 9468, each converting at the number of vectors shown (the default thresholds are 1024 for `SQ8` and LVQ, 10,000 for LeanVec):
 
-  | `COMPRESSION` | Default threshold | 100,000 | 1,000,000 |
-  | :------------ | :---------------- | :------ | :-------- |
-  | `SQ8` (1024; measured at 10,000) | 0.1 s | 1.3 s | 20 s |
-  | `LVQ4X8` (1024; measured at 10,000) | 0.3 s | 2.7 s | 32 s |
-  | `LEANVEC4X8` (10,000) | 10 s | 12 s | 47 s |
-  | `LEANVEC4X8`, `TRAINING_QUERY_COUNT 0` (PCA) | 0.9 s | 6 s | 40 s |
+  | `COMPRESSION` | 10,000 | 100,000 | 1,000,000 |
+  | :------------ | :----- | :------ | :-------- |
+  | `SQ8` | 0.1 s | 1.3 s | 20 s |
+  | `LVQ4X8` | 0.3 s | 2.7 s | 32 s |
+  | `LEANVEC4X8`, out-of-distribution (default) | 10 s | 12 s | 47 s |
+  | `LEANVEC4X8`, PCA (`TRAINING_QUERY_COUNT 0`) | 0.9 s | 6 s | 40 s |
 
   LeanVec's out-of-distribution training adds about 9 seconds at the default settings, most of the pause there. Its peak memory during a conversion is up to about 1.5 times the converted index's for `SQ8` and LVQ, and for LeanVec also the training vectors read back as `FLOAT32`, about 1 GB of working space, and memory that grows with `DIM`: two `DIM` × `REDUCE` `FLOAT32` projection matrices, and for PCA its `DIM` × `DIM` working space.
 - **LeanVec search window:** LeanVec searches the reduced vectors and re-ranks the window at full dimension, so it needs a larger window than uncompressed storage for the same recall. On 1,000,000 768-dimensional Cohere embeddings, recall@10 of 0.98 took windows of about 70 to 325 with LEANVEC4X8 trained with PCA, depending on how many vectors were added after the conversion, against 45 to 55 for `FLOAT32`; out-of-distribution training needs smaller ones. Raise `SEARCH_WINDOW_SIZE`, or `EF_RUNTIME` per query, accordingly.
