@@ -1162,12 +1162,15 @@ TEST_F(VectorSVSTest, ConsolidationRunsUnderTheSharedLock) {
   ASSERT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kKeys / 2);
 
   absl::Notification done;
-  std::thread consolidator([&] {
-    VectorSVSTestPeer::ConsolidateConcurrently(**index);
-    done.Notify();
-  });
+  std::thread consolidator;
   bool finished_while_held = false;
+  // Started while the shared lock is held, so finishing proves it doesn't
+  // need the exclusive one.
   HoldSharedWhile(VectorSVSTestPeer::ResizeMutex(**index), [&] {
+    consolidator = std::thread([&] {
+      VectorSVSTestPeer::ConsolidateConcurrently(**index);
+      done.Notify();
+    });
     finished_while_held =
         done.WaitForNotificationWithTimeout(absl::Seconds(10));
   });
