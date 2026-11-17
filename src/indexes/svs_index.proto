@@ -34,4 +34,9 @@ message SVSIndexHeader {
   // vectors. The payload then uses the uncompressed storage for the element
   // type, not build_config.compression.
   bool compression_pending = 7;
+
+  // Ids of the vectors deleted in SVS and not yet consolidated. A FINE_GRAIN
+  // index saves its slots as they are, deleted ones included, so the
+  // consolidation trigger carries over a reload.
+  repeated uint64 deleted_ids = 8;
 }

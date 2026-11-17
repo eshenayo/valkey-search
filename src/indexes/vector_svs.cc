@@ -864,11 +864,14 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
         err.get());
     if (!builder.ok()) return builder.status();
 
-    svs_index_h index = svs_index_load_stream_dynamic(
-        builder->get(), &iface, storage_config.blocksize_bytes, err.get());
+    svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
+    params.blocksize_bytes = storage_config.blocksize_bytes;
+    params.sync_kind = kSvsSyncKind;
+    svs_index_h index = svs_index_load_stream_dynamic_ex(builder->get(), &iface,
+                                                         &params, err.get());
     if (index == nullptr) {
       if (!adapter.status().ok()) return adapter.status();
-      return SvsErrorToStatus(err.get(), "index_load_stream_dynamic");
+      return SvsErrorToStatus(err.get(), "index_load_stream_dynamic_ex");
     }
     // Hand the handle to instance before the check below, so ~VectorSVS owns
     // it on every path out of here and no path needs its own free.
@@ -879,15 +882,21 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
     // Nothing else can use the index before it is published, so query its
     // memory here; otherwise the first FT.INFO after a load would report 0.
     instance->RefreshMemoryBytes();
-    // The stream load has no parameter form at this pin, so the restored
-    // index reports SVS_SYNC_KIND_NONE and cannot guard concurrent writers;
-    // keep its mutations exclusive (serialized by resize_mutex_, as before).
+    // An index SVS doesn't guard (SVS_SYNC_KIND_NONE) keeps its mutations
+    // exclusive (serialized by resize_mutex_).
     svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE;
     if (!svs_index_dynamic_get_sync_kind(index, &sync_kind, err.get())) {
       return SvsErrorToStatus(err.get(), "index_dynamic_get_sync_kind");
     }
     instance->mutations_exclusive_.store(sync_kind == SVS_SYNC_KIND_NONE,
                                          std::memory_order_release);
+    // The FINE_GRAIN loader keeps the saved deleted slots; restore their ids
+    // so the consolidation trigger counts them.
+    if (sync_kind != SVS_SYNC_KIND_NONE) {
+      absl::MutexLock map_lock(&instance->label_mutex_);
+      instance->deleted_ids_.assign(header.deleted_ids().begin(),
+                                    header.deleted_ids().end());
+    }
 
     // Terminator invariant (design.md): consumed_sentinel() implies AtEnd();
     // AtEnd() == false either way means SVS stopped before the payload end.
@@ -1588,10 +1597,16 @@ template <typename T>
 absl::Status VectorSVS<T>::SaveIndexImpl(
     RDBChunkOutputStream chunked_out) const {
 #if defined(__linux__) && defined(__x86_64__)
-  // Writer, not reader: svs_index_save_stream consolidates and compacts the
-  // live index before serializing, so a foreground save must exclude
-  // searches. Safe in the fork child, where suspended pools hold no locks.
+  // Writer, not reader: it keeps the deleted ids below consistent with the
+  // payload (mutations and consolidation hold the reader side), and a
+  // non-FINE_GRAIN svs_index_save_stream consolidates and compacts the live
+  // index, so it must exclude searches. Safe in the fork child, where
+  // suspended pools hold no locks.
   absl::WriterMutexLock lock(&resize_mutex_);
+  // A FINE_GRAIN save keeps deleted slots as they are; any other consolidates
+  // and compacts them.
+  const bool keeps_deleted_slots =
+      !mutations_exclusive_.load(std::memory_order_acquire);
 
   // Deletes only mark SVS slots, so a handle can outlive its last live
   // entry; SVS's save cannot compact an index with none, so save it as the
@@ -1626,6 +1641,10 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
   } else {
     FillSvsVamanaProto(build_config_, header.mutable_build_config());
   }
+  if (has_index && !unavailable && keeps_deleted_slots) {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    header.mutable_deleted_ids()->Add(deleted_ids_.begin(), deleted_ids_.end());
+  }
 
   std::string serialized;
   if (!header.SerializeToString(&serialized)) {
@@ -1648,9 +1667,11 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
     if (!adapter.status().ok()) return adapter.status();
     return SvsErrorToStatus(err.get(), "index_save_stream");
   }
-  // The save consolidated and compacted the index.
-  absl::MutexLock map_lock(&label_mutex_);
-  deleted_ids_.clear();
+  if (!keeps_deleted_slots) {
+    // The save consolidated and compacted the index.
+    absl::MutexLock map_lock(&label_mutex_);
+    deleted_ids_.clear();
+  }
   return absl::OkStatus();
 #else
   (void)chunked_out;

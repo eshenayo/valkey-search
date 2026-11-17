@@ -478,16 +478,15 @@ class TestSvsSaveRestoreSq8(ValkeySearchTestCaseDebugMode):
 
 
 class TestSvsSaveRestoreDeletedSlots(ValkeySearchTestCaseDebugMode):
-    """Deleted slots don't survive a reload: SVS's save consolidates them,
-    so the loaded index reports none and searches never return a deleted key.
-    BGSAVE consolidates in the forked child only, so the saving server keeps
-    its deleted slots."""
+    """Deleted slots survive a reload: SVS saves the slots as they are and the
+    RDB carries their ids, so the loaded index reports the same count, and
+    searches never return a deleted key."""
 
     NUM_VECTORS = 10
     DELETED = ["doc:1", "doc:2", "doc:3"]
 
     @pytest.mark.parametrize("how", ["debug_reload", "bgsave_restart"])
-    def test_reload_drops_deleted_slots(self, how):
+    def test_reload_keeps_deleted_slots(self, how):
         client: Valkey = self.client
         index = self.index_name = f"svs_deleted_{how}"
         _create_svs_index(client, index)
@@ -500,18 +499,18 @@ class TestSvsSaveRestoreDeletedSlots(ValkeySearchTestCaseDebugMode):
         def deleted_slots():
             return _v_index(client, index)["algorithm"]["deleted_slots"]
 
-        def saver_keeps_deleted_slots():
+        def all_deleted_slots_counted():
             assert deleted_slots() == len(self.DELETED)
 
-        saver_keeps_deleted_slots()
+        all_deleted_slots_counted()
         if how == "debug_reload":
             client.execute_command("DEBUG", "RELOAD")
         else:
-            _bgsave_and_restart(self, before_restart=saver_keeps_deleted_slots)
+            _bgsave_and_restart(self, before_restart=all_deleted_slots_counted)
         live = self.NUM_VECTORS - len(self.DELETED)
         waiters.wait_for_equal(
             lambda: _v_index(client, index)["size"], live, timeout=30)
-        assert deleted_slots() == 0
+        all_deleted_slots_counted()
         keys = _score_map(_knn(client, index, [1.0] + [0.0] * (DIM - 1),
                                self.NUM_VECTORS)).keys()
         assert len(keys) == live

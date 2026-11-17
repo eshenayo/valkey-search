@@ -239,7 +239,7 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
 
     def test_ft_info_reports_deleted_slots(self):
         """FT.INFO deleted_slots counts deleted vectors whose slots SVS
-        still holds; a SAVE consolidates them away."""
+        still holds; a SAVE keeps them."""
         client: Valkey = self.server.get_new_client()
         self._create_default_index(client)
 
@@ -251,7 +251,7 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         client.delete("doc:2", "doc:5")
         assert deleted_slots() == 2
         client.execute_command("SAVE")
-        assert deleted_slots() == 0
+        assert deleted_slots() == 2
 
     def test_knn_returns_correct_neighbors_and_distances(self):
         """L2 distances are exact for a small deterministic axis-aligned set."""
