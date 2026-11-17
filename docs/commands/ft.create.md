@@ -135,7 +135,7 @@ See [Numeric Field Format](../topics/search-data-formats.md#numeric-fields) for 
   | `LEANVEC4X8`  | 4 × `REDUCE` + 8 × `DIM`    |
   | `LEANVEC8X8`  | 8 × `REDUCE` + 8 × `DIM`    |
 
-  Measured memory per vector, with 1,000,000 768-dimensional `FLOAT32` vectors at the defaults: SVS's own allocations (`memory_bytes` in `FT.INFO`), and in parentheses the index's whole increase of `used_memory`. The hash keys hold another 3072 bytes per vector in every case: `HNSW` indexes those vectors in place, while SVS keeps its own copy, uncompressed with `NONE`.
+  Measured memory per vector, with 1,000,000 768-dimensional vectors at the defaults: SVS's own allocations (`memory_bytes` in `FT.INFO`), and in parentheses the index's whole increase of `used_memory`. The vectors are `TYPE FLOAT32` (the `FP16` column is the compression) except in the `HNSW` (`FLOAT16`) column. The hash keys hold the vectors themselves on top of this: 3072 bytes each as `FLOAT32`, 1536 as `FLOAT16`. `HNSW` indexes those vectors in place, while SVS keeps its own copy, uncompressed with `NONE`.
 
   | `NONE` | `FP16` | `SQ8` | `LVQ4X8` | `LEANVEC4X8` | `HNSW` (`FLOAT32`) | `HNSW` (`FLOAT16`) |
   | :----- | :----- | :---- | :------- | :----------- | :----------------- | :----------------- |
