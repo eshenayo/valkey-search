@@ -312,6 +312,16 @@ class ScopedSvsError {
   svs_error_h err_;
 };
 
+// SVS can't compact an index with no live entries, and the C API's add_points
+// reuses the slots consolidation frees only after a compaction. So when a
+// consolidation leaves no live entries, its ids stay listed and the next
+// consolidation, with live entries again, compacts them.
+bool HasLiveEntries(svs_index_h index) {
+  size_t live = 0;
+  ScopedSvsError err;
+  return svs_index_get_size(index, &live, err.get()) && live > 0;
+}
+
 absl::Status SvsErrorToStatus(svs_error_h err, absl::string_view phase) {
   const char* msg = svs_error_get_message(err);
   const std::string text =
@@ -1335,18 +1345,14 @@ void VectorSVS<T>::MaybeConsolidate() {
         << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
     return;
   }
-  // Consolidation reclaimed every deleted slot and dropped their ids.
+  if (!HasLiveEntries(svs_index_)) return;
+  // Consolidation reclaimed every deleted slot and dropped their ids; the
+  // compaction lets add_points reuse the slots.
   {
     absl::MutexLock map_lock(&label_mutex_);
     deleted_ids_.clear();
   }
-  // The C API's add_points only fills slots past the last compaction, so the
-  // slots consolidate freed are reused only after compacting. SVS can't
-  // compact an index with no live entries.
-  size_t live_in_svs = 0;
-  if (svs_index_get_size(svs_index_, &live_in_svs, err.get()) &&
-      live_in_svs > 0 &&
-      !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
+  if (!svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA compact failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_compact");
@@ -1379,6 +1385,7 @@ void VectorSVS<T>::ConsolidateConcurrently() {
     return;
   }
   const absl::Time consolidated = absl::Now();
+  if (!HasLiveEntries(svs_index_)) return;
   // Ids deleted before the consolidation started are reclaimed; later ones
   // (pushed after them) wait for the next.
   {
@@ -1387,13 +1394,9 @@ void VectorSVS<T>::ConsolidateConcurrently() {
         deleted_ids_.begin(),
         deleted_ids_.begin() + std::min(before, deleted_ids_.size()));
   }
-  // The C API's add_points doesn't refill the slots consolidation freed, so
-  // compact to reclaim them; SVS runs compaction exclusively. SVS can't
-  // compact an index with no live entries, and shutdown doesn't need it.
-  size_t live_in_svs = 0;
+  // Compaction lets add_points reuse the freed slots; SVS runs it exclusively.
+  // Shutdown doesn't need it.
   if (!SvsMaintenance::Stopped() &&
-      svs_index_get_size(svs_index_, &live_in_svs, err.get()) &&
-      live_in_svs > 0 &&
       !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA compact failed: "

@@ -1402,7 +1402,8 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
 }
 
 // Deleting every entry triggers consolidation with nothing left to compact
-// (SVS can't compact an empty index); the index must keep working.
+// (SVS can't compact an empty index), so the ids stay listed; the index must
+// keep working, and the next consolidation with live entries clears them.
 TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   const size_t kKeys = 1100;  // past the 1024-slot trigger
   auto index = VectorSVS<float>::Create(
@@ -1420,7 +1421,6 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
         (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
   }
   VectorSVSTestPeer::WaitForConsolidation(**index);
-  EXPECT_LT(VectorSVSTestPeer::DeletedIdCount(**index), 1024u);
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), 0u);
 
   VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
@@ -1429,6 +1429,13 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   VMSDK_EXPECT_OK(result);
   ASSERT_EQ(result->size(), 1u);
   EXPECT_EQ((*result)[0].external_id, IndexToKey(0));
+
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(1),
+                                                 VectorToStr(vectors[1])));
+  VMSDK_EXPECT_OK(
+      (*index)->RemoveRecord(IndexToKey(1), indexes::DeletionType::kRecord));
+  VectorSVSTestPeer::WaitForConsolidation(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
 }
 
 // A restored index isn't FINE_GRAIN, so it consolidates inline under the
@@ -1512,6 +1519,42 @@ size_t SvsDataBytes(const VectorSVS<float> &index) {
       << svs_error_get_message(err);
   svs_error_free(err);
   return breakdown.data_bytes;
+}
+
+// SVS can't compact an index with no live entries, so a consolidation that
+// runs once every vector is deleted keeps the ids; the next one, with live
+// entries again, compacts. Repeated fill and delete-all cycles then reuse the
+// freed slots instead of growing.
+TEST_F(VectorSVSTest, FillAndDeleteAllCyclesReuseSlots) {
+  const size_t kKeys = 1024;  // the last delete triggers, with none live
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  proto.set_initial_cap(64);  // small blocks, so growth shows
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 5.0);
+  std::vector<size_t> filled_bytes;
+  for (int cycle = 0; cycle < 4; ++cycle) {
+    for (size_t i = 0; i < kKeys; ++i) {
+      VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                     VectorToStr(vectors[i])));
+    }
+    filled_bytes.push_back(SvsDataBytes(**index));
+    for (size_t i = 0; i < kKeys; ++i) {
+      VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(i),
+                                             indexes::DeletionType::kRecord));
+    }
+    VectorSVSTestPeer::WaitForConsolidation(**index);
+  }
+  // At most one cycle's slots are held when the next fill starts.
+  EXPECT_LE(filled_bytes[3], filled_bytes[1])
+      << "cycle bytes: " << filled_bytes[0] << ", " << filled_bytes[1] << ", "
+      << filled_bytes[2] << ", " << filled_bytes[3];
+  auto result = (*index)->Search(VectorToStr(vectors[0]), 1, CancelNever());
+  VMSDK_EXPECT_OK(result);
+  EXPECT_TRUE(result->empty());
 }
 
 // A loaded index holds no deleted slots: SVS's save consolidates and
