@@ -748,12 +748,20 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig& config, int dimensions,
   // larger phase. Training measured up to about 1.1 GiB above the read-back
   // vectors from 100k up, and about 4x them at 10k; 1.5x them plus the
   // smaller of 1.5 GiB and 16x them leaves a margin.
+  //
+  // Both phases also hold the two DIM x REDUCE FP32 projection matrices, and
+  // training's PCA works on DIM x DIM doubles (budgeted at two such: the
+  // covariance and its decomposition). Negligible at 768-d, they dominate at
+  // high DIM.
+  const uint64_t matrices = 2 * dims * config.leanvec_dims * sizeof(float);
+  const uint64_t pca = 2 * dims * dims * sizeof(double);
   const uint64_t trained =
       std::min<uint64_t>(vectors, config.training_threshold) * dims *
       sizeof(float);
-  const uint64_t training =
-      trained + trained / 2 + std::min<uint64_t>(1536 * kMiB, 16 * trained);
-  return std::max(converting, training);
+  const uint64_t training = trained + trained / 2 +
+                            std::min<uint64_t>(1536 * kMiB, 16 * trained) +
+                            matrices + pca;
+  return std::max(converting + matrices, training);
 }
 
 size_t SvsConversionRows(const SVSBuildConfig& config, int dimensions,
