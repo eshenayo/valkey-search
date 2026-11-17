@@ -80,7 +80,8 @@ def start_server(server: str, module: str, port: int, work_dir: str,
         try:
             if valkey.Valkey(port=port, socket_timeout=1).ping():
                 return proc
-        except valkey.exceptions.ConnectionError:
+        except (valkey.exceptions.ConnectionError,
+                valkey.exceptions.TimeoutError):
             time.sleep(0.1)
     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     raise TimeoutError("valkey-server did not start")
