@@ -758,9 +758,12 @@ uint64_t SvsConversionPeakBytes(const SVSBuildConfig& config, int dimensions,
   const uint64_t trained =
       std::min<uint64_t>(vectors, config.training_threshold) * dims *
       sizeof(float);
-  const uint64_t training = trained + trained / 2 +
-                            std::min<uint64_t>(1536 * kMiB, 16 * trained) +
-                            matrices + pca;
+  // Training's working space beyond the read-back vectors: measured up to
+  // about 1.1 GiB from 100k vectors up.
+  constexpr uint64_t kMaxTrainingWorkspace = 1536 * kMiB;  // 1.5 GiB
+  const uint64_t training =
+      trained + trained / 2 +
+      std::min<uint64_t>(kMaxTrainingWorkspace, 16 * trained) + matrices + pca;
   return std::max(converting + matrices, training);
 }
 
