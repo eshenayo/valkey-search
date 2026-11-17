@@ -3106,9 +3106,12 @@ TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
             2 * 10000 * (128 + 16 + 33 * 4 + 40) + 2 * kBlock + 64 * kMiB);
   // LeanVec's peak is the larger of training and converting, not both: the
   // training vectors are freed before the conversion. Here training is: the
-  // read-back vectors, half again, and 16x them below the 1.5 GiB cap.
+  // read-back vectors, half again, and 16x them below the 1.5 GiB cap, plus
+  // the two 128 x 64 FP32 projection matrices and PCA's 128 x 128 doubles.
+  const uint64_t matrices = 2 * 128 * 64 * sizeof(float);
+  const uint64_t pca = 2 * 128 * 128 * sizeof(double);
   EXPECT_EQ(estimate(data_model::SVS_COMPRESSION_LEANVEC4X8),
-            fp32_bytes + fp32_bytes / 2 + 16 * fp32_bytes);
+            fp32_bytes + fp32_bytes / 2 + 16 * fp32_bytes + matrices + pca);
   auto leanvec = [](uint32_t threshold, size_t vectors) {
     SVSBuildConfig config;
     config.compression = data_model::SVS_COMPRESSION_LEANVEC4X8;
@@ -3123,11 +3126,27 @@ TEST_F(VectorSVSTest, ConversionPeakEstimateFollowsTheCompression) {
   const uint64_t converting =
       2 * uint64_t{1000000} * ((64 * 4 + 128 * 8) / 8 + 16 + 33 * 4 + 40) +
       3 * kBlock + 64 * kMiB;
-  EXPECT_EQ(leanvec(1000, 1000000), converting);
-  EXPECT_EQ(leanvec(2000, 1000000), converting);
+  EXPECT_EQ(leanvec(1000, 1000000), converting + matrices);
+  EXPECT_EQ(leanvec(2000, 1000000), converting + matrices);
   // A large training set is capped at 1.5 GiB above 1.5x its vectors.
   const uint64_t trained = uint64_t{1000000} * 128 * sizeof(float);
-  EXPECT_EQ(leanvec(1000000, 1000000), trained + trained / 2 + 1536 * kMiB);
+  EXPECT_EQ(leanvec(1000000, 1000000),
+            trained + trained / 2 + 1536 * kMiB + matrices + pca);
+  // At high DIM the matrices and PCA's working space dominate: DIM 32768,
+  // REDUCE 32767 and a threshold of 32768 read back 4 GiB, and need about
+  // 8 GiB of matrices and 16 GiB for PCA on top.
+  SVSBuildConfig wide;
+  wide.compression = data_model::SVS_COMPRESSION_LEANVEC4X8;
+  wide.graph_max_degree = 32;
+  wide.leanvec_dims = 32767;
+  wide.blocksize_bytes = kBlock;
+  wide.training_threshold = 32768;
+  const uint64_t wide_trained = uint64_t{32768} * 32768 * sizeof(float);
+  const uint64_t wide_matrices = uint64_t{2} * 32768 * 32767 * sizeof(float);
+  const uint64_t wide_pca = uint64_t{2} * 32768 * 32768 * sizeof(double);
+  EXPECT_EQ(
+      SvsConversionPeakBytes(wide, 32768, 32768),
+      wide_trained + wide_trained / 2 + 1536 * kMiB + wide_matrices + wide_pca);
 }
 
 // LeanVec trains on the first labels in insertion order, at most the
