@@ -90,6 +90,14 @@ class VectorSVSTestPeer {
     }
     EXPECT_FALSE(index.consolidating_.load()) << "consolidation still running";
   }
+  static int RunningMaintenance() ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    absl::MutexLock lock(&SvsMaintenance::mutex_);
+    return SvsMaintenance::running_;
+  }
+  static void ResumeMaintenance() ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    absl::MutexLock lock(&SvsMaintenance::mutex_);
+    SvsMaintenance::stopped_ = false;
+  }
   static size_t MemoryBytesForInfo(const VectorSVS<float> &index) {
     return index.MemoryBytesForInfo();
   }
@@ -1191,6 +1199,57 @@ void WhileHeldElsewhere(absl::Mutex &mu, bool shared,
   body();
   release.Notify();
   holder.join();
+}
+
+// Shutdown waits for a running background consolidation, which SVS can't
+// interrupt, and skips any that hasn't started.
+TEST_F(VectorSVSTest, StoppingMaintenanceWaitsForRunningAndSkipsQueued) {
+  const size_t kKeys = 20;
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kKeys / 2; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  absl::Cleanup resume = [] { VectorSVSTestPeer::ResumeMaintenance(); };
+  absl::Notification stopped;
+  std::thread consolidator, stopper;
+  // Holding resize_mutex_ keeps the consolidation running (blocked) until the
+  // stop is underway.
+  WhileHeldElsewhere(
+      VectorSVSTestPeer::ResizeMutex(**index), /*shared=*/false, [&] {
+        consolidator = std::thread(
+            [&] { VectorSVSTestPeer::ConsolidateConcurrently(**index); });
+        while (VectorSVSTestPeer::RunningMaintenance() == 0) {
+          absl::SleepFor(absl::Milliseconds(1));
+        }
+        stopper = std::thread([&] {
+          SvsMaintenance::Stop();
+          stopped.Notify();
+        });
+        EXPECT_FALSE(
+            stopped.WaitForNotificationWithTimeout(absl::Milliseconds(200)))
+            << "Stop returned while a consolidation was running";
+      });
+  consolidator.join();
+  stopper.join();
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+
+  VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(kKeys - 1),
+                                         indexes::DeletionType::kRecord));
+  VectorSVSTestPeer::ConsolidateConcurrently(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 1u);
+  VectorSVSTestPeer::ResumeMaintenance();
+  VectorSVSTestPeer::ConsolidateConcurrently(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
 }
 
 // FT.INFO's memory_bytes never waits behind a consolidation or conversion

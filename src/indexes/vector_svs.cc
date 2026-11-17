@@ -626,6 +626,34 @@ bool BuildConfigMatches(const SVSBuildConfig& expected,
 
 #endif  // __linux__ && __x86_64__
 
+ABSL_CONST_INIT absl::Mutex SvsMaintenance::mutex_(absl::kConstInit);
+int SvsMaintenance::running_ = 0;
+bool SvsMaintenance::stopped_ = false;
+
+void SvsMaintenance::Stop() {
+  absl::MutexLock lock(&mutex_);
+  stopped_ = true;
+  mutex_.Await(
+      absl::Condition(+[](int* running) { return *running == 0; }, &running_));
+}
+
+bool SvsMaintenance::Begin() {
+  absl::MutexLock lock(&mutex_);
+  if (stopped_) return false;
+  ++running_;
+  return true;
+}
+
+void SvsMaintenance::End() {
+  absl::MutexLock lock(&mutex_);
+  --running_;
+}
+
+bool SvsMaintenance::Stopped() {
+  absl::MutexLock lock(&mutex_);
+  return stopped_;
+}
+
 void InitSvsLogging() {
 #if defined(__linux__) && defined(__x86_64__)
   // Covers SVS work without a per-index logger.
@@ -1328,6 +1356,8 @@ void VectorSVS<T>::MaybeConsolidate() {
 template <typename T>
 void VectorSVS<T>::ConsolidateConcurrently() {
   absl::Cleanup done = [this] { consolidating_.store(false); };
+  if (!SvsMaintenance::Begin()) return;
+  absl::Cleanup end = [] { SvsMaintenance::End(); };
   // SVS consolidates a FINE_GRAIN index alongside writers and searches.
   absl::ReaderMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr ||
@@ -1359,9 +1389,10 @@ void VectorSVS<T>::ConsolidateConcurrently() {
   }
   // The C API's add_points doesn't refill the slots consolidation freed, so
   // compact to reclaim them; SVS runs compaction exclusively. SVS can't
-  // compact an index with no live entries.
+  // compact an index with no live entries, and shutdown doesn't need it.
   size_t live_in_svs = 0;
-  if (svs_index_get_size(svs_index_, &live_in_svs, err.get()) &&
+  if (!SvsMaintenance::Stopped() &&
+      svs_index_get_size(svs_index_, &live_in_svs, err.get()) &&
       live_in_svs > 0 &&
       !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)

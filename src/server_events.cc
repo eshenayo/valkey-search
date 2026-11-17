@@ -12,6 +12,7 @@
 #include "absl/time/clock.h"
 #include "src/coordinator/metadata_manager.h"
 #include "src/cursor.h"
+#include "src/indexes/vector_svs.h"
 #include "src/schema_manager.h"
 #include "src/valkey_search.h"
 #include "src/vector_registry.h"
@@ -89,6 +90,9 @@ void OnShutdownCallback(ValkeyModuleCtx *ctx, ValkeyModuleEvent eid,
   if (CursorTable::HasInstance()) {
     CursorTable::Instance().Clear();
   }
+  // A background SVS consolidation can't be interrupted and can outlast the
+  // pools' join deadline; skip queued ones and wait for the running one.
+  indexes::SvsMaintenance::Stop();
   ValkeySearch::Instance().JoinAllThreadPools();
   vmsdk::MarkAsShuttingDown();
   vmsdk::DrainPendingMainCallbacks();

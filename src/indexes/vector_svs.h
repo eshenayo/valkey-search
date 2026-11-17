@@ -77,6 +77,27 @@ struct SVSBuildConfig {
 // Routes SVS's default logger to the Valkey log. Call once at module load.
 void InitSvsLogging();
 
+// Background SVS maintenance in flight, so shutdown can wait for it: the
+// writer pool allows its workers a short deadline to exit, and SVS can't
+// interrupt a consolidation, which can run longer than that.
+class SvsMaintenance {
+ public:
+  // Called at shutdown before the pools are joined. Tasks that haven't started
+  // are skipped; returns once the running ones finish.
+  static void Stop();
+  // Marks a task as running; false once stopped, and the task must not run.
+  static bool Begin();
+  static void End();
+  // True once Stop was called: a running task skips work that can wait.
+  static bool Stopped();
+
+ private:
+  friend class VectorSVSTestPeer;
+  ABSL_CONST_INIT static absl::Mutex mutex_;
+  static int running_ ABSL_GUARDED_BY(mutex_);
+  static bool stopped_ ABSL_GUARDED_BY(mutex_);
+};
+
 template <typename T>
 class VectorSVS : public VectorType<T>,
                   public std::enable_shared_from_this<VectorSVS<T>> {
