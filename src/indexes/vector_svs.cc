@@ -1412,10 +1412,21 @@ void VectorSVS<T>::ConsolidateConcurrently() {
 
 template <typename T>
 size_t VectorSVS<T>::MemoryBytesForInfo() const {
-  // FT.INFO runs on the main thread, so it never waits: an exclusive holder
-  // of resize_mutex_ (a conversion, a restored index's consolidation, a save)
-  // or a background consolidation leaves the last value in place.
-  if (!resize_mutex_.ReaderTryLock()) return memory_bytes_.load();
+  if (!memory_refresh_pending_.exchange(true)) {
+    ValkeySearch::Instance().ScheduleUtilityTask(
+        [weak = this->weak_from_this()] {
+          if (auto self = weak.lock()) self->RefreshMemoryBytes();
+        });
+  }
+  return memory_bytes_.load();
+}
+
+template <typename T>
+void VectorSVS<T>::RefreshMemoryBytes() const {
+  absl::Cleanup done = [this] { memory_refresh_pending_.store(false); };
+  // Try-locks, so a pool thread never waits out a long operation (which
+  // would also hold up the pool's join at shutdown).
+  if (!resize_mutex_.ReaderTryLock()) return;
   if (svs_index_ != nullptr && consolidation_mutex_.TryLock()) {
     size_t bytes = 0;
     if (svs_index_get_memory_usage(svs_index_, &bytes, nullptr)) {
@@ -1424,7 +1435,6 @@ size_t VectorSVS<T>::MemoryBytesForInfo() const {
     consolidation_mutex_.Unlock();
   }
   resize_mutex_.ReaderUnlock();
-  return memory_bytes_.load();
 }
 
 template <typename T>

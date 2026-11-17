@@ -1256,8 +1256,9 @@ TEST_F(VectorSVSTest, StoppingMaintenanceWaitsForRunningAndSkipsQueued) {
 }
 
 // FT.INFO's memory_bytes never waits behind a consolidation or conversion
-// (which holds resize_mutex_ exclusively on a restored index): it reports the
-// last value, then catches up once the index is free.
+// (which holds resize_mutex_ exclusively on a restored index): the refresh,
+// inline here without a utility pool, is skipped and the last value stays,
+// then catches up once the index is free.
 TEST_F(VectorSVSTest, InfoMemoryBytesDoesNotWaitForConsolidation) {
   auto proto =
       CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
@@ -1287,6 +1288,33 @@ TEST_F(VectorSVSTest, InfoMemoryBytesDoesNotWaitForConsolidation) {
         EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index), small);
       });
   EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**index), small);
+}
+
+// With a utility pool, FT.INFO's memory_bytes never queries SVS on the
+// calling (main) thread, where SVS's exclusive lock would wait for in-flight
+// searches and writes: it returns the last value and the pool refreshes it.
+TEST_F(VectorSVSTest, InfoMemoryBytesRefreshesOnTheUtilityPool) {
+  InitThreadPools(/*readers=*/std::nullopt, /*writers=*/std::nullopt,
+                  /*utility=*/1);
+  vmsdk::ThreadPool *pool = ValkeySearch::Instance().GetUtilityThreadPool();
+  ASSERT_NE(pool, nullptr);
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(1, kDimensions, 2.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  VMSDK_EXPECT_OK(pool->SuspendWorkers());
+  EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index), 0u);
+  VMSDK_EXPECT_OK(pool->ResumeWorkers());
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while (VectorSVSTestPeer::MemoryBytesForInfo(**index) == 0 &&
+         absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**index), 0u);
 }
 
 TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
