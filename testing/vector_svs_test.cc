@@ -1317,6 +1317,33 @@ TEST_F(VectorSVSTest, InfoMemoryBytesRefreshesOnTheUtilityPool) {
   EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**index), 0u);
 }
 
+// A loaded index reports its memory on the first FT.INFO: the load queries
+// it, so it doesn't wait for a background refresh.
+TEST_F(VectorSVSTest, LoadedIndexReportsMemoryBytesAtOnce) {
+  InitThreadPools(/*readers=*/std::nullopt, /*writers=*/std::nullopt,
+                  /*utility=*/1);
+  vmsdk::ThreadPool *pool = ValkeySearch::Instance().GetUtilityThreadPool();
+  ASSERT_NE(pool, nullptr);
+  FakeSafeRDB rdb;
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(1, kDimensions, 2.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK(pool->SuspendWorkers());  // no background refresh
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(loaded);
+  EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**loaded), 0u);
+  VMSDK_EXPECT_OK(pool->ResumeWorkers());
+}
+
 TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
   FakeSafeRDB rdb;
   auto proto =

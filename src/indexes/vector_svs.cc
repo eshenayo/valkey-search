@@ -876,6 +876,9 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
       absl::WriterMutexLock lock(&instance->resize_mutex_);
       instance->svs_index_ = index;
     }
+    // Nothing else can use the index before it is published, so query its
+    // memory here; otherwise the first FT.INFO after a load would report 0.
+    instance->RefreshMemoryBytes();
     // The stream load has no parameter form at this pin, so the restored
     // index reports SVS_SYNC_KIND_NONE and cannot guard concurrent writers;
     // keep its mutations exclusive (serialized by resize_mutex_, as before).
