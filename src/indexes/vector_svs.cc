@@ -162,9 +162,14 @@ static_assert(std::has_single_bit(kSvsBlockSizeBytes) &&
                   std::has_single_bit(kSvsMinBlockSizeBytes),
               "SVS block sizes must be powers of two");
 
-// In the pinned SVS revision FINE_GRAIN is an alias of GLOBAL; once upstream
-// implements it, writers on one index run in parallel with no module change.
+// In the source SVS pin (v0.5.0) FINE_GRAIN is an alias of GLOBAL; the
+// prebuilt C API implements it, so writers on one index run in parallel.
 constexpr svs_sync_kind_t kSvsSyncKind = SVS_SYNC_KIND_FINE_GRAIN;
+
+// The prebuilt C API saves a FINE_GRAIN index's slots as they are, deleted
+// ones included, and its stream load takes a sync kind. The source SVS pin
+// consolidates and compacts on save and always loads as SVS_SYNC_KIND_NONE.
+constexpr bool kSvsSaveKeepsSlots = VALKEY_SEARCH_SVS_PREBUILT;
 
 // Reader or writer side of resize_mutex_ for a mutation, chosen at run time
 // (see VectorSVS::mutations_exclusive_). Annotated as a shared lock: the
@@ -1139,9 +1144,12 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
     // A payload written by a different SVS version isn't guaranteed to load,
     // so it's skipped and the index is rebuilt from the keyspace once the
     // tracked keys are loaded (OnTrackedKeysLoaded).
+    // A payload that kept its slots is readable only by an SVS whose save
+    // keeps them; SVS reports the same version either way.
     const uint32_t current_svs_version = svs_get_version();
     const bool svs_version_mismatch =
-        header.svs_version() != current_svs_version;
+        header.svs_version() != current_svs_version ||
+        (header.slots_kept() && !kSvsSaveKeepsSlots);
 
     if (header.dimensionality() != vector_index_proto.dimension_count()) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -1175,6 +1183,11 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
             << "SVS_VAMANA index " << attribute_identifier
             << " was saved by a build that could not create its storage. "
                "Rebuilding it from the keyspace.";
+      } else if (header.svs_version() == current_svs_version) {
+        VMSDK_LOG(WARNING, nullptr)
+            << "SVS_VAMANA index " << attribute_identifier
+            << " was saved with its deleted slots kept, which this build's "
+               "SVS can't load. Rebuilding it from the keyspace.";
       } else {
         VMSDK_LOG(WARNING, nullptr)
             << "SVS_VAMANA index " << attribute_identifier
@@ -1216,11 +1229,21 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
         err.get());
     if (!builder.ok()) return builder.status();
 
+#if VALKEY_SEARCH_SVS_PREBUILT
+    svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
+    params.blocksize_bytes = storage_config.blocksize_bytes;
+    params.sync_kind = kSvsSyncKind;
+    svs_index_h index = svs_index_load_stream_dynamic_ex(builder->get(), &iface,
+                                                         &params, err.get());
+    constexpr const char* kLoadOp = "index_load_stream_dynamic_ex";
+#else
     svs_index_h index = svs_index_load_stream_dynamic(
         builder->get(), &iface, storage_config.blocksize_bytes, err.get());
+    constexpr const char* kLoadOp = "index_load_stream_dynamic";
+#endif
     if (index == nullptr) {
       if (!adapter.status().ok()) return adapter.status();
-      return SvsErrorToStatus(err.get(), "index_load_stream_dynamic");
+      return SvsErrorToStatus(err.get(), kLoadOp);
     }
     // Hand the handle to instance before the check below, so ~VectorSVS owns
     // it on every path out of here and no path needs its own free.
@@ -1228,15 +1251,21 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
       absl::WriterMutexLock lock(&instance->resize_mutex_);
       instance->svs_index_ = index;
     }
-    // The stream load has no parameter form at this pin, so the restored
-    // index reports SVS_SYNC_KIND_NONE and cannot guard concurrent writers;
-    // keep its mutations exclusive (serialized by resize_mutex_, as before).
+    // An index SVS doesn't guard (SVS_SYNC_KIND_NONE: every stream load at
+    // the source SVS pin) keeps its mutations exclusive, serialized by
+    // resize_mutex_.
     svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE;
     if (!svs_index_dynamic_get_sync_kind(index, &sync_kind, err.get())) {
       return SvsErrorToStatus(err.get(), "index_dynamic_get_sync_kind");
     }
     instance->mutations_exclusive_.store(sync_kind == SVS_SYNC_KIND_NONE,
                                          std::memory_order_release);
+    // The payload's deleted slots are still in SVS; count them toward the
+    // next consolidation.
+    if (header.slots_kept()) {
+      instance->deleted_since_consolidate_.store(header.deleted_slots(),
+                                                 std::memory_order_relaxed);
+    }
 
     // Terminator invariant (design.md): consumed_sentinel() implies AtEnd();
     // AtEnd() == false either way means SVS stopped before the payload end.
@@ -1941,10 +1970,16 @@ template <typename T>
 absl::Status VectorSVS<T>::SaveIndexImpl(
     RDBChunkOutputStream chunked_out) const {
 #if defined(__linux__) && defined(__x86_64__)
-  // Writer, not reader: svs_index_save_stream consolidates and compacts the
-  // live index before serializing, so a foreground save must exclude
-  // searches. Safe in the fork child, where suspended pools hold no locks.
+  // Writer, not reader. At the source SVS pin svs_index_save_stream
+  // consolidates and compacts the live index before serializing, so a
+  // foreground save must exclude searches. A save that keeps slots doesn't
+  // need that, but the writer side also keeps deleted_since_consolidate_
+  // consistent with the saved slots. Safe in the fork child, where suspended
+  // pools hold no locks.
   absl::WriterMutexLock lock(&resize_mutex_);
+  // A FINE_GRAIN index saved by the prebuilt C API keeps its deleted slots.
+  const bool keeps_slots = kSvsSaveKeepsSlots && !mutations_exclusive_.load(
+                                                     std::memory_order_acquire);
 
   // Deletes only mark SVS slots, so a handle can outlive its last live
   // entry; SVS's save cannot compact an index with none, so save it as the
@@ -1979,6 +2014,11 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
   } else {
     FillSvsVamanaProto(build_config_, header.mutable_build_config());
   }
+  if (has_index && !unavailable && keeps_slots) {
+    header.set_slots_kept(true);
+    header.set_deleted_slots(
+        deleted_since_consolidate_.load(std::memory_order_relaxed));
+  }
 
   std::string serialized;
   if (!header.SerializeToString(&serialized)) {
@@ -2001,8 +2041,10 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
     if (!adapter.status().ok()) return adapter.status();
     return SvsErrorToStatus(err.get(), "index_save_stream");
   }
-  // The save consolidated and compacted the index.
-  deleted_since_consolidate_.store(0, std::memory_order_relaxed);
+  if (!keeps_slots) {
+    // The save consolidated and compacted the index.
+    deleted_since_consolidate_.store(0, std::memory_order_relaxed);
+  }
   return absl::OkStatus();
 #else
   (void)chunked_out;

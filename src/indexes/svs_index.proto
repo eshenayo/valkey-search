@@ -34,4 +34,17 @@ message SVSIndexHeader {
   // vectors. The payload then uses the uncompressed storage for the element
   // type, not build_config.compression.
   bool compression_pending = 7;
+
+  // Field 8 is taken on intel-svs-vamana-submodule (deleted ids).
+  reserved 8;
+
+  // True when the payload keeps SVS's slot state, deleted slots included,
+  // instead of a consolidated and compacted index. Only an SVS whose save
+  // keeps slots can read it; any other build rebuilds the index from the
+  // keyspace, as on an SVS version mismatch.
+  bool slots_kept = 9;
+
+  // The consolidation trigger's count of deleted slots when saved (it can
+  // run ahead of the slots the payload holds). Restored when slots_kept.
+  uint64 deleted_slots = 10;
 }

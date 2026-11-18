@@ -141,8 +141,7 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
                 f" data vectors and {queries} queries")
 
         # Writes, modifies and deletes keep landing after the conversion,
-        # without converting again. The deletes make SAVE consolidate and
-        # compact the converted index.
+        # without converting again. SAVE keeps the deleted slots as they are.
         add(THRESHOLD, NUM_DOCS)
         for i in range(DELETED):
             client.delete(f"d:{i}")
@@ -162,8 +161,7 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
         assert next(iter(_knn(client, "svs", docs[0]))) == \
             f"d:{DELETED}".encode()
 
-        # SAVE consolidates and compacts the deleted slots first, which can
-        # reorder close neighbors; the reload must then change nothing.
+        # The reload must change nothing.
         client.execute_command("SAVE")
         saved = [_knn(client, "svs", q) for q in queries]
         client.execute_command("DEBUG", "RELOAD")
@@ -181,6 +179,11 @@ class TestSVSLvqLeanVec(ValkeySearchTestCaseDebugMode):
             assert list(after) == list(result), f"query {q} keys"
             assert list(after.values()) == pytest.approx(
                 list(result.values()), abs=1e-6), f"query {q} scores"
+            assert not deleted & after.keys(), f"query {q} deleted keys"
+        # The reloaded index keeps taking writes.
+        client.hset("d:new", mapping={"v": docs[1].tobytes()})
+        wait_for_size(NUM_DOCS - DELETED + 1)
+        assert next(iter(_knn(client, "svs", docs[1]))) == b"d:new"
 
     @pytest.mark.parametrize("metric", ["L2", "COSINE"])
     def test_leanvec_at_training_floor_matches_full_training(self, metric):
