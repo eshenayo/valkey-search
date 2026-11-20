@@ -38,13 +38,15 @@ message SVSIndexHeader {
   // Field 8 is taken on intel-svs-vamana-submodule (deleted ids).
   reserved 8;
 
-  // True when the payload keeps SVS's slot state, deleted slots included,
-  // instead of a consolidated and compacted index. Only an SVS whose save
-  // keeps slots can read it; any other build rebuilds the index from the
-  // keyspace, as on an SVS version mismatch.
-  bool slots_kept = 9;
+  // Set when the payload keeps SVS's slot state, deleted slots included,
+  // instead of a consolidated and compacted index: the SVS version that
+  // wrote it. svs_version then holds a value no SVS release has, so a build
+  // that doesn't know this field takes its SVS-version-mismatch path and
+  // rebuilds the index from the keyspace. Only an SVS whose save keeps slots
+  // can read the payload; any other build rebuilds too.
+  uint32 slots_kept_svs_version = 9;
 
   // The consolidation trigger's count of deleted slots when saved (it can
-  // run ahead of the slots the payload holds). Restored when slots_kept.
+  // run ahead of the slots the payload holds). Restored with the payload.
   uint64 deleted_slots = 10;
 }

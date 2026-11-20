@@ -1497,12 +1497,24 @@ INSTANTIATE_TEST_SUITE_P(
                                   h.set_svs_version(h.svs_version() + 1);
                                 },
                                 false},
+                    // 0xFFFFFFFF is kSvsVersionSlotsKept (vector_svs.cc):
+                    // a payload that kept its slots, with the real SVS
+                    // version beside it.
                     RebuildCase{"SlotsKeptOnSourceBuild",
                                 [](data_model::SVSIndexHeader &h) {
-                                  h.set_slots_kept(true);
+                                  h.set_slots_kept_svs_version(h.svs_version());
+                                  h.set_svs_version(0xFFFFFFFFu);
                                   h.set_deleted_slots(3);
                                 },
-                                true}),
+                                true},
+                    RebuildCase{"SlotsKeptBySvsVersionMismatch",
+                                [](data_model::SVSIndexHeader &h) {
+                                  h.set_slots_kept_svs_version(h.svs_version() +
+                                                               1);
+                                  h.set_svs_version(0xFFFFFFFFu);
+                                  h.set_deleted_slots(3);
+                                },
+                                false}),
     [](const testing::TestParamInfo<RebuildCase> &info) {
       return std::string(info.param.name);
     });

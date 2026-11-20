@@ -107,6 +107,10 @@ constexpr uint32_t kSvsHeaderFormatVersion = 1;
 // SVSIndexHeader.svs_version of an index saved without storage, and so
 // without a payload. No SVS release has version 0.
 constexpr uint32_t kSvsVersionWithoutPayload = 0;
+// SVSIndexHeader.svs_version of a payload that kept its slots; the real
+// version is in slots_kept_svs_version. No SVS release has this version, so
+// readers that predate the field rebuild from the keyspace.
+constexpr uint32_t kSvsVersionSlotsKept = 0xFFFFFFFF;
 
 // Sequential threadpool vtable: SVS invokes parallel_for on the calling
 // reader thread. Matches HNSW's concurrency model (one search occupies
@@ -1147,9 +1151,12 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
     // A payload that kept its slots is readable only by an SVS whose save
     // keeps them; SVS reports the same version either way.
     const uint32_t current_svs_version = svs_get_version();
+    const bool slots_kept = header.svs_version() == kSvsVersionSlotsKept;
+    const uint32_t saved_svs_version =
+        slots_kept ? header.slots_kept_svs_version() : header.svs_version();
     const bool svs_version_mismatch =
-        header.svs_version() != current_svs_version ||
-        (header.slots_kept() && !kSvsSaveKeepsSlots);
+        saved_svs_version != current_svs_version ||
+        (slots_kept && !kSvsSaveKeepsSlots);
 
     if (header.dimensionality() != vector_index_proto.dimension_count()) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -1183,7 +1190,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
             << "SVS_VAMANA index " << attribute_identifier
             << " was saved by a build that could not create its storage. "
                "Rebuilding it from the keyspace.";
-      } else if (header.svs_version() == current_svs_version) {
+      } else if (saved_svs_version == current_svs_version) {
         VMSDK_LOG(WARNING, nullptr)
             << "SVS_VAMANA index " << attribute_identifier
             << " was saved with its deleted slots kept, which this build's "
@@ -1191,7 +1198,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
       } else {
         VMSDK_LOG(WARNING, nullptr)
             << "SVS_VAMANA index " << attribute_identifier
-            << " was saved with SVS version " << header.svs_version()
+            << " was saved with SVS version " << saved_svs_version
             << "; this build is SVS version " << current_svs_version
             << ". Rebuilding it from the keyspace.";
       }
@@ -1262,7 +1269,7 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
                                          std::memory_order_release);
     // The payload's deleted slots are still in SVS; count them toward the
     // next consolidation.
-    if (header.slots_kept()) {
+    if (slots_kept) {
       instance->deleted_since_consolidate_.store(header.deleted_slots(),
                                                  std::memory_order_relaxed);
     }
@@ -2015,7 +2022,8 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
     FillSvsVamanaProto(build_config_, header.mutable_build_config());
   }
   if (has_index && !unavailable && keeps_slots) {
-    header.set_slots_kept(true);
+    header.set_svs_version(kSvsVersionSlotsKept);
+    header.set_slots_kept_svs_version(svs_get_version());
     header.set_deleted_slots(
         deleted_since_consolidate_.load(std::memory_order_relaxed));
   }
