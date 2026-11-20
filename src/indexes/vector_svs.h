@@ -195,9 +195,9 @@ class VectorSVS : public VectorType<T> {
       float query_magnitude) const override ABSL_NO_THREAD_SAFETY_ANALYSIS;
   VectorRecord &GetVectorLockFree(uint64_t internal_id) const override
       ABSL_NO_THREAD_SAFETY_ANALYSIS;
-  // LoadFromRDB leaves this map empty (saves consolidate SVS's soft
-  // deletes away), so every label LoadTrackedKeys re-encounters is new to
-  // it; try_emplace instead of the base class's CHECK.
+  // LoadFromRDB leaves this map empty, so every label LoadTrackedKeys
+  // re-encounters is new to it; try_emplace instead of the base class's
+  // CHECK.
   VectorRecord &GetOrCreateVectorLockFree(uint64_t internal_id) override
       ABSL_LOCKS_EXCLUDED(label_mutex_);
   VectorRecord &GetVector(uint64_t internal_id) const override
@@ -262,11 +262,11 @@ class VectorSVS : public VectorType<T> {
   // gap inside modify is never observed.
   svs_index_h svs_index_ ABSL_GUARDED_BY(resize_mutex_){nullptr};
   // Mutations hold the reader side of resize_mutex_ when SVS guards the index
-  // itself (built with SVS_SYNC_KIND_FINE_GRAIN). An index restored from RDB
-  // comes back with SVS_SYNC_KIND_NONE at the pinned revision (the stream load
-  // takes no parameters), so its mutations take the writer side instead and
-  // stay serialized, as before. Set once in LoadFromRDB before the instance is
-  // published; read on every mutation.
+  // itself (SVS_SYNC_KIND_FINE_GRAIN). An index restored from RDB with the
+  // source SVS pin comes back with SVS_SYNC_KIND_NONE (its stream load takes
+  // no sync kind), so its mutations take the writer side instead and stay
+  // serialized. Set once in LoadFromRDB before the instance is published; read
+  // on every mutation.
   std::atomic<bool> mutations_exclusive_{false};
   // True while svs_index_ (or the index the next add builds) is uncompressed,
   // awaiting MaybeConvert. Written under the writer side of resize_mutex_;
@@ -289,8 +289,9 @@ class VectorSVS : public VectorType<T> {
   // this build may not know all their fields (e.g. ones only another build
   // defines), and its saves must pass them on unchanged.
   data_model::SVSVamanaAlgorithm unavailable_settings_;
-  // Slots deleted in SVS since the last consolidation (or save, which also
-  // consolidates).
+  // Slots deleted in SVS since the last consolidation, or since a save that
+  // consolidated (the source SVS pin's). Restored from the RDB header when the
+  // payload kept its slots.
   mutable std::atomic<size_t> deleted_since_consolidate_{0};
   SVSBuildConfig build_config_;
   mutable absl::Mutex label_mutex_ ABSL_ACQUIRED_AFTER(resize_mutex_);

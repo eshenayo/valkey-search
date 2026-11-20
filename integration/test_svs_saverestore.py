@@ -15,6 +15,7 @@ chunks, with recall checked against a brute-force ground truth.
 """
 
 import struct
+import threading
 
 import numpy as np
 import pytest
@@ -333,6 +334,74 @@ class TestSvsSaveRestoreWritesBetweenReloads(ValkeySearchTestCaseDebugMode):
 
         for i in range(1, self.FIRST_BATCH + self.SECOND_BATCH + 1):
             reply = _knn(client, self.index_name, [float(i), 0.0, 0.0, 0.0], 1)
+            assert reply[0] == 1
+            assert reply[1] == f"doc:{i}".encode()
+
+
+class TestSvsSaveRestoreDeletedSlots(ValkeySearchTestCaseDebugMode):
+    """Deletes pending at save time, including the last-inserted key, whose
+    label the next key after the reload gets again. Whether the save kept the
+    deleted slots (--svs-prebuilt) or consolidated them, deleted keys never
+    come back, the reloaded index takes parallel writes, and every key old
+    and new is still found by exact KNN after a second reload."""
+
+    NUM_VECTORS = 20
+    DELETED = (5, 20)
+    NEW = 10
+    WRITERS = 4
+
+    @pytest.mark.parametrize("how", ["debug_reload", "bgsave_restart"])
+    def test_reload_with_deletes_then_parallel_writes(self, how):
+        client: Valkey = self.client
+        index = self.index_name = f"svs_deleted_{how}"
+        _create_svs_index(client, index)
+        _populate(client, self.NUM_VECTORS, start=1)
+        for i in self.DELETED:
+            client.delete(f"doc:{i}")
+        live = self.NUM_VECTORS - len(self.DELETED)
+        waiters.wait_for_equal(
+            lambda: _v_index(client, index)["size"], live, timeout=30)
+
+        def reload():
+            if how == "debug_reload":
+                client.execute_command("DEBUG", "RELOAD")
+            else:
+                _bgsave_and_restart(self)
+
+        reload()
+        assert _v_index(client, index)["size"] == live
+        deleted = {f"doc:{i}".encode() for i in self.DELETED}
+        reply = client.execute_command(
+            "FT.SEARCH", index, f"*=>[KNN {self.NUM_VECTORS} @v $q]",
+            "PARAMS", "2", "q", _fp32([1.0, 0.0, 0.0, 0.0]),
+            "LIMIT", "0", str(self.NUM_VECTORS), "DIALECT", "2")
+        keys = _score_map(reply).keys()
+        assert len(keys) == live and not deleted & keys
+
+        new = range(self.NUM_VECTORS + 1, self.NUM_VECTORS + self.NEW + 1)
+
+        def write(shard):
+            writer = self.server.get_new_client()
+            for i in new[shard::self.WRITERS]:
+                writer.hset(f"doc:{i}",
+                            mapping={"v": _fp32([float(i), 0.0, 0.0, 0.0])})
+
+        threads = [threading.Thread(target=write, args=(w,))
+                   for w in range(self.WRITERS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        waiters.wait_for_equal(
+            lambda: _v_index(client, index)["size"], live + self.NEW,
+            timeout=30)
+
+        reload()
+        assert _v_index(client, index)["size"] == live + self.NEW
+        for i in [*range(1, self.NUM_VECTORS + 1), *new]:
+            if i in self.DELETED:
+                continue
+            reply = _knn(client, index, [float(i), 0.0, 0.0, 0.0], 1)
             assert reply[0] == 1
             assert reply[1] == f"doc:{i}".encode()
 

@@ -12,10 +12,10 @@ option(SVS_C_API_PREBUILT
        "Link the prebuilt SVS C API (LVQ/LeanVec) instead of compiling third_party/svs" OFF)
 # TODO: switch to a versioned release once one ships svs-c-api-no-omp.
 set(SVS_C_API_URL
-    "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-c-api-no-omp-2026-11-10-pr468.tar.gz"
+    "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-c-api-no-omp-2026-11-17-pr468-470-477.tar.gz"
     CACHE STRING "Prebuilt SVS C API tarball: a release URL or a local path")
 set(SVS_C_API_URL_HASH
-    "SHA256=a2d3e448c3c3d18ab81ba80ed4cc8d37eee4874b57a3b5d29fc6f2ccbbec7bc1"
+    "SHA256=d41a70cf4047f730a6ab1a111f2bbe3de232fccefe117cd1efa18ea094219f25"
     CACHE STRING "Hash of SVS_C_API_URL; empty skips verification")
 # Every SVS C API function the module calls; keep in sync with src/indexes.
 set(SVS_C_API_REQUIRED_ENTRY_POINTS
@@ -30,7 +30,7 @@ set(SVS_C_API_REQUIRED_ENTRY_POINTS
     svs_index_dynamic_consolidate svs_index_dynamic_delete_points
     svs_index_dynamic_get_sync_kind svs_index_dynamic_has_id svs_index_free
     svs_index_get_memory_breakdown svs_index_get_memory_usage
-    svs_index_get_size svs_index_load_stream_dynamic svs_index_reconstruct
+    svs_index_get_size svs_index_load_stream_dynamic_ex svs_index_reconstruct
     svs_index_save_stream svs_index_search_topk svs_leanvec_training_data_build
     svs_leanvec_training_data_free svs_logger_create_custom svs_logger_free
     svs_logger_set_level svs_search_params_create_vamana svs_search_params_free

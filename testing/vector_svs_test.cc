@@ -86,7 +86,8 @@ class VectorSVSTestPeer {
   static absl::Mutex &ResizeMutex(VectorSVS<float> &index) {
     return index.resize_mutex_;
   }
-  static size_t DeletedSinceConsolidate(const VectorSVS<float> &index) {
+  template <typename T>
+  static size_t DeletedSinceConsolidate(const VectorSVS<T> &index) {
     return index.deleted_since_consolidate_.load();
   }
   template <typename T>
@@ -321,6 +322,12 @@ TEST_P(VectorSVSDeleteBeforeSaveTest, SaveAndLoadAfterDeletes) {
                                  SupplementalContentChunkIter(&rdb));
   ASSERT_TRUE(load_keys_status.ok()) << load_keys_status;
   EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), survivors);
+  // The prebuilt C API saves deleted slots as they are, so the loaded index
+  // still holds them; the source SVS pin's save consolidates them away. An
+  // index with no live entries saves no payload.
+  const size_t kept =
+      SvsCApiPrebuilt() && survivors > 0 ? GetParam().deleted.size() : 0;
+  EXPECT_EQ(VectorSVSTestPeer::DeletedSinceConsolidate(**loaded), kept);
 
   // Every survivor is still its own nearest neighbour after the reload.
   for (size_t i = 0; i < kNumVectors; ++i) {
@@ -332,10 +339,23 @@ TEST_P(VectorSVSDeleteBeforeSaveTest, SaveAndLoadAfterDeletes) {
     EXPECT_EQ((*search_result)[0].external_id, IndexToKey(i));
   }
 
-  // The loaded index still accepts writes.
+  // The loaded index still accepts writes, and the new key is found even
+  // when its id is one a kept deleted slot had.
   VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
       **loaded, IndexToKey(kNumVectors), VectorToStr(vectors[kNumVectors])));
   EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), survivors + 1);
+  auto all = (*loaded)->Search(VectorToStr(vectors[kNumVectors]),
+                               kNumVectors + 1, CancelNever());
+  ASSERT_TRUE(all.ok()) << all.status();
+  EXPECT_EQ(all->size(), survivors + 1);
+  ASSERT_FALSE(all->empty());
+  EXPECT_EQ((*all)[0].external_id, IndexToKey(kNumVectors));
+  for (const auto &neighbor : *all) {
+    for (size_t i : GetParam().deleted) {
+      EXPECT_NE(neighbor.external_id, IndexToKey(i))
+          << "a deleted key came back after the reload";
+    }
+  }
 
   for (auto *record : records) {
     ValkeyModule_FreeString(nullptr, record);
@@ -346,6 +366,7 @@ INSTANTIATE_TEST_SUITE_P(
     DeleteCases, VectorSVSDeleteBeforeSaveTest,
     testing::Values(DeleteCase{"AllDeleted", {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}},
                     DeleteCase{"FirstInsertedDeleted", {0}},
+                    DeleteCase{"LastInsertedDeleted", {9}},
                     DeleteCase{"AllButOneDeleted",
                                {0, 1, 2, 3, 4, 5, 6, 7, 8}}),
     [](const testing::TestParamInfo<DeleteCase> &info) {
@@ -489,10 +510,10 @@ TEST_F(VectorSVSTest, SaveAndLoadSvsWithRecallAndMultipleChunks) {
 //
 // LoadFromRDB hard-fails on four header/proto disagreements: format_version,
 // build_config, dimensionality, and element_type. (An svs_version mismatch
-// rebuilds from the keyspace instead; see RebuildsFromKeyspaceOnSvsVersion-
-// Mismatch.) Each case below builds one header that is otherwise valid
-// and corrupts exactly one field, so a case can only pass by tripping the
-// gate it names, not some earlier one.
+// rebuilds from the keyspace instead; see VectorSVSRebuildTest.) Each case
+// below builds one header that is otherwise valid and corrupts exactly one
+// field, so a case can only pass by tripping the gate it names, not some
+// earlier one.
 
 // Known-good value for a header that must pass the format_version gate so a
 // later gate in the same header can be exercised instead. Mirrors
@@ -934,6 +955,9 @@ TEST_F(VectorSVSTest, RestoredIndexMutationsMatchItsSyncKind) {
   VMSDK_EXPECT_OK(loaded);
   svs_index_h restored = VectorSVSTestPeer::Handle(**loaded);
   ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(SyncKindOf(restored),
+            SvsCApiPrebuilt() ? SVS_SYNC_KIND_FINE_GRAIN : SVS_SYNC_KIND_NONE)
+      << "the prebuilt C API's stream load takes the sync kind";
   EXPECT_EQ(VectorSVSTestPeer::MutationsExclusive(**loaded),
             SyncKindOf(restored) == SVS_SYNC_KIND_NONE)
       << "an index SVS does not guard must mutate under the exclusive lock";
@@ -1130,7 +1154,10 @@ void HoldSharedWhile(absl::Mutex &mu, const std::function<void()> &body)
   mu.ReaderUnlock();
 }
 
-TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
+// A restored index mutates under the shared lock when SVS guards it (the
+// prebuilt C API loads it as FINE_GRAIN), and under the exclusive one when it
+// doesn't (the source SVS pin loads it as SVS_SYNC_KIND_NONE).
+TEST_F(VectorSVSTest, RestoredIndexMutationLockMatchesItsBuild) {
   FakeSafeRDB rdb;
   auto proto =
       CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
@@ -1189,8 +1216,13 @@ TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
   };
   EXPECT_TRUE(add_while_shared_held(**built, 1, absl::Seconds(10)))
       << "a built index mutates under the shared lock";
-  EXPECT_FALSE(add_while_shared_held(**restored, 1, absl::Milliseconds(300)))
-      << "a restored index must wait for the exclusive lock";
+  if (SvsCApiPrebuilt()) {
+    EXPECT_TRUE(add_while_shared_held(**restored, 1, absl::Seconds(10)))
+        << "a FINE_GRAIN restored index mutates under the shared lock";
+  } else {
+    EXPECT_FALSE(add_while_shared_held(**restored, 1, absl::Milliseconds(300)))
+        << "a restored index must wait for the exclusive lock";
+  }
   EXPECT_EQ(AsBase(*restored)->GetLabelCount(), 2u);
   ValkeyModule_FreeString(nullptr, records[0]);
 }
@@ -1237,6 +1269,83 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
     VMSDK_EXPECT_OK(result);
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ((*result)[0].external_id, IndexToKey(i));
+  }
+}
+
+// Deleted slots a reload keeps count toward the next consolidation: with the
+// prebuilt build a few more deletes cross the trigger and consolidate the
+// loaded index, which then saves and loads again. The source SVS pin's save
+// already consolidated them, so the count starts over.
+TEST_F(VectorSVSTest, ReloadedDeletedSlotsTriggerConsolidation) {
+  constexpr size_t kKeys = 1100;
+  constexpr size_t kBeforeSave = 1000;  // below the 1024-slot trigger
+  constexpr size_t kAfterLoad = 40;     // crosses it on the prebuilt build
+  const auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 5.0);
+  std::vector<ValkeyModuleString *> records(kKeys);
+  absl::Cleanup free_records = [&records]() {
+    for (auto *record : records) ValkeyModule_FreeString(nullptr, record);
+  };
+  for (size_t i = 0; i < kKeys; ++i) {
+    records[i] = ValkeyModule_CreateString(
+        nullptr, (const char *)vectors[i].data(), kDimensions * sizeof(float));
+  }
+  auto save_and_load = [&](VectorSVS<float> &from) {
+    FakeSafeRDB rdb;
+    VMSDK_EXPECT_OK(from.SaveIndex(RDBChunkOutputStream(&rdb)));
+    VMSDK_EXPECT_OK(from.SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+    ExpectHashGetsForRecords(records);
+    auto loaded = VectorSVS<float>::LoadFromRDB(
+        &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+        SupplementalContentChunkIter(&rdb), 0);
+    EXPECT_TRUE(loaded.ok()) << loaded.status();
+    VMSDK_EXPECT_OK(
+        (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                   SupplementalContentChunkIter(&rdb)));
+    return *std::move(loaded);
+  };
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kBeforeSave; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), DeletionType::kRecord));
+  }
+  ASSERT_EQ(VectorSVSTestPeer::DeletedSinceConsolidate(**index), kBeforeSave);
+
+  auto loaded = save_and_load(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedSinceConsolidate(*loaded),
+            SvsCApiPrebuilt() ? kBeforeSave : 0);
+  for (size_t i = kBeforeSave; i < kBeforeSave + kAfterLoad; ++i) {
+    VMSDK_EXPECT_OK(loaded->RemoveRecord(IndexToKey(i), DeletionType::kRecord));
+  }
+  // The prebuilt build crossed the trigger and consolidated; the source build
+  // counts only the deletes since the load.
+  if (SvsCApiPrebuilt()) {
+    EXPECT_LT(VectorSVSTestPeer::DeletedSinceConsolidate(*loaded), kAfterLoad);
+  } else {
+    EXPECT_EQ(VectorSVSTestPeer::DeletedSinceConsolidate(*loaded), kAfterLoad);
+  }
+  const size_t live = kKeys - kBeforeSave - kAfterLoad;
+  EXPECT_EQ(AsBase(loaded)->GetLabelCount(), live);
+
+  auto again = save_and_load(*loaded);
+  EXPECT_EQ(AsBase(again)->GetLabelCount(), live);
+  auto all =
+      again->Search(VectorToStr(vectors[kKeys - 1]), kKeys, CancelNever());
+  ASSERT_TRUE(all.ok()) << all.status();
+  EXPECT_EQ(all->size(), live);
+  for (const auto &neighbor : *all) {
+    size_t i = 0;
+    ASSERT_TRUE(absl::SimpleAtoi(
+        absl::StripSuffix(neighbor.external_id->Str(), "_key"), &i));
+    EXPECT_GE(i, kBeforeSave + kAfterLoad) << "a deleted key came back";
   }
 }
 
@@ -1309,9 +1418,23 @@ TEST_F(VectorSVSTest, InitialCapSizesTheFirstReservation) {
 
 // -- SVS version mismatch on load --------------------------------------------
 
-// A payload written by another SVS version is skipped, and the index is
-// rebuilt from the vectors LoadTrackedKeys reads back from the keyspace.
-TEST_F(VectorSVSTest, RebuildsFromKeyspaceOnSvsVersionMismatch) {
+// A payload this build's SVS can't load is skipped, and the index is rebuilt
+// from the vectors LoadTrackedKeys reads back from the keyspace: one written
+// by another SVS version, or one that kept its slots when this build's SVS
+// can't read that (the source SVS pin reports the same version).
+struct RebuildCase {
+  const char *name;
+  void (*mark)(data_model::SVSIndexHeader &header);
+  bool skip_on_prebuilt;
+};
+
+class VectorSVSRebuildTest : public VectorSVSTest,
+                             public testing::WithParamInterface<RebuildCase> {};
+
+TEST_P(VectorSVSRebuildTest, RebuildsFromKeyspace) {
+  if (GetParam().skip_on_prebuilt && SvsCApiPrebuilt()) {
+    GTEST_SKIP() << "the prebuilt C API loads payloads that kept their slots";
+  }
   const size_t kNumVectors = 20;
   auto vectors =
       DeterministicallyGenerateVectors(kNumVectors, kDimensions, 5.0);
@@ -1331,15 +1454,16 @@ TEST_F(VectorSVSTest, RebuildsFromKeyspaceOnSvsVersionMismatch) {
                                                    VectorToStr(vectors[i])));
   }
 
-  // Header from another SVS version, then a payload this build must skip.
+  // A header this build can't load the payload for, then a payload it must
+  // skip.
   FakeSafeRDB rdb;
   data_model::SVSIndexHeader header = ValidHeaderFor(proto);
-  header.set_svs_version(header.svs_version() + 1);
+  GetParam().mark(header);
   header.set_has_index(true);
   {
     RDBChunkOutputStream out(&rdb);
     VMSDK_EXPECT_OK(out.SaveString(header.SerializeAsString()));
-    VMSDK_EXPECT_OK(out.SaveString("payload from another SVS version"));
+    VMSDK_EXPECT_OK(out.SaveString("payload this build can't load"));
     VMSDK_EXPECT_OK(out.Close());
   }
   VMSDK_EXPECT_OK((*index)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
@@ -1365,6 +1489,35 @@ TEST_F(VectorSVSTest, RebuildsFromKeyspaceOnSvsVersionMismatch) {
     ValkeyModule_FreeString(nullptr, record);
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    PayloadsSkipped, VectorSVSRebuildTest,
+    testing::Values(RebuildCase{"SvsVersionMismatch",
+                                [](data_model::SVSIndexHeader &h) {
+                                  h.set_svs_version(h.svs_version() + 1);
+                                },
+                                false},
+                    // 0xFFFFFFFF is kSvsVersionSlotsKept (vector_svs.cc):
+                    // a payload that kept its slots, with the real SVS
+                    // version beside it.
+                    RebuildCase{"SlotsKeptOnSourceBuild",
+                                [](data_model::SVSIndexHeader &h) {
+                                  h.set_slots_kept_svs_version(h.svs_version());
+                                  h.set_svs_version(0xFFFFFFFFu);
+                                  h.set_deleted_slots(3);
+                                },
+                                true},
+                    RebuildCase{"SlotsKeptBySvsVersionMismatch",
+                                [](data_model::SVSIndexHeader &h) {
+                                  h.set_slots_kept_svs_version(h.svs_version() +
+                                                               1);
+                                  h.set_svs_version(0xFFFFFFFFu);
+                                  h.set_deleted_slots(3);
+                                },
+                                false}),
+    [](const testing::TestParamInfo<RebuildCase> &info) {
+      return std::string(info.param.name);
+    });
 
 // -- SQ8 training threshold ---------------------------------------------------
 
@@ -1493,9 +1646,69 @@ TEST_P(VectorSVSSq8MetricTest, ConvertsAtTrainingThreshold) {
   }
 }
 
+// A converted index saved with deletes pending: the prebuilt C API keeps the
+// deleted slots and the reload counts them; the source SVS pin's save
+// consolidates them away. Either way a deleted key never comes back.
+TEST_P(VectorSVSSq8MetricTest, DeletedSlotsAcrossReload) {
+  constexpr uint32_t kThreshold = 10;
+  constexpr size_t kNumVectors = 2 * kThreshold;
+  const auto proto = Sq8Proto(kDimensions, GetParam(), kThreshold);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = RandomVectors(kNumVectors + 1, kDimensions);
+  std::vector<ValkeyModuleString *> records(kNumVectors);
+  absl::Cleanup free_records = [&records]() {
+    for (auto *record : records) ValkeyModule_FreeString(nullptr, record);
+  };
+  for (size_t i = 0; i < kNumVectors; ++i) {
+    records[i] = ValkeyModule_CreateString(
+        nullptr, (const char *)vectors[i].data(), kDimensions * sizeof(float));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  ASSERT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
+  const std::vector<size_t> deleted = {0, 3, kNumVectors - 1};
+  for (size_t i : deleted) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), DeletionType::kRecord));
+  }
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*index)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  VMSDK_EXPECT_OK(
+      (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                 SupplementalContentChunkIter(&rdb)));
+  EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**loaded));
+  EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kNumVectors - deleted.size());
+  EXPECT_EQ(VectorSVSTestPeer::DeletedSinceConsolidate(**loaded),
+            SvsCApiPrebuilt() ? deleted.size() : 0);
+  // The last key was deleted, so the next key gets its id: on the prebuilt
+  // build SVS still holds that id's deleted slot.
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
+      **loaded, IndexToKey(kNumVectors), VectorToStr(vectors[kNumVectors])));
+  auto added =
+      (*loaded)->Search(VectorToStr(vectors[kNumVectors]), 1, CancelNever());
+  ASSERT_TRUE(added.ok()) << added.status();
+  ASSERT_EQ(added->size(), 1u);
+  EXPECT_EQ((*added)[0].external_id, IndexToKey(kNumVectors));
+  auto all = (*loaded)->Search(VectorToStr(vectors[1]), kNumVectors + 1,
+                               CancelNever());
+  ASSERT_TRUE(all.ok()) << all.status();
+  EXPECT_EQ(all->size(), kNumVectors - deleted.size() + 1);
+  for (const auto &neighbor : *all) {
+    for (size_t i : deleted) EXPECT_NE(neighbor.external_id, IndexToKey(i));
+  }
+}
+
 // An index saved before its conversion saves and loads its uncompressed
 // payload, then converts once it reaches the threshold. The converted index
-// is self-synchronizing, so mutations stop being exclusive.
+// is self-synchronizing, so mutations are no longer exclusive (if they were).
 TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
   constexpr uint32_t kThreshold = 10;
   constexpr size_t kStaged = 5;
@@ -1525,7 +1738,9 @@ TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
                                  SupplementalContentChunkIter(&rdb)));
   EXPECT_NE(VectorSVSTestPeer::Handle(**loaded), nullptr);
   EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(**loaded));
-  EXPECT_TRUE(VectorSVSTestPeer::MutationsExclusive(**loaded));
+  // Only the prebuilt C API's stream load restores the index as FINE_GRAIN.
+  EXPECT_EQ(VectorSVSTestPeer::MutationsExclusive(**loaded),
+            !SvsCApiPrebuilt());
   EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kStaged);
   for (size_t i = 0; i < kStaged; ++i) {
     auto result = (*loaded)->Search(VectorToStr(vectors[i]), 1, CancelNever());
@@ -1636,7 +1851,8 @@ class VectorSVSLeanVecTest : public VectorSVSLvqLeanVecTest {
 
 // The add that reaches the threshold converts the index once, after which it
 // keeps accepting writes and agrees with FLAT on most of the top 10. A saved
-// and reloaded copy answers with the same keys and scores.
+// and reloaded copy keeps the deleted slots and answers with the same keys and
+// scores.
 template <typename T>
 void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
   constexpr size_t kNumVectors = 2 * kThreshold;
@@ -1716,6 +1932,15 @@ void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
   // the projection does is measured on real embeddings, not here.
   EXPECT_GE(agreed, 0.65 * kTopK * (queries.size() - kNumVectors));
 
+  // Deletes after the conversion: the prebuilt C API saves their slots as
+  // they are, and the reload counts them toward the next consolidation.
+  const std::vector<size_t> deleted = {0, kNumVectors - 1};
+  for (size_t i : deleted) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  const size_t live = kNumVectors - deleted.size();
+
   FakeSafeRDB rdb;
   VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
   VMSDK_EXPECT_OK((*index)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
@@ -1739,7 +1964,9 @@ void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
       (*loaded)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
                                  SupplementalContentChunkIter(&rdb)));
   EXPECT_FALSE(VectorSVSTestPeer::CompressionPending(**loaded));
-  EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kNumVectors);
+  EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), live);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedSinceConsolidate(**loaded),
+            deleted.size());
   EXPECT_EQ(stats.svs_conversions_cnt, done_before + 1);
   for (size_t q = kNumVectors; q < queries.size(); ++q) {
     const auto query = EncodeAs<T>(queries[q]);
@@ -1753,8 +1980,23 @@ void VectorSVSLvqLeanVecTest::ConvertsAtThresholdAndRoundTrips() {
           << "query " << q << " rank " << r;
       EXPECT_FLOAT_EQ((*after)[r].distance, (*before)[r].distance)
           << "query " << q << " rank " << r;
+      for (size_t i : deleted) {
+        EXPECT_NE((*after)[r].external_id, IndexToKey(i));
+      }
     }
   }
+  // The last key was deleted, so the next key gets its id, whose deleted slot
+  // SVS still holds. Lossy storage may rank a close neighbor first, so look in
+  // the top k.
+  const auto fresh = EncodeAs<T>(queries[kNumVectors]);
+  VMSDK_EXPECT_OK(
+      testing_infra::AddVectorRecord(**loaded, IndexToKey(kNumVectors), fresh));
+  EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), live + 1);
+  auto found = (*loaded)->Search(fresh, kTopK, CancelNever());
+  ASSERT_TRUE(found.ok()) << found.status();
+  EXPECT_TRUE(absl::c_any_of(*found, [](const auto &n) {
+    return n.external_id == IndexToKey(kNumVectors);
+  }));
 }
 
 // An index saved before its conversion loads uncompressed and converts once it
