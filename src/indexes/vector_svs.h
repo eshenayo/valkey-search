@@ -77,8 +77,30 @@ struct SVSBuildConfig {
 // Routes SVS's default logger to the Valkey log. Call once at module load.
 void InitSvsLogging();
 
+// Background SVS maintenance in flight, so shutdown can wait for it: the
+// writer pool allows its workers a short deadline to exit, and SVS can't
+// interrupt a consolidation, which can run longer than that.
+class SvsMaintenance {
+ public:
+  // Called at shutdown before the pools are joined. Tasks that haven't started
+  // are skipped; returns once the running ones finish.
+  static void Stop();
+  // Marks a task as running; false once stopped, and the task must not run.
+  static bool Begin();
+  static void End();
+  // True once Stop was called: a running task skips work that can wait.
+  static bool Stopped();
+
+ private:
+  friend class VectorSVSTestPeer;
+  ABSL_CONST_INIT static absl::Mutex mutex_;
+  static int running_ ABSL_GUARDED_BY(mutex_);
+  static bool stopped_ ABSL_GUARDED_BY(mutex_);
+};
+
 template <typename T>
-class VectorSVS : public VectorType<T> {
+class VectorSVS : public VectorType<T>,
+                  public std::enable_shared_from_this<VectorSVS<T>> {
  protected:
   // VectorType<T> is a dependent base, so inherited names are not found by
   // unqualified lookup. Re-declare the ones used below.
@@ -188,10 +210,22 @@ class VectorSVS : public VectorType<T> {
   // compression on every vector in the index. A failed conversion is logged,
   // counted, and retried on the next add.
   void MaybeConvert() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
-  // SVS reuses deleted slots only after consolidating and compacting. Does
-  // both once enough slots have been deleted, so update-heavy workloads stay
-  // bounded.
+  // Reclaims deleted slots once enough have been deleted, so update-heavy
+  // workloads stay bounded. A FINE_GRAIN index consolidates and compacts in a
+  // writer-pool task rather than in the deleting client's
+  // request; SVS consolidates alongside writers and searches but compacts
+  // exclusively. Any other index does both inline, exclusively.
   void MaybeConsolidate() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
+  void ConsolidateConcurrently()
+      ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_, consolidation_mutex_);
+  // FT.INFO's memory_bytes. SVS reports memory under its exclusive lock,
+  // which waits for every search and write in flight, and FT.INFO runs on the
+  // main thread. So this returns the last value and refreshes it in the
+  // background (inline without a utility pool).
+  size_t MemoryBytesForInfo() const;
+  // Skipped while resize_mutex_ is held exclusively (a conversion, a restored
+  // index's consolidation, a save) or a background consolidation runs.
+  void RefreshMemoryBytes() const ABSL_NO_THREAD_SAFETY_ANALYSIS;
 #endif
 
   // Concurrency: the index is built with SVS_SYNC_KIND_FINE_GRAIN and guards
@@ -214,6 +248,13 @@ class VectorSVS : public VectorType<T> {
   // awaiting MaybeConvert. Written under the writer side of resize_mutex_;
   // atomic so adds can check it without the lock.
   std::atomic<bool> compression_pending_{false};
+  // True while a FINE_GRAIN consolidation runs, so only one runs at a time.
+  std::atomic<bool> consolidating_{false};
+  // Held while SVS consolidates and compacts a FINE_GRAIN index in the
+  // background (acquired after resize_mutex_).
+  mutable absl::Mutex consolidation_mutex_ ABSL_ACQUIRED_AFTER(resize_mutex_);
+  mutable std::atomic<size_t> memory_bytes_{0};
+  mutable std::atomic<bool> memory_refresh_pending_{false};
   // Set by LoadFromRDB when the saved SVS payload was skipped; consumed by
   // OnTrackedKeysLoaded on the main thread before the index is published.
   bool rebuild_from_keyspace_{false};
@@ -226,13 +267,16 @@ class VectorSVS : public VectorType<T> {
   // this build may not know all their fields (e.g. ones only another build
   // defines), and its saves must pass them on unchanged.
   data_model::SVSVamanaAlgorithm unavailable_settings_;
-  // Slots deleted in SVS since the last consolidation (or save, which also
-  // consolidates).
-  mutable std::atomic<size_t> deleted_since_consolidate_{0};
   SVSBuildConfig build_config_;
   mutable absl::Mutex label_mutex_ ABSL_ACQUIRED_AFTER(resize_mutex_);
   mutable absl::node_hash_map<uint64_t, VectorRecord> label_to_record_
       ABSL_GUARDED_BY(label_mutex_);
+  // Ids deleted in SVS whose slots consolidation hasn't reclaimed yet, one
+  // entry per deleted slot. Its size triggers consolidation; consolidation
+  // and foreground saves (which consolidate) clear it. A delete racing a
+  // consolidation can leave an extra entry, so it may over-count, never
+  // under-count.
+  mutable std::vector<uint64_t> deleted_ids_ ABSL_GUARDED_BY(label_mutex_);
 
   friend class VectorSVSTestPeer;
 };
