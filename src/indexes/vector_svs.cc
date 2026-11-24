@@ -1399,8 +1399,11 @@ void VectorSVS<T>::MaybeConsolidate() {
     auto task = [weak = this->weak_from_this()] {
       if (auto self = weak.lock()) self->ConsolidateConcurrently();
     };
-    // The writer pool stays suspended while a fork child saves, so the
-    // consolidation can't dirty pages the child is copying. kHigh queues it
+    // The writer pool is suspended while a fork child saves, until the child
+    // exits or for at most max-worker-suspension-secs (not at all when 0), so
+    // a consolidation normally waits for the save. If the pool resumes first,
+    // the pass adds copy-on-write memory like any write; the child's snapshot
+    // is unaffected. kHigh queues it
     // behind the mutations already waiting: by default the pool runs kLow
     // tasks only when no kHigh task waits, so sustained writes would starve
     // it. Without a pool (unit tests) it runs here.
