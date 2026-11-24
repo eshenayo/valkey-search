@@ -937,11 +937,15 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
         err.get());
     if (!builder.ok()) return builder.status();
 
-    svs_index_h index = svs_index_load_stream_dynamic(
-        builder->get(), &iface, storage_config.blocksize_bytes, err.get());
+    // SVS doesn't save the sync kind, so pass the one new indexes use.
+    svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
+    params.blocksize_bytes = storage_config.blocksize_bytes;
+    params.sync_kind = kSvsSyncKind;
+    svs_index_h index = svs_index_load_stream_dynamic_ex(builder->get(), &iface,
+                                                         &params, err.get());
     if (index == nullptr) {
       if (!adapter.status().ok()) return adapter.status();
-      return SvsErrorToStatus(err.get(), "index_load_stream_dynamic");
+      return SvsErrorToStatus(err.get(), "index_load_stream_dynamic_ex");
     }
     // Hand the handle to instance before the check below, so ~VectorSVS owns
     // it on every path out of here and no path needs its own free.
@@ -952,9 +956,8 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
     // Nothing else can use the index before it is published, so query its
     // memory here; otherwise the first FT.INFO after a load would report 0.
     instance->RefreshMemoryBytes();
-    // The stream load has no parameter form at this pin, so the restored
-    // index reports SVS_SYNC_KIND_NONE and cannot guard concurrent writers;
-    // keep its mutations exclusive (serialized by resize_mutex_, as before).
+    // An index SVS doesn't guard (SVS_SYNC_KIND_NONE) keeps its mutations
+    // exclusive (serialized by resize_mutex_).
     svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE;
     if (!svs_index_dynamic_get_sync_kind(index, &sync_kind, err.get())) {
       return SvsErrorToStatus(err.get(), "index_dynamic_get_sync_kind");

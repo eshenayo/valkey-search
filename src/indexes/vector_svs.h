@@ -248,8 +248,8 @@ class VectorSVS : public VectorType<T>,
   // main thread. So this returns the last value and refreshes it in the
   // background (inline without a utility pool).
   size_t MemoryBytesForInfo() const;
-  // Skipped while resize_mutex_ is held exclusively (a conversion, a restored
-  // index's consolidation, a save) or a background consolidation runs.
+  // Skipped while resize_mutex_ is held exclusively (a conversion, an inline
+  // consolidation, a save) or a background consolidation runs.
   void RefreshMemoryBytes() const ABSL_NO_THREAD_SAFETY_ANALYSIS;
 #endif
 
@@ -263,11 +263,10 @@ class VectorSVS : public VectorType<T>,
   // gap inside modify is never observed.
   svs_index_h svs_index_ ABSL_GUARDED_BY(resize_mutex_){nullptr};
   // Mutations hold the reader side of resize_mutex_ when SVS guards the index
-  // itself (built with SVS_SYNC_KIND_FINE_GRAIN). An index restored from RDB
-  // comes back with SVS_SYNC_KIND_NONE at the pinned revision (the stream load
-  // takes no parameters), so its mutations take the writer side instead and
-  // stay serialized, as before. Set once in LoadFromRDB before the instance is
-  // published; read on every mutation.
+  // itself (SVS_SYNC_KIND_FINE_GRAIN, for built and restored indexes alike).
+  // An index SVS reports as SVS_SYNC_KIND_NONE takes the writer side instead,
+  // so its mutations stay serialized. Set once in LoadFromRDB before the
+  // instance is published; read on every mutation.
   std::atomic<bool> mutations_exclusive_{false};
   // True while svs_index_ (or the index the next add builds) is uncompressed,
   // awaiting MaybeConvert. Written under the writer side of resize_mutex_;

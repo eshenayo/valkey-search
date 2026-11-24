@@ -920,8 +920,8 @@ svs_sync_kind_t SyncKindOf(svs_index_h handle) {
 }
 
 // A built index guards itself (FINE_GRAIN) and mutates under the shared
-// lock. A restored one reports whatever the stream load gave it; the module
-// keeps its mutations exclusive exactly when that is SVS_SYNC_KIND_NONE.
+// lock; a restored one loads as FINE_GRAIN too. The module keeps mutations
+// exclusive exactly when SVS reports SVS_SYNC_KIND_NONE.
 TEST_F(VectorSVSTest, RestoredIndexMutationsMatchItsSyncKind) {
   FakeSafeRDB rdb;
   auto proto =
@@ -945,9 +945,8 @@ TEST_F(VectorSVSTest, RestoredIndexMutationsMatchItsSyncKind) {
   VMSDK_EXPECT_OK(loaded);
   svs_index_h restored = VectorSVSTestPeer::Handle(**loaded);
   ASSERT_NE(restored, nullptr);
-  EXPECT_EQ(VectorSVSTestPeer::MutationsExclusive(**loaded),
-            SyncKindOf(restored) == SVS_SYNC_KIND_NONE)
-      << "an index SVS does not guard must mutate under the exclusive lock";
+  EXPECT_EQ(SyncKindOf(restored), SVS_SYNC_KIND_FINE_GRAIN);
+  EXPECT_FALSE(VectorSVSTestPeer::MutationsExclusive(**loaded));
 }
 
 // -- Concurrent writers on a loaded index (as #19 does on a built one) -------
@@ -1344,7 +1343,7 @@ TEST_F(VectorSVSTest, LoadedIndexReportsMemoryBytesAtOnce) {
   VMSDK_EXPECT_OK(pool->ResumeWorkers());
 }
 
-TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
+TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheSharedLock) {
   FakeSafeRDB rdb;
   auto proto =
       CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
@@ -1403,8 +1402,8 @@ TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
   };
   EXPECT_TRUE(add_while_shared_held(**built, 1, absl::Seconds(10)))
       << "a built index mutates under the shared lock";
-  EXPECT_FALSE(add_while_shared_held(**restored, 1, absl::Milliseconds(300)))
-      << "a restored index must wait for the exclusive lock";
+  EXPECT_TRUE(add_while_shared_held(**restored, 1, absl::Seconds(10)))
+      << "a restored index mutates under the shared lock too";
   EXPECT_EQ(AsBase(*restored)->GetLabelCount(), 2u);
   ValkeyModule_FreeString(nullptr, records[0]);
 }
@@ -1493,9 +1492,9 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
 }
 
-// A restored index isn't FINE_GRAIN, so it consolidates inline under the
-// exclusive lock; that also empties the deleted-id list.
-TEST_F(VectorSVSTest, RestoredIndexConsolidatesInline) {
+// A restored index is FINE_GRAIN, so it consolidates in the background like
+// a built one; that also empties the deleted-id list.
+TEST_F(VectorSVSTest, RestoredIndexConsolidatesInTheBackground) {
   const size_t kKeys = 1100;  // past the 1024-slot trigger
   FakeSafeRDB rdb;
   auto proto =
@@ -1522,17 +1521,18 @@ TEST_F(VectorSVSTest, RestoredIndexConsolidatesInline) {
   VMSDK_EXPECT_OK(
       (*restored)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
                                    SupplementalContentChunkIter(&rdb)));
-  ASSERT_TRUE(VectorSVSTestPeer::MutationsExclusive(**restored));
+  ASSERT_FALSE(VectorSVSTestPeer::MutationsExclusive(**restored));
 
-  size_t max_deleted = 0;
-  for (size_t i = 0; i < kKeys; ++i) {
+  // Deleting 1100 of 1100 leaves the trigger's consolidation with no live
+  // entries, so it keeps the ids; stop short of that.
+  const size_t kDeletes = 1050;
+  for (size_t i = 0; i < kDeletes; ++i) {
     VMSDK_EXPECT_OK((*restored)->RemoveRecord(IndexToKey(i),
                                               indexes::DeletionType::kRecord));
-    max_deleted =
-        std::max(max_deleted, VectorSVSTestPeer::DeletedIdCount(**restored));
   }
-  EXPECT_EQ(max_deleted, 1023u) << "the trigger fires at 1024 deletes";
-  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**restored), kKeys - 1024);
+  VectorSVSTestPeer::WaitForConsolidation(**restored);
+  EXPECT_LT(VectorSVSTestPeer::DeletedIdCount(**restored), 1024u)
+      << "the 1024-delete trigger consolidated";
   for (auto *r : records) ValkeyModule_FreeString(nullptr, r);
 }
 
@@ -1882,8 +1882,9 @@ TEST_P(VectorSVSSq8MetricTest, ConvertsAtTrainingThreshold) {
 }
 
 // An index saved before its conversion saves and loads its uncompressed
-// payload, then converts once it reaches the threshold. The converted index
-// is self-synchronizing, so mutations stop being exclusive.
+// payload, then converts once it reaches the threshold. Both the loaded and
+// the converted index are self-synchronizing, so mutations are never
+// exclusive.
 TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
   constexpr uint32_t kThreshold = 10;
   constexpr size_t kStaged = 5;
@@ -1913,7 +1914,7 @@ TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
                                  SupplementalContentChunkIter(&rdb)));
   EXPECT_NE(VectorSVSTestPeer::Handle(**loaded), nullptr);
   EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(**loaded));
-  EXPECT_TRUE(VectorSVSTestPeer::MutationsExclusive(**loaded));
+  EXPECT_FALSE(VectorSVSTestPeer::MutationsExclusive(**loaded));
   EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kStaged);
   for (size_t i = 0; i < kStaged; ++i) {
     auto result = (*loaded)->Search(VectorToStr(vectors[i]), 1, CancelNever());
