@@ -123,7 +123,10 @@ bool SvsThreadpoolParallelFor(void* /*self*/,
     return true;
   }
   // Helpers start at width 1, and the caller drops to 1 for the call, so any
-  // nested parallel_for stays sequential.
+  // nested parallel_for stays sequential. SVS's func catches its own
+  // exceptions (it records them for SVS to rethrow), so only starting a
+  // helper can throw; the caller then runs with the helpers it has, and the
+  // helpers are joined and the width restored on every exit.
   std::atomic<size_t> next{0};
   auto run = [&] {
     for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;) {
@@ -131,13 +134,21 @@ bool SvsThreadpoolParallelFor(void* /*self*/,
     }
   };
   std::vector<std::thread> helpers;
-  helpers.reserve(threads - 1);
-  for (size_t t = 1; t < threads; ++t) helpers.emplace_back(run);
   const size_t width = svs_threads;
+  absl::Cleanup restore = [&] {
+    for (auto& helper : helpers) helper.join();
+    svs_threads = width;
+  };
+  try {
+    helpers.reserve(threads - 1);
+    for (size_t t = 1; t < threads; ++t) helpers.emplace_back(run);
+  } catch (const std::exception& e) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 60)
+        << "SVS maintenance: started " << helpers.size() + 1 << " of "
+        << threads << " threads: " << e.what();
+  }
   svs_threads = 1;
   run();
-  svs_threads = width;
-  for (auto& helper : helpers) helper.join();
   return true;
 }
 
