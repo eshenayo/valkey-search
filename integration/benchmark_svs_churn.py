@@ -127,6 +127,32 @@ def wait_settled(client, size: int, timeout: float) -> float:
         time.sleep(0.05)
 
 
+def settled_memory(client, timeout: float) -> int:
+    """memory_bytes once no maintenance pass is due and a refresh has landed.
+
+    FT.INFO returns the last background refresh of memory_bytes and requests
+    another, and the refresh is skipped while maintenance runs. So first wait
+    until deleted_slots is below the trigger (a quarter of the live vectors,
+    at least 1024, as in vector_svs.cc), which a running pass keeps it above
+    until its compaction ends (if the live count hasn't grown since it
+    started), then until two reads in a row agree.
+    """
+    start = time.perf_counter()
+    while True:
+        index = index_info(client).attributes[0]["index"]
+        due = index["algorithm"].get("deleted_slots", 0) >= max(
+            1024, index["size"] // 4)
+        if not due:
+            first = index["algorithm"]["memory_bytes"]
+            time.sleep(0.2)
+            second = algorithm(client)["memory_bytes"]
+            if first == second and first > 0:
+                return second
+        if time.perf_counter() - start > timeout:
+            raise TimeoutError("memory_bytes did not settle")
+        time.sleep(0.2)
+
+
 def latency_summary(latencies_ms: List[float]) -> Dict[str, float]:
     if not latencies_ms:
         return {}
@@ -352,7 +378,7 @@ def run_benchmark(args, seed: int) -> Dict:
             "vectors": num_vectors, "send_sec": sent,
             "indexed_sec": sent + caught_up,
             "vectors_per_sec": num_vectors / (sent + caught_up),
-            "memory_bytes": algorithm(client)["memory_bytes"]}
+            "memory_bytes": settled_memory(client, args.timeout)}
         print(f"ingest: {results['ingest']}")
 
         queries = [q.tobytes() for q in data.queries(1000)]
@@ -428,6 +454,9 @@ def run_benchmark(args, seed: int) -> Dict:
                 stop.set()
             search_during = readers.result()
         total_ops = sum(op["ops"] for ops in writes for op in ops)
+        # The per-round memory_bytes are the last background refresh, which
+        # can predate a running pass; compare settled readings instead.
+        memory_after_churn = settled_memory(client, args.timeout)
 
         def p99_max(kind):
             return max(op["latency_ms"]["p99"] for op in
@@ -450,8 +479,9 @@ def run_benchmark(args, seed: int) -> Dict:
             "delete_latency_ms_p99_max": p99_max(0),
             "insert_latency_ms_p99_max": p99_max(1),
             "update_latency_ms_p99_max": p99_max(2),
+            "memory_bytes_after": memory_after_churn,
             "memory_bytes_growth":
-                rounds[-1]["memory_bytes"] - results["ingest"]["memory_bytes"],
+                memory_after_churn - results["ingest"]["memory_bytes"],
             "search_during_churn": search_during,
             "recall_after": recall(client, data, args.recall_queries, args.k,
                                    args.ef_runtime)}
@@ -468,8 +498,8 @@ def run_benchmark(args, seed: int) -> Dict:
             lambda: client.execute_command("DEBUG", "RELOAD"))
         persistence["settled_after_reload_sec"] = wait_settled(
             client, len(data.live), args.timeout)
-        persistence["memory_bytes_after_reload"] = \
-            algorithm(client)["memory_bytes"]
+        persistence["memory_bytes_after_reload"] = settled_memory(
+            client, args.timeout)
         results["persistence"] = persistence
         print(f"persistence: {persistence}")
         return results
