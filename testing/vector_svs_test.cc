@@ -1998,6 +1998,64 @@ TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
   }
 }
 
+// Records the widest SVS parallel_for, then forwards to the module's.
+std::atomic<size_t> widest_parallel_for{0};
+bool (*module_parallel_for)(void *, void (*)(void *, size_t), void *, size_t,
+                            svs_error_h) = nullptr;
+bool RecordingParallelFor(void *self, void (*func)(void *, size_t), void *param,
+                          size_t n, svs_error_h err) {
+  const size_t width = std::min(kSvsThreadpoolOps.size(nullptr), n);
+  size_t seen = widest_parallel_for.load();
+  while (width > seen &&
+         !widest_parallel_for.compare_exchange_weak(seen, width)) {
+  }
+  return module_parallel_for(self, func, param, n, err);
+}
+
+// The SQ8 conversion blocks the index, so it compresses on the maintenance
+// threads, scaled to the index size like a compaction; every vector stays
+// its own nearest afterwards.
+TEST_F(VectorSVSTest, Sq8ConversionRunsOnMaintenanceThreads) {
+#ifdef SAN_BUILD
+  // Two threads need 16384 vectors, about a minute of adds under TSAN, which
+  // would push this binary past the sanitizer suite's timeout. The parallel
+  // helpers are covered there by the threadpool test.
+  GTEST_SKIP() << "too slow under sanitizers";
+#endif
+  constexpr uint32_t kThreshold = 20000;  // two threads' worth (8192 each)
+  auto &budget = options::GetSvsMaintenanceThreads();
+  VMSDK_EXPECT_OK(budget.SetValue(4));
+  module_parallel_for = kSvsThreadpoolOps.parallel_for;
+  widest_parallel_for = 0;
+  auto index = VectorSVS<float>::Create(
+      Sq8Proto(kDimensions, data_model::DISTANCE_METRIC_L2, kThreshold),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = RandomVectors(kThreshold, kDimensions);
+  for (size_t i = 0; i + 1 < kThreshold; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  ASSERT_TRUE(VectorSVSTestPeer::CompressionPending(**index));
+  // The conversion assembles a new builder, which copies the ops table.
+  kSvsThreadpoolOps.parallel_for = RecordingParallelFor;
+  absl::Cleanup restore = [&] {
+    kSvsThreadpoolOps.parallel_for = module_parallel_for;
+    VMSDK_EXPECT_OK(budget.SetValue(0));
+  };
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
+      **index, IndexToKey(kThreshold - 1), VectorToStr(vectors.back())));
+  ASSERT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
+  EXPECT_EQ(widest_parallel_for.load(), 2u)
+      << "20000 vectors convert on two of the four maintenance threads";
+  for (size_t i = 0; i < kThreshold; i += 997) {
+    auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever());
+    VMSDK_EXPECT_OK(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ((*result)[0].external_id, IndexToKey(i)) << "key " << i;
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Metrics, VectorSVSSq8MetricTest,
     testing::Values(data_model::DISTANCE_METRIC_L2,

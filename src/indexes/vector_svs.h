@@ -52,9 +52,10 @@ namespace valkey_search::indexes {
 extern svs_threadpool_interface_ops kSvsThreadpoolOps;
 extern svs_threadpool_interface kSvsThreadpoolIface;
 
-// Threads for one consolidation or compaction, from a server-wide budget of
-// svs-maintenance-threads (the writer-thread count when 0), so indexes
-// maintained at the same time split it instead of oversubscribing the host.
+// Threads for one consolidation, compaction or SQ8 conversion, from a
+// server-wide budget of svs-maintenance-threads (the writer-thread count when
+// 0), so indexes maintained at the same time split it instead of
+// oversubscribing the host.
 // Never waits: grants what is free, and at least the calling thread. For its
 // lifetime, SVS's parallel_for on this thread spreads over width() threads.
 class SvsMaintenanceThreads {

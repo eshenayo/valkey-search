@@ -135,7 +135,7 @@ static auto writer_threads_count =
         .Build();
 
 /// Register the "--svs-maintenance-threads" flag: how many threads SVS_VAMANA
-/// background maintenance (consolidation and compaction) may use at once,
+/// maintenance (consolidation, compaction, SQ8 conversion) may use at once,
 /// across all indexes. 0 follows --writer-threads; 1 runs it single-threaded.
 constexpr absl::string_view kSvsMaintenanceThreadsConfig{
     "svs-maintenance-threads"};

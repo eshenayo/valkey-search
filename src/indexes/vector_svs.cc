@@ -1589,6 +1589,9 @@ void VectorSVS<T>::MaybeConvert() {
     svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
     params.blocksize_bytes = build_config_.blocksize_bytes;
     params.sync_kind = kSvsSyncKind;
+    // The conversion blocks the index, so, like a compaction, it compresses
+    // the vectors on the maintenance threads.
+    SvsMaintenanceThreads threads(SvsMaintenanceThreads::Limit(svs_index_));
     converted = svs_index_convert_dynamic_ex(builder->get(), svs_index_,
                                              &params, err.get());
   }
