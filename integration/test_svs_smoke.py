@@ -237,6 +237,22 @@ class TestSVSVamanaSmoke(ValkeySearchTestCaseBase):
         client.hset("doc:3", mapping={"v": _fp32([99.0, 99.0, 99.0, 99.0])})
         assert _v_index(client, "svs_idx")["size"] == 5
 
+    def test_ft_info_reports_deleted_slots(self):
+        """FT.INFO deleted_slots counts deleted vectors whose slots SVS
+        still holds; a SAVE consolidates them away."""
+        client: Valkey = self.server.get_new_client()
+        self._create_default_index(client)
+
+        def deleted_slots():
+            return _v_index(client, "svs_idx")["algorithm"]["deleted_slots"]
+
+        assert deleted_slots() == 0
+        self._populate(client, 5)
+        client.delete("doc:2", "doc:5")
+        assert deleted_slots() == 2
+        client.execute_command("SAVE")
+        assert deleted_slots() == 0
+
     def test_knn_returns_correct_neighbors_and_distances(self):
         """L2 distances are exact for a small deterministic axis-aligned set."""
         client: Valkey = self.server.get_new_client()
@@ -868,17 +884,22 @@ class TestSVSVamanaDebugMode(ValkeySearchTestCaseDebugMode):
         )
         assert _v_index(client, index)["algorithm"]["memory_bytes"] == 0
 
+        def memory_bytes():
+            return _v_index(client, index)["algorithm"]["memory_bytes"]
+
         def add(start, n):
             for i in range(start, start + n):
                 client.hset(f"{prefix}{i}",
                             mapping={"v": _fp32([float(i + 1), 1.0, 0.0, 0.0])})
             waiters.wait_for_equal(
                 lambda: _v_index(client, index)["size"], start + n, timeout=30)
-            return _v_index(client, index)["algorithm"]["memory_bytes"]
 
-        small = add(0, 10)
-        assert small > 0
-        assert add(10, 1000) > small
+        # FT.INFO refreshes memory_bytes in the background, so poll it.
+        add(0, 10)
+        waiters.wait_for_true(lambda: memory_bytes() > 0, timeout=30)
+        small = memory_bytes()
+        add(10, 1000)
+        waiters.wait_for_true(lambda: memory_bytes() > small, timeout=30)
 
     def test_info_counts_svs_vector_field(self):
         """An SVS_VAMANA field is counted in number_of_vector_attributes and

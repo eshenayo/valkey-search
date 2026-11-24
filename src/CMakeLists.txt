@@ -294,6 +294,7 @@ target_link_libraries(server_events PUBLIC schema_manager)
 target_link_libraries(server_events PUBLIC valkey_search)
 target_link_libraries(server_events PUBLIC metadata_manager)
 target_link_libraries(server_events PUBLIC valkey_module)
+target_link_libraries(server_events PUBLIC vector_svs)
 
 set(SRCS_vector_registry ${CMAKE_CURRENT_LIST_DIR}/vector_registry.cc
                                ${CMAKE_CURRENT_LIST_DIR}/vector_registry.h)

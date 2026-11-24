@@ -134,6 +134,18 @@ static auto writer_threads_count =
             })
         .Build();
 
+/// Register the "--svs-maintenance-threads" flag: how many threads SVS_VAMANA
+/// maintenance (consolidation, compaction, SQ8 conversion) may use at once,
+/// across all indexes. 0 follows --writer-threads; 1 runs it single-threaded.
+constexpr absl::string_view kSvsMaintenanceThreadsConfig{
+    "svs-maintenance-threads"};
+static auto svs_maintenance_threads =
+    config::NumberBuilder(kSvsMaintenanceThreadsConfig,  // name
+                          0,                             // default
+                          0,                             // min
+                          kMaxThreadsCount)              // max
+        .Build();
+
 /// Register the "--utility-threads" flag. Controls the utility thread pool
 constexpr absl::string_view kUtilityThreadsConfig{"utility-threads"};
 static auto utility_threads_count =
@@ -636,6 +648,10 @@ vmsdk::config::Number &GetReaderThreadCount() {
 
 vmsdk::config::Number &GetWriterThreadCount() {
   return dynamic_cast<vmsdk::config::Number &>(*writer_threads_count);
+}
+
+vmsdk::config::Number &GetSvsMaintenanceThreads() {
+  return dynamic_cast<vmsdk::config::Number &>(*svs_maintenance_threads);
 }
 
 vmsdk::config::Number &GetUtilityThreadCount() {

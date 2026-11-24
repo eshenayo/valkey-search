@@ -79,8 +79,39 @@ class VectorSVSTestPeer {
   static absl::Mutex &ResizeMutex(VectorSVS<float> &index) {
     return index.resize_mutex_;
   }
-  static size_t DeletedSinceConsolidate(const VectorSVS<float> &index) {
-    return index.deleted_since_consolidate_.load();
+  static void ConsolidateConcurrently(VectorSVS<float> &index) {
+    index.ConsolidateConcurrently();
+  }
+  // Waits for a background consolidation the writer pool is running.
+  static void WaitForConsolidation(const VectorSVS<float> &index) {
+    const absl::Time deadline = absl::Now() + absl::Seconds(30);
+    while (index.consolidating_.load() && absl::Now() < deadline) {
+      absl::SleepFor(absl::Milliseconds(1));
+    }
+    EXPECT_FALSE(index.consolidating_.load()) << "consolidation still running";
+  }
+  static int RunningMaintenance() ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    absl::MutexLock lock(&SvsMaintenance::mutex_);
+    return SvsMaintenance::running_;
+  }
+  static void ResumeMaintenance() ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    absl::MutexLock lock(&SvsMaintenance::mutex_);
+    SvsMaintenance::stopped_ = false;
+  }
+  static size_t MemoryBytesForInfo(const VectorSVS<float> &index) {
+    return index.MemoryBytesForInfo();
+  }
+  static absl::Mutex &ConsolidationMutex(VectorSVS<float> &index) {
+    return index.consolidation_mutex_;
+  }
+  // As if a background consolidation were scheduled.
+  static void SetConsolidating(VectorSVS<float> &index, bool consolidating) {
+    index.consolidating_.store(consolidating);
+  }
+  static size_t DeletedIdCount(const VectorSVS<float> &index)
+      ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    absl::ReaderMutexLock lock(&index.label_mutex_);
+    return index.deleted_ids_.size();
   }
   static bool CompressionPending(const VectorSVS<float> &index) {
     return index.compression_pending_.load();
@@ -893,8 +924,8 @@ svs_sync_kind_t SyncKindOf(svs_index_h handle) {
 }
 
 // A built index guards itself (FINE_GRAIN) and mutates under the shared
-// lock. A restored one reports whatever the stream load gave it; the module
-// keeps its mutations exclusive exactly when that is SVS_SYNC_KIND_NONE.
+// lock; a restored one loads as FINE_GRAIN too. The module keeps mutations
+// exclusive exactly when SVS reports SVS_SYNC_KIND_NONE.
 TEST_F(VectorSVSTest, RestoredIndexMutationsMatchItsSyncKind) {
   FakeSafeRDB rdb;
   auto proto =
@@ -918,9 +949,8 @@ TEST_F(VectorSVSTest, RestoredIndexMutationsMatchItsSyncKind) {
   VMSDK_EXPECT_OK(loaded);
   svs_index_h restored = VectorSVSTestPeer::Handle(**loaded);
   ASSERT_NE(restored, nullptr);
-  EXPECT_EQ(VectorSVSTestPeer::MutationsExclusive(**loaded),
-            SyncKindOf(restored) == SVS_SYNC_KIND_NONE)
-      << "an index SVS does not guard must mutate under the exclusive lock";
+  EXPECT_EQ(SyncKindOf(restored), SVS_SYNC_KIND_FINE_GRAIN);
+  EXPECT_FALSE(VectorSVSTestPeer::MutationsExclusive(**loaded));
 }
 
 // -- Concurrent writers on a loaded index (as #19 does on a built one) -------
@@ -1114,7 +1144,258 @@ void HoldSharedWhile(absl::Mutex &mu, const std::function<void()> &body)
   mu.ReaderUnlock();
 }
 
-TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
+// A FINE_GRAIN index consolidates under the shared lock, alongside writers
+// and searches, and reclaims the deleted slots.
+TEST_F(VectorSVSTest, ConsolidationRunsUnderTheSharedLock) {
+  const size_t kKeys = 20;
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kKeys / 2; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  ASSERT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kKeys / 2);
+
+  absl::Notification done;
+  std::thread consolidator;
+  bool finished_while_held = false;
+  // Started while the shared lock is held, so finishing proves it doesn't
+  // need the exclusive one.
+  HoldSharedWhile(VectorSVSTestPeer::ResizeMutex(**index), [&] {
+    consolidator = std::thread([&] {
+      VectorSVSTestPeer::ConsolidateConcurrently(**index);
+      done.Notify();
+    });
+    finished_while_held =
+        done.WaitForNotificationWithTimeout(absl::Seconds(10));
+  });
+  consolidator.join();
+  EXPECT_TRUE(finished_while_held)
+      << "consolidation waited for the exclusive lock";
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+  for (size_t i = kKeys / 2; i < kKeys; ++i) {
+    auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever());
+    VMSDK_EXPECT_OK(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ((*result)[0].external_id, IndexToKey(i));
+  }
+}
+
+// Runs `body` while another thread holds `mu` (exclusively, or shared when
+// `shared`).
+void WhileHeldElsewhere(absl::Mutex &mu, bool shared,
+                        const std::function<void()> &body)
+    ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  absl::Notification held, release;
+  std::thread holder([&]() ABSL_NO_THREAD_SAFETY_ANALYSIS {
+    shared ? mu.ReaderLock() : mu.Lock();
+    held.Notify();
+    release.WaitForNotification();
+    shared ? mu.ReaderUnlock() : mu.Unlock();
+  });
+  held.WaitForNotification();
+  body();
+  release.Notify();
+  holder.join();
+}
+
+// Shutdown waits for a running background consolidation, which SVS can't
+// interrupt, and skips any that hasn't started. The running pass skips its
+// compaction, so its slots stay counted until a later pass compacts them.
+TEST_F(VectorSVSTest, StoppingMaintenanceWaitsForRunningAndSkipsQueued) {
+  const size_t kKeys = 20;
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kKeys / 2; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  absl::Cleanup resume = [] { VectorSVSTestPeer::ResumeMaintenance(); };
+  absl::Notification stopped;
+  std::thread consolidator, stopper;
+  // Holding resize_mutex_ keeps the consolidation running (blocked) until the
+  // stop is underway.
+  WhileHeldElsewhere(
+      VectorSVSTestPeer::ResizeMutex(**index), /*shared=*/false, [&] {
+        consolidator = std::thread(
+            [&] { VectorSVSTestPeer::ConsolidateConcurrently(**index); });
+        while (VectorSVSTestPeer::RunningMaintenance() == 0) {
+          absl::SleepFor(absl::Milliseconds(1));
+        }
+        stopper = std::thread([&] {
+          SvsMaintenance::Stop();
+          stopped.Notify();
+        });
+        EXPECT_FALSE(
+            stopped.WaitForNotificationWithTimeout(absl::Milliseconds(200)))
+            << "Stop returned while a consolidation was running";
+      });
+  consolidator.join();
+  stopper.join();
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kKeys / 2)
+      << "compaction was skipped, so the slots aren't reusable yet";
+
+  VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(kKeys - 1),
+                                         indexes::DeletionType::kRecord));
+  VectorSVSTestPeer::ConsolidateConcurrently(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kKeys / 2 + 1)
+      << "a pass that starts after the stop is skipped";
+  VectorSVSTestPeer::ResumeMaintenance();
+  VectorSVSTestPeer::ConsolidateConcurrently(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+}
+
+// Deletes that arrive while a pass runs can't schedule another; once the pass
+// succeeds it rechecks them, so they're reclaimed without waiting for the next
+// delete.
+TEST_F(VectorSVSTest, PassRechecksDeletesThatArrivedDuringIt) {
+  const size_t kKeys = 4000;
+  const size_t kDeletes = 1100;  // past the 1024-slot trigger, twice
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  // A pass is "scheduled", so these deletes don't start one.
+  VectorSVSTestPeer::SetConsolidating(**index, true);
+  for (size_t i = 0; i < kDeletes; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  std::thread pass;
+  // Holding consolidation_mutex_ stops the pass after it has counted the
+  // first deletes, while it still lets writers in.
+  WhileHeldElsewhere(
+      VectorSVSTestPeer::ConsolidationMutex(**index), /*shared=*/false, [&] {
+        pass = std::thread(
+            [&] { VectorSVSTestPeer::ConsolidateConcurrently(**index); });
+        while (VectorSVSTestPeer::RunningMaintenance() == 0) {
+          absl::SleepFor(absl::Milliseconds(1));
+        }
+        absl::SleepFor(absl::Milliseconds(100));
+        for (size_t i = kDeletes; i < 2 * kDeletes; ++i) {
+          VMSDK_EXPECT_OK((*index)->RemoveRecord(
+              IndexToKey(i), indexes::DeletionType::kRecord));
+        }
+        EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 2 * kDeletes);
+      });
+  pass.join();
+  VectorSVSTestPeer::WaitForConsolidation(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u)
+      << "the deletes made during the pass were not rechecked";
+}
+
+// FT.INFO's memory_bytes never waits behind a consolidation or conversion
+// (which holds resize_mutex_ exclusively on a restored index): the refresh,
+// inline here without a utility pool, is skipped and the last value stays,
+// then catches up once the index is free.
+TEST_F(VectorSVSTest, InfoMemoryBytesDoesNotWaitForConsolidation) {
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  proto.set_initial_cap(16);  // small blocks, so adds grow memory
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index), 0u);
+  const size_t kKeys = 2000;
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  const size_t small = VectorSVSTestPeer::MemoryBytesForInfo(**index);
+  ASSERT_GT(small, 0u);
+  for (size_t i = 1; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  WhileHeldElsewhere(VectorSVSTestPeer::ConsolidationMutex(**index),
+                     /*shared=*/false, [&] {
+                       EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index),
+                                 small);
+                     });
+  WhileHeldElsewhere(
+      VectorSVSTestPeer::ResizeMutex(**index), /*shared=*/false, [&] {
+        EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index), small);
+      });
+  EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**index), small);
+}
+
+// With a utility pool, FT.INFO's memory_bytes never queries SVS on the
+// calling (main) thread, where SVS's exclusive lock would wait for in-flight
+// searches and writes: it returns the last value and the pool refreshes it.
+TEST_F(VectorSVSTest, InfoMemoryBytesRefreshesOnTheUtilityPool) {
+  InitThreadPools(/*readers=*/std::nullopt, /*writers=*/std::nullopt,
+                  /*utility=*/1);
+  vmsdk::ThreadPool *pool = ValkeySearch::Instance().GetUtilityThreadPool();
+  ASSERT_NE(pool, nullptr);
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(1, kDimensions, 2.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  VMSDK_EXPECT_OK(pool->SuspendWorkers());
+  EXPECT_EQ(VectorSVSTestPeer::MemoryBytesForInfo(**index), 0u);
+  VMSDK_EXPECT_OK(pool->ResumeWorkers());
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while (VectorSVSTestPeer::MemoryBytesForInfo(**index) == 0 &&
+         absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**index), 0u);
+}
+
+// A loaded index reports its memory on the first FT.INFO: the load queries
+// it, so it doesn't wait for a background refresh.
+TEST_F(VectorSVSTest, LoadedIndexReportsMemoryBytesAtOnce) {
+  InitThreadPools(/*readers=*/std::nullopt, /*writers=*/std::nullopt,
+                  /*utility=*/1);
+  vmsdk::ThreadPool *pool = ValkeySearch::Instance().GetUtilityThreadPool();
+  ASSERT_NE(pool, nullptr);
+  FakeSafeRDB rdb;
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(1, kDimensions, 2.0);
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
+                                                 VectorToStr(vectors[0])));
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK(pool->SuspendWorkers());  // no background refresh
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(loaded);
+  EXPECT_GT(VectorSVSTestPeer::MemoryBytesForInfo(**loaded), 0u);
+  VMSDK_EXPECT_OK(pool->ResumeWorkers());
+}
+
+TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheSharedLock) {
   FakeSafeRDB rdb;
   auto proto =
       CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
@@ -1173,8 +1454,8 @@ TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
   };
   EXPECT_TRUE(add_while_shared_held(**built, 1, absl::Seconds(10)))
       << "a built index mutates under the shared lock";
-  EXPECT_FALSE(add_while_shared_held(**restored, 1, absl::Milliseconds(300)))
-      << "a restored index must wait for the exclusive lock";
+  EXPECT_TRUE(add_while_shared_held(**restored, 1, absl::Seconds(10)))
+      << "a restored index mutates under the shared lock too";
   EXPECT_EQ(AsBase(*restored)->GetLabelCount(), 2u);
   ValkeyModule_FreeString(nullptr, records[0]);
 }
@@ -1183,8 +1464,9 @@ TEST_F(VectorSVSTest, RestoredIndexMutatesUnderTheExclusiveLock) {
 // --------------------------------------------------
 
 // Every modify deletes a slot in SVS. Without consolidation those slots are
-// never reused; with it, the deleted count stays below the trigger, and the
-// index keeps answering with each key's latest vector.
+// never reused; with it, the deleted count stays near the trigger (deletes
+// continue while the background pass runs), and the index keeps answering
+// with each key's latest vector.
 TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
   const size_t kKeys = 50;
   const size_t kRounds = 100;  // 5000 modifies, past the 1024-slot trigger
@@ -1210,11 +1492,12 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
       auto result =
           (*index)->ModifyRecord(IndexToKey(i), AttributeData(std::move(vec)));
       VMSDK_EXPECT_OK(result);
-      max_deleted = std::max(
-          max_deleted, VectorSVSTestPeer::DeletedSinceConsolidate(**index));
+      max_deleted =
+          std::max(max_deleted, VectorSVSTestPeer::DeletedIdCount(**index));
     }
   }
-  EXPECT_LT(max_deleted, 1024u) << "deleted slots were never consolidated";
+  EXPECT_LT(max_deleted, 2 * 1024u) << "deleted slots were never consolidated";
+  VectorSVSTestPeer::WaitForConsolidation(**index);
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), kKeys);
   for (size_t i = 0; i < kKeys; ++i) {
     auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever());
@@ -1225,7 +1508,8 @@ TEST_F(VectorSVSTest, ModifyChurnConsolidatesDeletedSlots) {
 }
 
 // Deleting every entry triggers consolidation with nothing left to compact
-// (SVS can't compact an empty index); the index must keep working.
+// (SVS can't compact an empty index), so the ids stay listed; the index must
+// keep working, and the next consolidation with live entries clears them.
 TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   const size_t kKeys = 1100;  // past the 1024-slot trigger
   auto index = VectorSVS<float>::Create(
@@ -1242,7 +1526,7 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
     VMSDK_EXPECT_OK(
         (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
   }
-  EXPECT_LT(VectorSVSTestPeer::DeletedSinceConsolidate(**index), 1024u);
+  VectorSVSTestPeer::WaitForConsolidation(**index);
   EXPECT_EQ(AsBase(*index)->GetLabelCount(), 0u);
 
   VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(0),
@@ -1251,6 +1535,84 @@ TEST_F(VectorSVSTest, DeleteAllConsolidatesAndKeepsAcceptingWrites) {
   VMSDK_EXPECT_OK(result);
   ASSERT_EQ(result->size(), 1u);
   EXPECT_EQ((*result)[0].external_id, IndexToKey(0));
+
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(1),
+                                                 VectorToStr(vectors[1])));
+  VMSDK_EXPECT_OK(
+      (*index)->RemoveRecord(IndexToKey(1), indexes::DeletionType::kRecord));
+  VectorSVSTestPeer::WaitForConsolidation(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+}
+
+// A restored index is FINE_GRAIN, so it consolidates in the background like
+// a built one; that also empties the deleted-id list.
+TEST_F(VectorSVSTest, RestoredIndexConsolidatesInTheBackground) {
+  const size_t kKeys = 1100;  // past the 1024-slot trigger
+  FakeSafeRDB rdb;
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  auto built = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(built);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 5.0);
+  std::vector<ValkeyModuleString *> records(kKeys);
+  for (size_t i = 0; i < kKeys; ++i) {
+    records[i] = ValkeyModule_CreateString(
+        nullptr, (const char *)vectors[i].data(), kDimensions * sizeof(float));
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**built, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  VMSDK_EXPECT_OK((*built)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  VMSDK_EXPECT_OK((*built)->SaveTrackedKeys(RDBChunkOutputStream(&rdb)));
+  ExpectHashGetsForRecords(records);
+  auto restored = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(restored);
+  VMSDK_EXPECT_OK(
+      (*restored)->LoadTrackedKeys(&fake_ctx_, &hash_attribute_data_type_,
+                                   SupplementalContentChunkIter(&rdb)));
+  ASSERT_FALSE(VectorSVSTestPeer::MutationsExclusive(**restored));
+
+  // Deleting 1100 of 1100 leaves the trigger's consolidation with no live
+  // entries, so it keeps the ids; stop short of that.
+  const size_t kDeletes = 1050;
+  for (size_t i = 0; i < kDeletes; ++i) {
+    VMSDK_EXPECT_OK((*restored)->RemoveRecord(IndexToKey(i),
+                                              indexes::DeletionType::kRecord));
+  }
+  VectorSVSTestPeer::WaitForConsolidation(**restored);
+  EXPECT_LT(VectorSVSTestPeer::DeletedIdCount(**restored), 1024u)
+      << "the 1024-delete trigger consolidated";
+  for (auto *r : records) ValkeyModule_FreeString(nullptr, r);
+}
+
+// Each delete adds its id to the deleted set; a save consolidates the index in
+// SVS, so it empties the set.
+TEST_F(VectorSVSTest, DeletedIdsAreTrackedUntilSave) {
+  const size_t kKeys = 10;
+  const size_t kDeletes = 4;
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 5.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+  for (size_t i = 0; i < kDeletes; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+    EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), i + 1);
+  }
+
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
 }
 
 // -- Per-field footprint
@@ -1264,6 +1626,100 @@ size_t SvsDataBytes(const VectorSVS<float> &index) {
       << svs_error_get_message(err);
   svs_error_free(err);
   return breakdown.data_bytes;
+}
+
+// Background maintenance widens with the index: a small one stays on the
+// calling thread, since starting threads would cost more than its share of
+// work.
+TEST_F(VectorSVSTest, SmallIndexMaintainsSingleThreaded) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(100, kDimensions, 2.0);
+  for (size_t i = 0; i < vectors.size(); ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  ASSERT_GT(SvsMaintenanceThreads::Limit(), 1u);
+  EXPECT_EQ(SvsMaintenanceThreads::Limit(VectorSVSTestPeer::Handle(**index)),
+            1u);
+}
+
+// SVS can't compact an index with no live entries, so a consolidation that
+// runs once every vector is deleted keeps the ids; the next one, with live
+// entries again, compacts. Repeated fill and delete-all cycles then reuse the
+// freed slots instead of growing.
+TEST_F(VectorSVSTest, FillAndDeleteAllCyclesReuseSlots) {
+  const size_t kKeys = 1024;  // the last delete triggers, with none live
+  auto proto =
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE);
+  proto.set_initial_cap(64);  // small blocks, so growth shows
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 5.0);
+  std::vector<size_t> filled_bytes;
+  for (int cycle = 0; cycle < 4; ++cycle) {
+    for (size_t i = 0; i < kKeys; ++i) {
+      VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                     VectorToStr(vectors[i])));
+    }
+    filled_bytes.push_back(SvsDataBytes(**index));
+    for (size_t i = 0; i < kKeys; ++i) {
+      VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(i),
+                                             indexes::DeletionType::kRecord));
+    }
+    VectorSVSTestPeer::WaitForConsolidation(**index);
+  }
+  // At most one cycle's slots are held when the next fill starts.
+  EXPECT_LE(filled_bytes[3], filled_bytes[1])
+      << "cycle bytes: " << filled_bytes[0] << ", " << filled_bytes[1] << ", "
+      << filled_bytes[2] << ", " << filled_bytes[3];
+  auto result = (*index)->Search(VectorToStr(vectors[0]), 1, CancelNever());
+  VMSDK_EXPECT_OK(result);
+  EXPECT_TRUE(result->empty());
+}
+
+// A loaded index holds no deleted slots: SVS's save consolidates and
+// compacts, so the deleted-id list correctly starts empty after a load. Fewer
+// deletes than the consolidation trigger leave the saved index's slots
+// allocated; the loaded one has room for the live vectors only. If SVS ever
+// saves deleted slots as-is, the list must be persisted or rebuilt at load,
+// and this test fails.
+TEST_F(VectorSVSTest, LoadedIndexHoldsNoDeletedSlots) {
+  constexpr int kDim = 128;  // 512-byte vectors: 128 per 64 KiB block
+  const size_t kKeys = 2000;
+  const size_t kDeletes = 1000;  // below the 1024 consolidation trigger
+  auto proto = CreateSVSVectorIndexProto(kDim, data_model::DISTANCE_METRIC_L2,
+                                         data_model::SVS_COMPRESSION_NONE);
+  proto.set_initial_cap(16);
+  auto index = VectorSVS<float>::Create(proto, attribute_identifier,
+                                        attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDim, 5.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  for (size_t i = 0; i < kDeletes; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  ASSERT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kDeletes);
+  const size_t saved_bytes = SvsDataBytes(**index);
+
+  FakeSafeRDB rdb;
+  VMSDK_EXPECT_OK((*index)->SaveIndex(RDBChunkOutputStream(&rdb)));
+  auto loaded = VectorSVS<float>::LoadFromRDB(
+      &fake_ctx_, &hash_attribute_data_type_, proto, "attribute_identifier_2",
+      SupplementalContentChunkIter(&rdb), 0);
+  VMSDK_EXPECT_OK(loaded);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**loaded), 0u);
+  EXPECT_LT(SvsDataBytes(**loaded), saved_bytes * 3 / 4)
+      << "the loaded index kept the deleted slots";
 }
 
 // INITIAL_CAP sizes SVS's allocation block, so a small index no longer
@@ -1478,8 +1934,9 @@ TEST_P(VectorSVSSq8MetricTest, ConvertsAtTrainingThreshold) {
 }
 
 // An index saved before its conversion saves and loads its uncompressed
-// payload, then converts once it reaches the threshold. The converted index
-// is self-synchronizing, so mutations stop being exclusive.
+// payload, then converts once it reaches the threshold. Both the loaded and
+// the converted index are self-synchronizing, so mutations are never
+// exclusive.
 TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
   constexpr uint32_t kThreshold = 10;
   constexpr size_t kStaged = 5;
@@ -1509,7 +1966,7 @@ TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
                                  SupplementalContentChunkIter(&rdb)));
   EXPECT_NE(VectorSVSTestPeer::Handle(**loaded), nullptr);
   EXPECT_TRUE(VectorSVSTestPeer::CompressionPending(**loaded));
-  EXPECT_TRUE(VectorSVSTestPeer::MutationsExclusive(**loaded));
+  EXPECT_FALSE(VectorSVSTestPeer::MutationsExclusive(**loaded));
   EXPECT_EQ(AsBase(*loaded)->GetLabelCount(), kStaged);
   for (size_t i = 0; i < kStaged; ++i) {
     auto result = (*loaded)->Search(VectorToStr(vectors[i]), 1, CancelNever());
@@ -1538,6 +1995,64 @@ TEST_P(VectorSVSSq8MetricTest, PendingIndexRoundTrip) {
   }
   for (auto *record : records) {
     ValkeyModule_FreeString(nullptr, record);
+  }
+}
+
+// Records the widest SVS parallel_for, then forwards to the module's.
+std::atomic<size_t> widest_parallel_for{0};
+bool (*module_parallel_for)(void *, void (*)(void *, size_t), void *, size_t,
+                            svs_error_h) = nullptr;
+bool RecordingParallelFor(void *self, void (*func)(void *, size_t), void *param,
+                          size_t n, svs_error_h err) {
+  const size_t width = std::min(kSvsThreadpoolOps.size(nullptr), n);
+  size_t seen = widest_parallel_for.load();
+  while (width > seen &&
+         !widest_parallel_for.compare_exchange_weak(seen, width)) {
+  }
+  return module_parallel_for(self, func, param, n, err);
+}
+
+// The SQ8 conversion blocks the index, so it compresses on the maintenance
+// threads, scaled to the index size like a compaction; every vector stays
+// its own nearest afterwards.
+TEST_F(VectorSVSTest, Sq8ConversionRunsOnMaintenanceThreads) {
+#ifdef SAN_BUILD
+  // Two threads need 16384 vectors, about a minute of adds under TSAN, which
+  // would push this binary past the sanitizer suite's timeout. The parallel
+  // helpers are covered there by the threadpool test.
+  GTEST_SKIP() << "too slow under sanitizers";
+#endif
+  constexpr uint32_t kThreshold = 20000;  // two threads' worth (8192 each)
+  auto &budget = options::GetSvsMaintenanceThreads();
+  VMSDK_EXPECT_OK(budget.SetValue(4));
+  module_parallel_for = kSvsThreadpoolOps.parallel_for;
+  widest_parallel_for = 0;
+  auto index = VectorSVS<float>::Create(
+      Sq8Proto(kDimensions, data_model::DISTANCE_METRIC_L2, kThreshold),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = RandomVectors(kThreshold, kDimensions);
+  for (size_t i = 0; i + 1 < kThreshold; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  ASSERT_TRUE(VectorSVSTestPeer::CompressionPending(**index));
+  // The conversion assembles a new builder, which copies the ops table.
+  kSvsThreadpoolOps.parallel_for = RecordingParallelFor;
+  absl::Cleanup restore = [&] {
+    kSvsThreadpoolOps.parallel_for = module_parallel_for;
+    VMSDK_EXPECT_OK(budget.SetValue(0));
+  };
+  VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(
+      **index, IndexToKey(kThreshold - 1), VectorToStr(vectors.back())));
+  ASSERT_FALSE(VectorSVSTestPeer::CompressionPending(**index));
+  EXPECT_EQ(widest_parallel_for.load(), 2u)
+      << "20000 vectors convert on two of the four maintenance threads";
+  for (size_t i = 0; i < kThreshold; i += 997) {
+    auto result = (*index)->Search(VectorToStr(vectors[i]), 1, CancelNever());
+    VMSDK_EXPECT_OK(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ((*result)[0].external_id, IndexToKey(i)) << "key " << i;
   }
 }
 
@@ -2266,9 +2781,9 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param.name;
     });
 
-// A restored index logs through the global default logger: SVS v0.5.0 stream
-// loads ignore the builder's logger (changes once SVS honors it on load).
-TEST_P(VectorSVSL2CosineTest, RestoredIndexLogsAsGlobal) {
+// A restored index logs with its own tag: SVS stream loads use the builder's
+// logger.
+TEST_P(VectorSVSL2CosineTest, RestoredIndexLogsWithItsTag) {
   VMSDK_EXPECT_OK(vmsdk::InitLogging(nullptr, "debug"));
   absl::Cleanup restore_level = [] {
     VMSDK_EXPECT_OK(vmsdk::InitLogging(nullptr, "notice"));
@@ -2293,7 +2808,7 @@ TEST_P(VectorSVSL2CosineTest, RestoredIndexLogsAsGlobal) {
       SupplementalContentChunkIter(&rdb), 0);
   VMSDK_EXPECT_OK(loaded);
 
-  ExpectSvsLogsTagged("global");
+  ExpectSvsLogsTagged("attribute_identifier_2");
   VMSDK_EXPECT_OK(VectorSVSTestPeer::AddPoint(**loaded, 2, vectors[2].data()));
 }
 

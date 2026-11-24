@@ -8,6 +8,7 @@
 #include "src/indexes/vector_svs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <queue>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -37,12 +39,14 @@
 #include "src/query/search.h"
 #include "src/rdb_serialization.h"
 #include "src/utils/cancel.h"
+#include "src/valkey_search.h"
 #include "src/valkey_search_options.h"
 #include "third_party/hnswlib/hnswlib.h"
 #include "vmsdk/src/debug.h"
 #include "vmsdk/src/log.h"
 #include "vmsdk/src/memory_allocation.h"
 #include "vmsdk/src/status/status_macros.h"
+#include "vmsdk/src/thread_pool.h"
 #include "vmsdk/src/valkey_module_api/valkey_module.h"
 
 #if defined(__linux__) && defined(__x86_64__)
@@ -98,24 +102,95 @@ constexpr uint32_t kSvsHeaderFormatVersion = 1;
 // without a payload. No SVS release has version 0.
 constexpr uint32_t kSvsVersionWithoutPayload = 0;
 
-// Sequential threadpool vtable: SVS invokes parallel_for on the calling
-// reader thread. Matches HNSW's concurrency model (one search occupies
-// one reader thread; throughput scales via concurrent searches on
-// Valkey's reader pool). Static-storage so it survives every index
-// handle's lifetime.
-size_t SvsThreadpoolSize(void* /*self*/) { return 1; }
+// Threadpool vtable. Searches and writes run SVS's parallel_for on the calling
+// thread: one search occupies one reader thread, as with HNSW, and
+// throughput scales through concurrent searches on Valkey's reader pool.
+// Background maintenance raises this thread's width (SvsMaintenanceThreads),
+// so a compaction, which blocks the index, spreads over that many threads.
+// Static-storage so it survives every index handle's lifetime.
+thread_local size_t svs_threads = 1;
+
+size_t SvsThreadpoolSize(void* /*self*/) { return svs_threads; }
 
 bool SvsThreadpoolParallelFor(void* /*self*/,
                               void (*func)(void* svs_param, size_t i),
                               void* svs_param, size_t n,
                               svs_error_h /*out_err*/) {
-  for (size_t i = 0; i < n; ++i) {
-    func(svs_param, i);
+  const size_t threads = std::min(svs_threads, n);
+  if (threads <= 1) {
+    for (size_t i = 0; i < n; ++i) {
+      func(svs_param, i);
+    }
+    return true;
   }
+  // Helpers start at width 1, and the caller drops to 1 for the call, so any
+  // nested parallel_for stays sequential. SVS's func catches its own
+  // exceptions (it records them for SVS to rethrow), so only starting a
+  // helper can throw; the caller then runs with the helpers it has, and the
+  // helpers are joined and the width restored on every exit.
+  std::atomic<size_t> next{0};
+  auto run = [&] {
+    for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;) {
+      func(svs_param, i);
+    }
+  };
+  std::vector<std::thread> helpers;
+  const size_t width = svs_threads;
+  absl::Cleanup restore = [&] {
+    for (auto& helper : helpers) helper.join();
+    svs_threads = width;
+  };
+  try {
+    helpers.reserve(threads - 1);
+    for (size_t t = 1; t < threads; ++t) helpers.emplace_back(run);
+  } catch (const std::exception& e) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 60)
+        << "SVS maintenance: started " << helpers.size() + 1 << " of "
+        << threads << " threads: " << e.what();
+  }
+  svs_threads = 1;
+  run();
   return true;
 }
 
 }  // namespace
+
+ABSL_CONST_INIT absl::Mutex SvsMaintenanceThreads::mutex_(absl::kConstInit);
+size_t SvsMaintenanceThreads::in_use_ = 0;
+
+size_t SvsMaintenanceThreads::Limit(svs_index_h index) {
+  // Starting a thread costs more than a small index's share of work, so the
+  // width grows with the index: one thread per kVectorsPerThread live vectors.
+  constexpr size_t kVectorsPerThread = 8192;
+  size_t live = 0;
+  svs_index_get_size(index, &live, nullptr);
+  return std::min(Limit(), std::max<size_t>(1, live / kVectorsPerThread));
+}
+
+size_t SvsMaintenanceThreads::Limit() {
+  const int64_t configured = options::GetSvsMaintenanceThreads().GetValue();
+  const int64_t limit =
+      configured > 0 ? configured : options::GetWriterThreadCount().GetValue();
+  return static_cast<size_t>(std::max<int64_t>(1, limit));
+}
+
+SvsMaintenanceThreads::SvsMaintenanceThreads(size_t want)
+    : saved_width_(svs_threads) {
+  {
+    absl::MutexLock lock(&mutex_);
+    const size_t limit = Limit();
+    const size_t free = limit > in_use_ ? limit - in_use_ : 0;
+    width_ = std::max<size_t>(1, std::min(want, free));
+    in_use_ += width_;
+  }
+  svs_threads = width_;
+}
+
+SvsMaintenanceThreads::~SvsMaintenanceThreads() {
+  svs_threads = saved_width_;
+  absl::MutexLock lock(&mutex_);
+  in_use_ -= width_;
+}
 
 // Declared in vector_svs.h for the unit tests.
 svs_threadpool_ops_t kSvsThreadpoolOps =
@@ -154,8 +229,8 @@ static_assert(std::has_single_bit(kSvsBlockSizeBytes) &&
                   std::has_single_bit(kSvsMinBlockSizeBytes),
               "SVS block sizes must be powers of two");
 
-// In the pinned SVS revision FINE_GRAIN is an alias of GLOBAL; once upstream
-// implements it, writers on one index run in parallel with no module change.
+// FINE_GRAIN backs the handle with SVS's concurrent index, so writers on one
+// index run in parallel.
 constexpr svs_sync_kind_t kSvsSyncKind = SVS_SYNC_KIND_FINE_GRAIN;
 
 // Reader or writer side of resize_mutex_ for a mutation, chosen at run time
@@ -314,6 +389,16 @@ class ScopedSvsError {
  private:
   svs_error_h err_;
 };
+
+// SVS can't compact an index with no live entries, and the C API's add_points
+// reuses the slots consolidation frees only after a compaction. So when a
+// consolidation leaves no live entries, its ids stay listed and the next
+// consolidation, with live entries again, compacts them.
+bool HasLiveEntries(svs_index_h index) {
+  size_t live = 0;
+  ScopedSvsError err;
+  return svs_index_get_size(index, &live, err.get()) && live > 0;
+}
 
 absl::Status SvsErrorToStatus(svs_error_h err, absl::string_view phase) {
   const char* msg = svs_error_get_message(err);
@@ -629,9 +714,37 @@ bool BuildConfigMatches(const SVSBuildConfig& expected,
 
 #endif  // __linux__ && __x86_64__
 
+ABSL_CONST_INIT absl::Mutex SvsMaintenance::mutex_(absl::kConstInit);
+int SvsMaintenance::running_ = 0;
+bool SvsMaintenance::stopped_ = false;
+
+void SvsMaintenance::Stop() {
+  absl::MutexLock lock(&mutex_);
+  stopped_ = true;
+  mutex_.Await(
+      absl::Condition(+[](int* running) { return *running == 0; }, &running_));
+}
+
+bool SvsMaintenance::Begin() {
+  absl::MutexLock lock(&mutex_);
+  if (stopped_) return false;
+  ++running_;
+  return true;
+}
+
+void SvsMaintenance::End() {
+  absl::MutexLock lock(&mutex_);
+  --running_;
+}
+
+bool SvsMaintenance::Stopped() {
+  absl::MutexLock lock(&mutex_);
+  return stopped_;
+}
+
 void InitSvsLogging() {
 #if defined(__linux__) && defined(__x86_64__)
-  // Covers SVS work without a per-index logger, such as stream loads.
+  // Covers SVS work without a per-index logger.
   if (svs_logger_h l = MakeSvsLogger("global")) {
     svs_set_default_logger(l, nullptr);
     svs_logger_free(l);
@@ -829,11 +942,15 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
         err.get());
     if (!builder.ok()) return builder.status();
 
-    svs_index_h index = svs_index_load_stream_dynamic(
-        builder->get(), &iface, storage_config.blocksize_bytes, err.get());
+    // SVS doesn't save the sync kind, so pass the one new indexes use.
+    svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
+    params.blocksize_bytes = storage_config.blocksize_bytes;
+    params.sync_kind = kSvsSyncKind;
+    svs_index_h index = svs_index_load_stream_dynamic_ex(builder->get(), &iface,
+                                                         &params, err.get());
     if (index == nullptr) {
       if (!adapter.status().ok()) return adapter.status();
-      return SvsErrorToStatus(err.get(), "index_load_stream_dynamic");
+      return SvsErrorToStatus(err.get(), "index_load_stream_dynamic_ex");
     }
     // Hand the handle to instance before the check below, so ~VectorSVS owns
     // it on every path out of here and no path needs its own free.
@@ -841,9 +958,11 @@ absl::StatusOr<std::shared_ptr<VectorSVS<T>>> VectorSVS<T>::LoadFromRDB(
       absl::WriterMutexLock lock(&instance->resize_mutex_);
       instance->svs_index_ = index;
     }
-    // The stream load has no parameter form at this pin, so the restored
-    // index reports SVS_SYNC_KIND_NONE and cannot guard concurrent writers;
-    // keep its mutations exclusive (serialized by resize_mutex_, as before).
+    // Nothing else can use the index before it is published, so query its
+    // memory here; otherwise the first FT.INFO after a load would report 0.
+    instance->RefreshMemoryBytes();
+    // An index SVS doesn't guard (SVS_SYNC_KIND_NONE) keeps its mutations
+    // exclusive (serialized by resize_mutex_).
     svs_sync_kind_t sync_kind = SVS_SYNC_KIND_NONE;
     if (!svs_index_dynamic_get_sync_kind(index, &sync_kind, err.get())) {
       return SvsErrorToStatus(err.get(), "index_dynamic_get_sync_kind");
@@ -1133,19 +1252,18 @@ absl::Status VectorSVS<T>::RemoveRecordImpl(uint64_t internal_id) {
     }
   }
   absl::Status svs_status = absl::OkStatus();
+  size_t deleted = 0;
   {
     SvsMutationLock lock(&resize_mutex_,
                          mutations_exclusive_.load(std::memory_order_acquire));
     if (svs_index_ != nullptr) {
       ScopedSvsError err;
-      size_t deleted = 0;
       if (!svs_index_dynamic_delete_points(svs_index_, &internal_id,
                                            /*num_vectors=*/1, &deleted,
                                            err.get())) {
         ++Metrics::GetStats().svs_remove_exceptions_cnt;
         svs_status = SvsErrorToStatus(err.get(), "index_dynamic_delete_points");
       }
-      deleted_since_consolidate_.fetch_add(deleted, std::memory_order_relaxed);
     }
   }
   // Test hook: SVS no longer holds the id, the map still does. No lock is
@@ -1160,6 +1278,7 @@ absl::Status VectorSVS<T>::RemoveRecordImpl(uint64_t internal_id) {
   {
     absl::MutexLock map_lock(&label_mutex_);
     label_to_record_.erase(internal_id);
+    if (deleted > 0) deleted_ids_.push_back(internal_id);
   }
   MaybeConsolidate();
   return svs_status;
@@ -1204,7 +1323,10 @@ absl::Status VectorSVS<T>::ModifyRecordImpl(uint64_t internal_id,
         return SvsErrorToStatus(err.get(),
                                 "modify: index_dynamic_delete_points");
       }
-      deleted_since_consolidate_.fetch_add(deleted, std::memory_order_relaxed);
+      if (deleted > 0) {
+        absl::MutexLock map_lock(&label_mutex_);
+        deleted_ids_.push_back(internal_id);
+      }
       size_t added = 0;
       if (!svs_index_dynamic_add_points(svs_index_, fp32, &internal_id,
                                         /*num_vectors=*/1, &added, err.get())) {
@@ -1268,16 +1390,43 @@ absl::Status VectorSVS<T>::InsertVector(uint64_t internal_id,
 
 template <typename T>
 void VectorSVS<T>::MaybeConsolidate() {
-  const size_t live = GetLabelCount();
-  auto due = [this, live]() {
-    return deleted_since_consolidate_.load(std::memory_order_relaxed) >=
-           std::max(kConsolidateMinDeleted, live / kConsolidateLiveDivisor);
+  auto due = [this]() {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    return deleted_ids_.size() >=
+           std::max(kConsolidateMinDeleted,
+                    label_to_record_.size() / kConsolidateLiveDivisor);
   };
   if (!due()) return;
+  if (!mutations_exclusive_.load(std::memory_order_acquire)) {
+    // One consolidation at a time; the flag is cleared when it finishes.
+    bool idle = false;
+    if (!consolidating_.compare_exchange_strong(idle, true)) return;
+    auto task = [weak = this->weak_from_this()] {
+      if (auto self = weak.lock()) self->ConsolidateConcurrently();
+    };
+    // The writer pool is suspended while a fork child saves, until the child
+    // exits or for at most max-worker-suspension-secs (not at all when 0), so
+    // a consolidation normally waits for the save. If the pool resumes first,
+    // the pass adds copy-on-write memory like any write; the child's snapshot
+    // is unaffected. kHigh queues it
+    // behind the mutations already waiting: by default the pool runs kLow
+    // tasks only when no kHigh task waits, so sustained writes would starve
+    // it. Without a pool (unit tests) it runs here.
+    vmsdk::ThreadPool* pool = ValkeySearch::Instance().GetWriterThreadPool();
+    if (pool == nullptr) {
+      task();
+    } else if (!pool->Schedule(std::move(task),
+                               vmsdk::ThreadPool::Priority::kHigh)) {
+      consolidating_.store(false);
+    }
+    return;
+  }
   // Consolidation rewrites graph edges, so it excludes the other writers;
   // searches are already excluded by the mutation phase.
   absl::WriterMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr || !due()) return;
+  // The whole pass excludes this index's searches and writes.
+  SvsMaintenanceThreads threads(SvsMaintenanceThreads::Limit(svs_index_));
   ScopedSvsError err;
   if (!svs_index_dynamic_consolidate(svs_index_, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
@@ -1285,19 +1434,127 @@ void VectorSVS<T>::MaybeConsolidate() {
         << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
     return;
   }
-  // The C API's add_points only fills slots past the last compaction, so the
-  // slots consolidate freed are reused only after compacting. SVS can't
-  // compact an index with no live entries.
-  size_t live_in_svs = 0;
-  if (svs_index_get_size(svs_index_, &live_in_svs, err.get()) &&
-      live_in_svs > 0 &&
-      !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
+  if (!HasLiveEntries(svs_index_)) return;
+  // add_points reuses the freed slots only after compaction, so their ids
+  // stay counted (and the trigger retries) until it succeeds.
+  if (!svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA compact failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_compact");
     return;
   }
-  deleted_since_consolidate_.store(0, std::memory_order_relaxed);
+  absl::MutexLock map_lock(&label_mutex_);
+  deleted_ids_.clear();
+}
+
+template <typename T>
+void VectorSVS<T>::ConsolidateConcurrently() {
+  const bool succeeded = ConsolidatePass();
+  consolidating_.store(false);
+  // Deletes that arrived during the pass couldn't schedule one, so check them
+  // now. Not after a failure (no immediate retry), an emptied index or
+  // shutdown, where the pass reports false.
+  if (succeeded) MaybeConsolidate();
+}
+
+template <typename T>
+bool VectorSVS<T>::ConsolidatePass() {
+  if (!SvsMaintenance::Begin()) return false;
+  absl::Cleanup end = [] { SvsMaintenance::End(); };
+  // SVS consolidates a FINE_GRAIN index alongside writers and searches.
+  absl::ReaderMutexLock lock(&resize_mutex_);
+  if (svs_index_ == nullptr ||
+      mutations_exclusive_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  size_t before = 0;
+  {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    before = deleted_ids_.size();
+  }
+  absl::MutexLock busy(&consolidation_mutex_);
+  ScopedSvsError err;
+  // Consolidation runs alongside this index's searches and writes, so it
+  // leaves them half the budget; compaction blocks the index and takes all.
+  const size_t limit = SvsMaintenanceThreads::Limit(svs_index_);
+  size_t consolidate_threads = 1;
+  size_t compact_threads = 1;
+  const absl::Time start = absl::Now();
+  bool consolidated_ok;
+  {
+    SvsMaintenanceThreads threads(std::max<size_t>(1, limit / 2));
+    consolidate_threads = threads.width();
+    consolidated_ok = svs_index_dynamic_consolidate(svs_index_, err.get());
+  }
+  if (!consolidated_ok) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
+        << "SVS_VAMANA consolidate failed: "
+        << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
+    return false;
+  }
+  const absl::Time consolidated = absl::Now();
+  if (!HasLiveEntries(svs_index_)) return false;
+  // Compaction lets add_points reuse the freed slots; SVS runs it exclusively.
+  // Shutdown doesn't need it.
+  if (SvsMaintenance::Stopped()) return false;
+  bool compacted;
+  {
+    SvsMaintenanceThreads threads(limit);
+    compact_threads = threads.width();
+    compacted =
+        svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get());
+  }
+  if (!compacted) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
+        << "SVS_VAMANA compact failed: "
+        << SvsErrorToStatus(err.get(), "index_dynamic_compact");
+    return false;
+  }
+  // Ids deleted before the consolidation started are reclaimed now; until
+  // compaction succeeds they stay counted, so the trigger retries. Later ones
+  // (pushed after them) wait for the next pass.
+  {
+    absl::MutexLock map_lock(&label_mutex_);
+    deleted_ids_.erase(
+        deleted_ids_.begin(),
+        deleted_ids_.begin() + std::min(before, deleted_ids_.size()));
+  }
+  VMSDK_LOG(VERBOSE, nullptr)
+      << "SVS index consolidated: attribute=" << this->attribute_identifier_
+      << ", deleted=" << before
+      << ", consolidate_ms=" << absl::ToInt64Milliseconds(consolidated - start)
+      << ", compact_ms="
+      << absl::ToInt64Milliseconds(absl::Now() - consolidated)
+      << ", consolidate_threads=" << consolidate_threads
+      << ", compact_threads=" << compact_threads;
+  return true;
+}
+
+template <typename T>
+size_t VectorSVS<T>::MemoryBytesForInfo() const {
+  if (!memory_refresh_pending_.exchange(true)) {
+    ValkeySearch::Instance().ScheduleUtilityTask(
+        [weak = this->weak_from_this()] {
+          if (auto self = weak.lock()) self->RefreshMemoryBytes();
+        });
+  }
+  return memory_bytes_.load();
+}
+
+template <typename T>
+void VectorSVS<T>::RefreshMemoryBytes() const {
+  absl::Cleanup done = [this] { memory_refresh_pending_.store(false); };
+  // Try-locks, so a pool thread never waits out a long operation (which
+  // would also hold up the pool's join at shutdown).
+  if (!resize_mutex_.ReaderTryLock()) return;
+  if (svs_index_ != nullptr && consolidation_mutex_.TryLock()) {
+    size_t bytes = 0;
+    if (svs_index_get_memory_usage(svs_index_, &bytes, nullptr)) {
+      memory_bytes_.store(bytes);
+    }
+    consolidation_mutex_.Unlock();
+  }
+  resize_mutex_.ReaderUnlock();
 }
 
 template <typename T>
@@ -1340,6 +1597,9 @@ void VectorSVS<T>::MaybeConvert() {
     svs_dynamic_index_params_t params = SVS_INIT_DYNAMIC_INDEX_PARAMS();
     params.blocksize_bytes = build_config_.blocksize_bytes;
     params.sync_kind = kSvsSyncKind;
+    // The conversion blocks the index, so, like a compaction, it compresses
+    // the vectors on the maintenance threads.
+    SvsMaintenanceThreads threads(SvsMaintenanceThreads::Limit(svs_index_));
     converted = svs_index_convert_dynamic_ex(builder->get(), svs_index_,
                                              &params, err.get());
   }
@@ -1391,7 +1651,7 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   ValkeyModule_ReplyWithSimpleString(ctx, "algorithm");
   const bool trained = build_config_.training_threshold > 0;
   const bool unavailable = !unavailable_.empty();
-  ValkeyModule_ReplyWithArray(ctx, (trained ? 18 : 14) + (unavailable ? 2 : 0));
+  ValkeyModule_ReplyWithArray(ctx, (trained ? 20 : 16) + (unavailable ? 2 : 0));
   ValkeyModule_ReplyWithSimpleString(ctx, "name");
   ValkeyModule_ReplyWithSimpleString(
       ctx, std::string(
@@ -1430,15 +1690,17 @@ int VectorSVS<T>::RespondWithInfoImpl(ValkeyModuleCtx* ctx) const {
   // first add.
   size_t memory_bytes = 0;
 #if defined(__linux__) && defined(__x86_64__)
-  {
-    absl::ReaderMutexLock lock(&resize_mutex_);
-    if (svs_index_ != nullptr) {
-      svs_index_get_memory_usage(svs_index_, &memory_bytes, nullptr);
-    }
-  }
+  memory_bytes = MemoryBytesForInfo();
 #endif
   ValkeyModule_ReplyWithSimpleString(ctx, "memory_bytes");
   ValkeyModule_ReplyWithLongLong(ctx, static_cast<long long>(memory_bytes));
+  size_t deleted_slots = 0;
+  {
+    absl::ReaderMutexLock map_lock(&label_mutex_);
+    deleted_slots = deleted_ids_.size();
+  }
+  ValkeyModule_ReplyWithSimpleString(ctx, "deleted_slots");
+  ValkeyModule_ReplyWithLongLong(ctx, static_cast<long long>(deleted_slots));
   return 4;
 }
 
@@ -1507,7 +1769,8 @@ absl::Status VectorSVS<T>::SaveIndexImpl(
     return SvsErrorToStatus(err.get(), "index_save_stream");
   }
   // The save consolidated and compacted the index.
-  deleted_since_consolidate_.store(0, std::memory_order_relaxed);
+  absl::MutexLock map_lock(&label_mutex_);
+  deleted_ids_.clear();
   return absl::OkStatus();
 #else
   (void)chunked_out;
