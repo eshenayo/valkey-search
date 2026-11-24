@@ -1427,29 +1427,37 @@ void VectorSVS<T>::MaybeConsolidate() {
     return;
   }
   if (!HasLiveEntries(svs_index_)) return;
-  // Consolidation reclaimed every deleted slot and dropped their ids; the
-  // compaction lets add_points reuse the slots.
-  {
-    absl::MutexLock map_lock(&label_mutex_);
-    deleted_ids_.clear();
-  }
+  // add_points reuses the freed slots only after compaction, so their ids
+  // stay counted (and the trigger retries) until it succeeds.
   if (!svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA compact failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_compact");
+    return;
   }
+  absl::MutexLock map_lock(&label_mutex_);
+  deleted_ids_.clear();
 }
 
 template <typename T>
 void VectorSVS<T>::ConsolidateConcurrently() {
-  absl::Cleanup done = [this] { consolidating_.store(false); };
-  if (!SvsMaintenance::Begin()) return;
+  const bool succeeded = ConsolidatePass();
+  consolidating_.store(false);
+  // Deletes that arrived during the pass couldn't schedule one, so check them
+  // now. Not after a failure (no immediate retry), an emptied index or
+  // shutdown, where the pass reports false.
+  if (succeeded) MaybeConsolidate();
+}
+
+template <typename T>
+bool VectorSVS<T>::ConsolidatePass() {
+  if (!SvsMaintenance::Begin()) return false;
   absl::Cleanup end = [] { SvsMaintenance::End(); };
   // SVS consolidates a FINE_GRAIN index alongside writers and searches.
   absl::ReaderMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr ||
       mutations_exclusive_.load(std::memory_order_acquire)) {
-    return;
+    return false;
   }
   size_t before = 0;
   {
@@ -1474,31 +1482,34 @@ void VectorSVS<T>::ConsolidateConcurrently() {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA consolidate failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
-    return;
+    return false;
   }
   const absl::Time consolidated = absl::Now();
-  if (!HasLiveEntries(svs_index_)) return;
-  // Ids deleted before the consolidation started are reclaimed; later ones
-  // (pushed after them) wait for the next.
+  if (!HasLiveEntries(svs_index_)) return false;
+  // Compaction lets add_points reuse the freed slots; SVS runs it exclusively.
+  // Shutdown doesn't need it.
+  if (SvsMaintenance::Stopped()) return false;
+  bool compacted;
+  {
+    SvsMaintenanceThreads threads(limit);
+    compact_threads = threads.width();
+    compacted =
+        svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get());
+  }
+  if (!compacted) {
+    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
+        << "SVS_VAMANA compact failed: "
+        << SvsErrorToStatus(err.get(), "index_dynamic_compact");
+    return false;
+  }
+  // Ids deleted before the consolidation started are reclaimed now; until
+  // compaction succeeds they stay counted, so the trigger retries. Later ones
+  // (pushed after them) wait for the next pass.
   {
     absl::MutexLock map_lock(&label_mutex_);
     deleted_ids_.erase(
         deleted_ids_.begin(),
         deleted_ids_.begin() + std::min(before, deleted_ids_.size()));
-  }
-  // Compaction lets add_points reuse the freed slots; SVS runs it exclusively.
-  // Shutdown doesn't need it.
-  bool compact_failed = false;
-  if (!SvsMaintenance::Stopped()) {
-    SvsMaintenanceThreads threads(limit);
-    compact_threads = threads.width();
-    compact_failed =
-        !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get());
-  }
-  if (compact_failed) {
-    VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
-        << "SVS_VAMANA compact failed: "
-        << SvsErrorToStatus(err.get(), "index_dynamic_compact");
   }
   VMSDK_LOG(VERBOSE, nullptr)
       << "SVS index consolidated: attribute=" << this->attribute_identifier_
@@ -1508,6 +1519,7 @@ void VectorSVS<T>::ConsolidateConcurrently() {
       << absl::ToInt64Milliseconds(absl::Now() - consolidated)
       << ", consolidate_threads=" << consolidate_threads
       << ", compact_threads=" << compact_threads;
+  return true;
 }
 
 template <typename T>

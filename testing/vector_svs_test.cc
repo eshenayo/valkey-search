@@ -104,6 +104,10 @@ class VectorSVSTestPeer {
   static absl::Mutex &ConsolidationMutex(VectorSVS<float> &index) {
     return index.consolidation_mutex_;
   }
+  // As if a background consolidation were scheduled.
+  static void SetConsolidating(VectorSVS<float> &index, bool consolidating) {
+    index.consolidating_.store(consolidating);
+  }
   static size_t DeletedIdCount(const VectorSVS<float> &index)
       ABSL_NO_THREAD_SAFETY_ANALYSIS {
     absl::ReaderMutexLock lock(&index.label_mutex_);
@@ -1204,7 +1208,8 @@ void WhileHeldElsewhere(absl::Mutex &mu, bool shared,
 }
 
 // Shutdown waits for a running background consolidation, which SVS can't
-// interrupt, and skips any that hasn't started.
+// interrupt, and skips any that hasn't started. The running pass skips its
+// compaction, so its slots stay counted until a later pass compacts them.
 TEST_F(VectorSVSTest, StoppingMaintenanceWaitsForRunningAndSkipsQueued) {
   const size_t kKeys = 20;
   auto index = VectorSVS<float>::Create(
@@ -1243,15 +1248,62 @@ TEST_F(VectorSVSTest, StoppingMaintenanceWaitsForRunningAndSkipsQueued) {
       });
   consolidator.join();
   stopper.join();
-  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kKeys / 2)
+      << "compaction was skipped, so the slots aren't reusable yet";
 
   VMSDK_EXPECT_OK((*index)->RemoveRecord(IndexToKey(kKeys - 1),
                                          indexes::DeletionType::kRecord));
   VectorSVSTestPeer::ConsolidateConcurrently(**index);
-  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 1u);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), kKeys / 2 + 1)
+      << "a pass that starts after the stop is skipped";
   VectorSVSTestPeer::ResumeMaintenance();
   VectorSVSTestPeer::ConsolidateConcurrently(**index);
   EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u);
+}
+
+// Deletes that arrive while a pass runs can't schedule another; once the pass
+// succeeds it rechecks them, so they're reclaimed without waiting for the next
+// delete.
+TEST_F(VectorSVSTest, PassRechecksDeletesThatArrivedDuringIt) {
+  const size_t kKeys = 4000;
+  const size_t kDeletes = 1100;  // past the 1024-slot trigger, twice
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(kKeys, kDimensions, 2.0);
+  for (size_t i = 0; i < kKeys; ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  // A pass is "scheduled", so these deletes don't start one.
+  VectorSVSTestPeer::SetConsolidating(**index, true);
+  for (size_t i = 0; i < kDeletes; ++i) {
+    VMSDK_EXPECT_OK(
+        (*index)->RemoveRecord(IndexToKey(i), indexes::DeletionType::kRecord));
+  }
+  std::thread pass;
+  // Holding consolidation_mutex_ stops the pass after it has counted the
+  // first deletes, while it still lets writers in.
+  WhileHeldElsewhere(
+      VectorSVSTestPeer::ConsolidationMutex(**index), /*shared=*/false, [&] {
+        pass = std::thread(
+            [&] { VectorSVSTestPeer::ConsolidateConcurrently(**index); });
+        while (VectorSVSTestPeer::RunningMaintenance() == 0) {
+          absl::SleepFor(absl::Milliseconds(1));
+        }
+        absl::SleepFor(absl::Milliseconds(100));
+        for (size_t i = kDeletes; i < 2 * kDeletes; ++i) {
+          VMSDK_EXPECT_OK((*index)->RemoveRecord(
+              IndexToKey(i), indexes::DeletionType::kRecord));
+        }
+        EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 2 * kDeletes);
+      });
+  pass.join();
+  VectorSVSTestPeer::WaitForConsolidation(**index);
+  EXPECT_EQ(VectorSVSTestPeer::DeletedIdCount(**index), 0u)
+      << "the deletes made during the pass were not rechecked";
 }
 
 // FT.INFO's memory_bytes never waits behind a consolidation or conversion

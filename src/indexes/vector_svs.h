@@ -241,7 +241,12 @@ class VectorSVS : public VectorType<T>,
   // request; SVS consolidates alongside writers and searches but compacts
   // exclusively. Any other index does both inline, exclusively.
   void MaybeConsolidate() ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_);
+  // Runs one background pass, then schedules another if deletes that arrived
+  // during it are already past the trigger.
   void ConsolidateConcurrently()
+      ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_, consolidation_mutex_);
+  // One background consolidate + compact; true if both ran and succeeded.
+  bool ConsolidatePass()
       ABSL_LOCKS_EXCLUDED(resize_mutex_, label_mutex_, consolidation_mutex_);
   // FT.INFO's memory_bytes. SVS reports memory under its exclusive lock,
   // which waits for every search and write in flight, and FT.INFO runs on the
