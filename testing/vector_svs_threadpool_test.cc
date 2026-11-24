@@ -9,6 +9,7 @@
 // the create-failure counter, the FINE_GRAIN build and concurrent writers.
 // Built only where the SVS C API is (x86_64 Linux).
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,9 +20,11 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -32,6 +35,7 @@
 #include "src/metrics.h"
 #include "src/utils/cancel.h"
 #include "src/utils/string_interning.h"
+#include "src/valkey_search_options.h"
 #include "svs/c/svs_c.h"
 #include "testing/common.h"
 #include "vmsdk/src/testing_infra/utils.h"
@@ -503,4 +507,83 @@ TEST_F(VectorSVSThreadpoolTest,
 }
 
 }  // namespace
+// -- (c) background maintenance width
+// ------------------------------------------
+
+struct WideRecorder {
+  explicit WideRecorder(size_t n) : counts(n) {}
+  std::vector<std::atomic<int>> counts;
+  absl::Mutex mu;
+  absl::flat_hash_set<std::thread::id> threads ABSL_GUARDED_BY(mu);
+  std::atomic<bool> nested_wide{false};
+};
+
+void RecordWide(void *param, size_t i) {
+  auto *rec = static_cast<WideRecorder *>(param);
+  rec->counts[i].fetch_add(1);
+  if (kSvsThreadpoolOps.size(nullptr) != 1) rec->nested_wide = true;
+  absl::MutexLock lock(&rec->mu);
+  rec->threads.insert(std::this_thread::get_id());
+}
+
+// Inside SvsMaintenanceThreads, parallel_for spreads its iterations over
+// several threads and runs each exactly once; a nested call stays sequential.
+TEST(SvsMaintenanceThreads, ParallelForRunsEachIterationOnceAcrossThreads) {
+  auto &budget = options::GetSvsMaintenanceThreads();
+  VMSDK_EXPECT_OK(budget.SetValue(8));
+  absl::Cleanup restore = [&] { VMSDK_EXPECT_OK(budget.SetValue(0)); };
+  constexpr size_t kIterations = 1000;
+  WideRecorder rec(kIterations);
+  {
+    SvsMaintenanceThreads threads(8);
+    ASSERT_EQ(threads.width(), 8u);
+    EXPECT_EQ(kSvsThreadpoolOps.size(nullptr), 8u);
+    EXPECT_TRUE(kSvsThreadpoolOps.parallel_for(nullptr, RecordWide, &rec,
+                                               kIterations, nullptr));
+    EXPECT_EQ(kSvsThreadpoolOps.size(nullptr), 8u) << "width restored";
+  }
+  EXPECT_EQ(kSvsThreadpoolOps.size(nullptr), 1u) << "1 outside maintenance";
+  for (size_t i = 0; i < kIterations; ++i) {
+    EXPECT_EQ(rec.counts[i].load(), 1) << "iteration " << i;
+  }
+  absl::MutexLock lock(&rec.mu);
+  EXPECT_GT(rec.threads.size(), 1u);
+  EXPECT_FALSE(rec.nested_wide.load()) << "a nested parallel_for went wide";
+}
+
+// Indexes maintained at the same time split the budget; each always gets at
+// least its own thread, and a finished pass gives its threads back.
+TEST(SvsMaintenanceThreads, IndexesShareTheBudget) {
+  auto &budget = options::GetSvsMaintenanceThreads();
+  VMSDK_EXPECT_OK(budget.SetValue(6));
+  absl::Cleanup restore = [&] { VMSDK_EXPECT_OK(budget.SetValue(0)); };
+  EXPECT_EQ(SvsMaintenanceThreads::Limit(), 6u);
+  {
+    SvsMaintenanceThreads a(4);
+    EXPECT_EQ(a.width(), 4u);
+    SvsMaintenanceThreads b(4);
+    EXPECT_EQ(b.width(), 2u);
+    SvsMaintenanceThreads c(4);
+    EXPECT_EQ(c.width(), 1u);
+  }
+  SvsMaintenanceThreads d(4);
+  EXPECT_EQ(d.width(), 4u);
+}
+
+// 1 keeps maintenance single-threaded, as before the option; 0 follows the
+// writer-thread count.
+TEST(SvsMaintenanceThreads, OneIsSingleThreadedAndZeroFollowsWriters) {
+  auto &budget = options::GetSvsMaintenanceThreads();
+  VMSDK_EXPECT_OK(budget.SetValue(1));
+  absl::Cleanup restore = [&] { VMSDK_EXPECT_OK(budget.SetValue(0)); };
+  {
+    SvsMaintenanceThreads threads(16);
+    EXPECT_EQ(threads.width(), 1u);
+    EXPECT_EQ(kSvsThreadpoolOps.size(nullptr), 1u);
+  }
+  VMSDK_EXPECT_OK(budget.SetValue(0));
+  EXPECT_EQ(SvsMaintenanceThreads::Limit(),
+            static_cast<size_t>(options::GetWriterThreadCount().GetValue()));
+}
+
 }  // namespace valkey_search::indexes

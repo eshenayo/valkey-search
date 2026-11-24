@@ -32,6 +32,10 @@ config::Number &GetReaderThreadCount();
 /// number of writer threads
 config::Number &GetWriterThreadCount();
 
+/// Threads SVS_VAMANA background maintenance may use at once, across all
+/// indexes; 0 means the writer-thread count.
+config::Number &GetSvsMaintenanceThreads();
+
 /// Return the configuration entry that allows the caller to control the
 /// number of utility threads
 config::Number &GetUtilityThreadCount();

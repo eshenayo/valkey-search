@@ -46,10 +46,35 @@ struct svs_threadpool_interface;
 namespace valkey_search::indexes {
 
 #if defined(__linux__) && defined(__x86_64__)
-// Sequential threadpool vtable installed on every SVS builder; exposed for
-// the unit tests.
+// Threadpool vtable installed on every SVS builder: parallel_for runs on the
+// calling thread, or across SvsMaintenanceThreads' width inside background
+// maintenance. Exposed for the unit tests.
 extern svs_threadpool_interface_ops kSvsThreadpoolOps;
 extern svs_threadpool_interface kSvsThreadpoolIface;
+
+// Threads for one consolidation or compaction, from a server-wide budget of
+// svs-maintenance-threads (the writer-thread count when 0), so indexes
+// maintained at the same time split it instead of oversubscribing the host.
+// Never waits: grants what is free, and at least the calling thread. For its
+// lifetime, SVS's parallel_for on this thread spreads over width() threads.
+class SvsMaintenanceThreads {
+ public:
+  // The budget (svs-maintenance-threads, or writer-threads when 0).
+  static size_t Limit();
+  // The width worth using on `index`: the budget, or fewer for a small index.
+  static size_t Limit(svs_index_h index);
+  explicit SvsMaintenanceThreads(size_t want);
+  ~SvsMaintenanceThreads();
+  SvsMaintenanceThreads(const SvsMaintenanceThreads &) = delete;
+  SvsMaintenanceThreads &operator=(const SvsMaintenanceThreads &) = delete;
+  size_t width() const { return width_; }
+
+ private:
+  ABSL_CONST_INIT static absl::Mutex mutex_;
+  static size_t in_use_ ABSL_GUARDED_BY(mutex_);
+  size_t width_ = 1;
+  size_t saved_width_;
+};
 #endif
 
 // Build-time configuration retained on the class so the first HSET can

@@ -1576,6 +1576,25 @@ size_t SvsDataBytes(const VectorSVS<float> &index) {
   return breakdown.data_bytes;
 }
 
+// Background maintenance widens with the index: a small one stays on the
+// calling thread, since starting threads would cost more than its share of
+// work.
+TEST_F(VectorSVSTest, SmallIndexMaintainsSingleThreaded) {
+  auto index = VectorSVS<float>::Create(
+      CreateSVSVectorIndexProto(kDimensions, data_model::DISTANCE_METRIC_L2,
+                                data_model::SVS_COMPRESSION_NONE),
+      attribute_identifier, attribute_data_type, 0);
+  VMSDK_EXPECT_OK(index);
+  auto vectors = DeterministicallyGenerateVectors(100, kDimensions, 2.0);
+  for (size_t i = 0; i < vectors.size(); ++i) {
+    VMSDK_EXPECT_OK(testing_infra::AddVectorRecord(**index, IndexToKey(i),
+                                                   VectorToStr(vectors[i])));
+  }
+  ASSERT_GT(SvsMaintenanceThreads::Limit(), 1u);
+  EXPECT_EQ(SvsMaintenanceThreads::Limit(VectorSVSTestPeer::Handle(**index)),
+            1u);
+}
+
 // SVS can't compact an index with no live entries, so a consolidation that
 // runs once every vector is deleted keeps the ids; the next one, with live
 // entries again, compacts. Repeated fill and delete-all cycles then reuse the

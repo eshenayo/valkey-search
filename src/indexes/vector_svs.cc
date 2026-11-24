@@ -8,6 +8,7 @@
 #include "src/indexes/vector_svs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <queue>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -99,24 +101,84 @@ constexpr uint32_t kSvsHeaderFormatVersion = 1;
 // without a payload. No SVS release has version 0.
 constexpr uint32_t kSvsVersionWithoutPayload = 0;
 
-// Sequential threadpool vtable: SVS invokes parallel_for on the calling
-// reader thread. Matches HNSW's concurrency model (one search occupies
-// one reader thread; throughput scales via concurrent searches on
-// Valkey's reader pool). Static-storage so it survives every index
-// handle's lifetime.
-size_t SvsThreadpoolSize(void* /*self*/) { return 1; }
+// Threadpool vtable. Searches and writes run SVS's parallel_for on the calling
+// thread: one search occupies one reader thread, as with HNSW, and
+// throughput scales through concurrent searches on Valkey's reader pool.
+// Background maintenance raises this thread's width (SvsMaintenanceThreads),
+// so a compaction, which blocks the index, spreads over that many threads.
+// Static-storage so it survives every index handle's lifetime.
+thread_local size_t svs_threads = 1;
+
+size_t SvsThreadpoolSize(void* /*self*/) { return svs_threads; }
 
 bool SvsThreadpoolParallelFor(void* /*self*/,
                               void (*func)(void* svs_param, size_t i),
                               void* svs_param, size_t n,
                               svs_error_h /*out_err*/) {
-  for (size_t i = 0; i < n; ++i) {
-    func(svs_param, i);
+  const size_t threads = std::min(svs_threads, n);
+  if (threads <= 1) {
+    for (size_t i = 0; i < n; ++i) {
+      func(svs_param, i);
+    }
+    return true;
   }
+  // Helpers start at width 1, and the caller drops to 1 for the call, so any
+  // nested parallel_for stays sequential.
+  std::atomic<size_t> next{0};
+  auto run = [&] {
+    for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < n;) {
+      func(svs_param, i);
+    }
+  };
+  std::vector<std::thread> helpers;
+  helpers.reserve(threads - 1);
+  for (size_t t = 1; t < threads; ++t) helpers.emplace_back(run);
+  const size_t width = svs_threads;
+  svs_threads = 1;
+  run();
+  svs_threads = width;
+  for (auto& helper : helpers) helper.join();
   return true;
 }
 
 }  // namespace
+
+ABSL_CONST_INIT absl::Mutex SvsMaintenanceThreads::mutex_(absl::kConstInit);
+size_t SvsMaintenanceThreads::in_use_ = 0;
+
+size_t SvsMaintenanceThreads::Limit(svs_index_h index) {
+  // Starting a thread costs more than a small index's share of work, so the
+  // width grows with the index: one thread per kVectorsPerThread live vectors.
+  constexpr size_t kVectorsPerThread = 8192;
+  size_t live = 0;
+  svs_index_get_size(index, &live, nullptr);
+  return std::min(Limit(), std::max<size_t>(1, live / kVectorsPerThread));
+}
+
+size_t SvsMaintenanceThreads::Limit() {
+  const int64_t configured = options::GetSvsMaintenanceThreads().GetValue();
+  const int64_t limit =
+      configured > 0 ? configured : options::GetWriterThreadCount().GetValue();
+  return static_cast<size_t>(std::max<int64_t>(1, limit));
+}
+
+SvsMaintenanceThreads::SvsMaintenanceThreads(size_t want)
+    : saved_width_(svs_threads) {
+  {
+    absl::MutexLock lock(&mutex_);
+    const size_t limit = Limit();
+    const size_t free = limit > in_use_ ? limit - in_use_ : 0;
+    width_ = std::max<size_t>(1, std::min(want, free));
+    in_use_ += width_;
+  }
+  svs_threads = width_;
+}
+
+SvsMaintenanceThreads::~SvsMaintenanceThreads() {
+  svs_threads = saved_width_;
+  absl::MutexLock lock(&mutex_);
+  in_use_ -= width_;
+}
 
 // Declared in vector_svs.h for the unit tests.
 svs_threadpool_ops_t kSvsThreadpoolOps =
@@ -1341,6 +1403,8 @@ void VectorSVS<T>::MaybeConsolidate() {
   // searches are already excluded by the mutation phase.
   absl::WriterMutexLock lock(&resize_mutex_);
   if (svs_index_ == nullptr || !due()) return;
+  // The whole pass excludes this index's searches and writes.
+  SvsMaintenanceThreads threads(SvsMaintenanceThreads::Limit(svs_index_));
   ScopedSvsError err;
   if (!svs_index_dynamic_consolidate(svs_index_, err.get())) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
@@ -1380,8 +1444,19 @@ void VectorSVS<T>::ConsolidateConcurrently() {
   }
   absl::MutexLock busy(&consolidation_mutex_);
   ScopedSvsError err;
+  // Consolidation runs alongside this index's searches and writes, so it
+  // leaves them half the budget; compaction blocks the index and takes all.
+  const size_t limit = SvsMaintenanceThreads::Limit(svs_index_);
+  size_t consolidate_threads = 1;
+  size_t compact_threads = 1;
   const absl::Time start = absl::Now();
-  if (!svs_index_dynamic_consolidate(svs_index_, err.get())) {
+  bool consolidated_ok;
+  {
+    SvsMaintenanceThreads threads(std::max<size_t>(1, limit / 2));
+    consolidate_threads = threads.width();
+    consolidated_ok = svs_index_dynamic_consolidate(svs_index_, err.get());
+  }
+  if (!consolidated_ok) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA consolidate failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_consolidate");
@@ -1399,8 +1474,14 @@ void VectorSVS<T>::ConsolidateConcurrently() {
   }
   // Compaction lets add_points reuse the freed slots; SVS runs it exclusively.
   // Shutdown doesn't need it.
-  if (!SvsMaintenance::Stopped() &&
-      !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get())) {
+  bool compact_failed = false;
+  if (!SvsMaintenance::Stopped()) {
+    SvsMaintenanceThreads threads(limit);
+    compact_threads = threads.width();
+    compact_failed =
+        !svs_index_dynamic_compact(svs_index_, /*batchsize=*/0, err.get());
+  }
+  if (compact_failed) {
     VMSDK_LOG_EVERY_N_SEC(WARNING, nullptr, 10)
         << "SVS_VAMANA compact failed: "
         << SvsErrorToStatus(err.get(), "index_dynamic_compact");
@@ -1410,7 +1491,9 @@ void VectorSVS<T>::ConsolidateConcurrently() {
       << ", deleted=" << before
       << ", consolidate_ms=" << absl::ToInt64Milliseconds(consolidated - start)
       << ", compact_ms="
-      << absl::ToInt64Milliseconds(absl::Now() - consolidated);
+      << absl::ToInt64Milliseconds(absl::Now() - consolidated)
+      << ", consolidate_threads=" << consolidate_threads
+      << ", compact_threads=" << compact_threads;
 }
 
 template <typename T>
