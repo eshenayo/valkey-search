@@ -26,6 +26,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "src/attribute_data.h"
@@ -516,14 +517,23 @@ struct WideRecorder {
   absl::Mutex mu;
   absl::flat_hash_set<std::thread::id> threads ABSL_GUARDED_BY(mu);
   std::atomic<bool> nested_wide{false};
+  std::atomic<bool> waited{false};
 };
 
+// The first iteration waits (once, bounded) for a second thread to run one,
+// so the test doesn't depend on the workload outlasting thread start-up.
 void RecordWide(void *param, size_t i) {
   auto *rec = static_cast<WideRecorder *>(param);
   rec->counts[i].fetch_add(1);
   if (kSvsThreadpoolOps.size(nullptr) != 1) rec->nested_wide = true;
   absl::MutexLock lock(&rec->mu);
   rec->threads.insert(std::this_thread::get_id());
+  if (!rec->waited.exchange(true)) {
+    auto two_threads = [rec]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(rec->mu) {
+      return rec->threads.size() > 1;
+    };
+    rec->mu.AwaitWithTimeout(absl::Condition(&two_threads), absl::Seconds(10));
+  }
 }
 
 // Inside SvsMaintenanceThreads, parallel_for spreads its iterations over
